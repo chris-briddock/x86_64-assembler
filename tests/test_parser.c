@@ -328,6 +328,51 @@ int test_parse_call_ret(void) {
     return 0;
 }
 
+/* Test: Parse int immediate instruction */
+int test_parse_int(void) {
+    int count = 0;
+    const char *source = "int $0x80\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_INT, insts[0].type);
+    ASSERT_EQ(1, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[0].type);
+    ASSERT_EQ(0x80, insts[0].operands[0].immediate);
+
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse enter/cbw/cwd/cwde mnemonics */
+int test_parse_enter_and_legacy_signext(void) {
+    int count = 0;
+    const char *source =
+        "enter 16, 0\n"
+        "cbw\n"
+        "cwd\n"
+        "cwde\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(4, count);
+
+    ASSERT_EQ(INST_ENTER, insts[0].type);
+    ASSERT_EQ(2, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[0].type);
+    ASSERT_EQ(16, insts[0].operands[0].immediate);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[1].type);
+    ASSERT_EQ(0, insts[0].operands[1].immediate);
+
+    ASSERT_EQ(INST_CBW, insts[1].type);
+    ASSERT_EQ(INST_CWD, insts[2].type);
+    ASSERT_EQ(INST_CWDE, insts[3].type);
+
+    free_instructions(insts);
+    return 0;
+}
+
 /* Regression test: Unknown instruction should fail parsing */
 int test_parse_unknown_instruction(void) {
     int count = 0;
@@ -584,6 +629,8 @@ TEST_SUITE(parser) {
     TEST(parse_instruction_with_comment);
     TEST(parse_push_pop);
     TEST(parse_call_ret);
+    TEST(parse_int);
+    TEST(parse_enter_and_legacy_signext);
     TEST(parse_unknown_instruction);
     TEST(parse_sse_move_mem_dst_imm_src_invalid);
     TEST(parse_sse_arith_non_xmm_dst_invalid);

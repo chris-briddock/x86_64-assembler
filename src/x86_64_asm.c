@@ -24,6 +24,7 @@ extern int encode_lea(assembler_context_t *ctx, const parsed_instruction_t *inst
 extern int encode_jmp(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_jcc(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_call_ret(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_int(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_syscall(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_sysret(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_nop(assembler_context_t *ctx, const parsed_instruction_t *inst);
@@ -34,7 +35,10 @@ extern int encode_clc_stc_cmc(assembler_context_t *ctx, const parsed_instruction
 extern int encode_cld_std(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_cli_sti(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_leave(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_enter(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_setcc(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_cmov(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_bswap(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_xchg(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_imul(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_div_idiv_mul(assembler_context_t *ctx, const parsed_instruction_t *inst);
@@ -398,6 +402,9 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
         case INST_RET:
             return encode_call_ret(ctx, inst);
 
+        case INST_INT:
+            return encode_int(ctx, inst);
+
         case INST_SYSCALL:
             return encode_syscall(ctx, inst);
 
@@ -410,9 +417,13 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
         case INST_HLT:
             return encode_hlt(ctx, inst);
 
+        case INST_CWD:
         case INST_CQO:
+        case INST_CDQ:
             return encode_cwd_cdq_cqo(ctx, inst);
 
+        case INST_CBW:
+        case INST_CWDE:
         case INST_CDQE:
             return encode_cbw_cwde_cdqe(ctx, inst);
 
@@ -432,14 +443,26 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
         case INST_LEAVE:
             return encode_leave(ctx, inst);
 
+        case INST_ENTER:
+            return encode_enter(ctx, inst);
+
         case INST_SETA: case INST_SETAE: case INST_SETB: case INST_SETBE:
         case INST_SETE: case INST_SETG: case INST_SETGE: case INST_SETL:
         case INST_SETLE: case INST_SETNE: case INST_SETNO: case INST_SETNP:
         case INST_SETNS: case INST_SETO: case INST_SETP: case INST_SETS:
             return encode_setcc(ctx, inst);
 
+        case INST_CMOVA: case INST_CMOVAE: case INST_CMOVB: case INST_CMOVBE:
+        case INST_CMOVE: case INST_CMOVG: case INST_CMOVGE: case INST_CMOVL:
+        case INST_CMOVLE: case INST_CMOVNE: case INST_CMOVNO: case INST_CMOVNP:
+        case INST_CMOVNS: case INST_CMOVO: case INST_CMOVP: case INST_CMOVS:
+            return encode_cmov(ctx, inst);
+
         case INST_XCHG:
             return encode_xchg(ctx, inst);
+
+        case INST_BSWAP:
+            return encode_bswap(ctx, inst);
 
         case INST_IMUL:
             return encode_imul(ctx, inst);
@@ -570,6 +593,7 @@ static int estimate_instruction_size(const parsed_instruction_t *inst) {
             return 2; /* Usually 1-2 bytes with prefixes */
 
         /* Syscall */
+        case INST_INT: return 2;
         case INST_SYSCALL: return 2;
         case INST_SYSRET: return 2;
 

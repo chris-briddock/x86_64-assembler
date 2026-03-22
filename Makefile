@@ -2,6 +2,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g
+DEPFLAGS = -MMD -MP
 SRCDIR = src
 OBJDIR = obj
 BINDIR = bin
@@ -9,6 +10,7 @@ TESTDIR = tests
 
 SOURCES = $(wildcard $(SRCDIR)/*.c)
 OBJECTS = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SOURCES))
+DEPFILES = $(OBJECTS:.o=.d)
 TARGET = $(BINDIR)/x86_64-asm
 
 # Test files
@@ -26,11 +28,14 @@ $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+-include $(DEPFILES)
 
 clean:
 	rm -rf $(OBJDIR) $(BINDIR)
 	rm -f test_* *.bin *.hex
+	@rm -f $(DEPFILES) 2>/dev/null || true
 	@rm -f $(TESTDIR)/test_*.o $(TESTDIR)/*.o 2>/dev/null || true
 
 # Unit tests

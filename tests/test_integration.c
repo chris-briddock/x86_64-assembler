@@ -266,6 +266,30 @@ int test_integration_callret(void) {
     return 0;
 }
 
+/* Test: enter/leave and legacy sign-extension helpers should assemble and execute */
+int test_integration_enter_legacy_signext(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    enter $0, $0\n"
+        "    mov al, $0x80\n"
+        "    cbw\n"
+        "    cwde\n"
+        "    cdqe\n"
+        "    cwd\n"
+        "    cdq\n"
+        "    cqo\n"
+        "    leave\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $23\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(23, exit_code);
+    return 0;
+}
+
 /* Test: 8-bit register operations */
 int test_integration_8bit(void) {
     /* Test 8-bit low registers (al, bl, cl, dl) which are more commonly used
@@ -352,6 +376,64 @@ int test_integration_invalid(void) {
     ASSERT_NOT_NULL(captured_err);
     ASSERT_STR_CONTAINS(captured_err, "Unknown instruction");
     ASSERT_STR_CONTAINS(captured_err, "Parsing failed");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Test: Invalid ENTER operand range should fail with clear diagnostic */
+int test_integration_enter_invalid_operands(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    enter $70000, $0\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n";
+    char *captured_err;
+
+    assembler_context_t *ctx = asm_init();
+    if (!ctx) return 1;
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+
+    int result = asm_assemble(ctx, source);
+    captured_err = test_capture_stderr_end();
+    asm_free(ctx);
+
+    ASSERT_EQ(-1, result);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "enter first operand must fit in 16 bits");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Test: Invalid ENTER nesting-level operand should fail with clear diagnostic */
+int test_integration_enter_invalid_nesting(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    enter $0, $300\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n";
+    char *captured_err;
+
+    assembler_context_t *ctx = asm_init();
+    if (!ctx) return 1;
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+
+    int result = asm_assemble(ctx, source);
+    captured_err = test_capture_stderr_end();
+    asm_free(ctx);
+
+    ASSERT_EQ(-1, result);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "enter second operand must fit in 8 bits");
 
     free(captured_err);
     return 0;
@@ -954,10 +1036,13 @@ TEST_SUITE(integration) {
     TEST(integration_loop);
     TEST(integration_pushpop);
     TEST(integration_callret);
+    TEST(integration_enter_legacy_signext);
     TEST(integration_8bit);
     TEST(integration_data);
     TEST(integration_empty);
     TEST(integration_invalid);
+    TEST(integration_enter_invalid_operands);
+    TEST(integration_enter_invalid_nesting);
     TEST(integration_sectionless_entrypoint);
     TEST(integration_include_relative);
     TEST(integration_sse_smoke);

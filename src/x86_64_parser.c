@@ -64,6 +64,7 @@ static const inst_name_t inst_table[] = {
     {"movzx", INST_MOVZX},
     {"movsx", INST_MOVSX},
     {"xchg", INST_XCHG},
+    {"bswap", INST_BSWAP},
 
     /* CMOVcc */
     {"cmova", INST_CMOVA}, {"cmovae", INST_CMOVAE},
@@ -108,6 +109,7 @@ static const inst_name_t inst_table[] = {
     {"jns", INST_JNS}, {"jo", INST_JO},
     {"jp", INST_JP}, {"js", INST_JS},
     {"call", INST_CALL}, {"ret", INST_RET},
+    {"int", INST_INT},
     {"syscall", INST_SYSCALL}, {"sysret", INST_SYSRET},
 
     /* SETcc */
@@ -122,10 +124,13 @@ static const inst_name_t inst_table[] = {
 
     /* Other */
     {"leave", INST_LEAVE},
+    {"enter", INST_ENTER},
     {"nop", INST_NOP}, {"hlt", INST_HLT},
     {"clc", INST_CLC}, {"stc", INST_STC}, {"cmc", INST_CMC},
     {"cld", INST_CLD}, {"std", INST_STD},
     {"cli", INST_CLI}, {"sti", INST_STI},
+    {"cbw", INST_CBW}, {"cwd", INST_CWD},
+    {"cwde", INST_CWDE},
     {"cqo", INST_CQO}, {"cdq", INST_CDQ},
     {"cdqe", INST_CDQE},
 

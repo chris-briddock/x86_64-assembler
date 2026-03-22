@@ -233,11 +233,30 @@ int encode_int(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 
 /* CDQ/CQO encoding */
 int encode_cwd_cdq_cqo(assembler_context_t *ctx, const parsed_instruction_t *inst) {
-    (void)inst;
-    /* CQO: REX.W + 99 */
-    if (emit_byte(ctx, 0x48) < 0) return -1; /* REX.W */
-    if (emit_byte(ctx, 0x99) < 0) return -1;
-    return 0;
+    if (inst->operand_count != 0) {
+        fprintf(stderr, "Error: cwd/cdq/cqo takes no operands\n");
+        return -1;
+    }
+
+    switch (inst->type) {
+        case INST_CWD:
+            /* CWD: 66 99 */
+            if (emit_byte(ctx, 0x66) < 0) return -1;
+            if (emit_byte(ctx, 0x99) < 0) return -1;
+            return 0;
+        case INST_CDQ:
+            /* CDQ: 99 */
+            if (emit_byte(ctx, 0x99) < 0) return -1;
+            return 0;
+        case INST_CQO:
+            /* CQO: REX.W + 99 */
+            if (emit_byte(ctx, 0x48) < 0) return -1;
+            if (emit_byte(ctx, 0x99) < 0) return -1;
+            return 0;
+        default:
+            fprintf(stderr, "Error: Invalid instruction for cwd/cdq/cqo encoder\n");
+            return -1;
+    }
 }
 
 /* CWD/CWDE/CDQE encoding */
@@ -249,10 +268,60 @@ int encode_cwd(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 }
 
 int encode_cbw_cwde_cdqe(assembler_context_t *ctx, const parsed_instruction_t *inst) {
-    (void)inst;
-    /* CDQE: REX.W + 98 */
-    if (emit_byte(ctx, 0x48) < 0) return -1; /* REX.W */
-    if (emit_byte(ctx, 0x98) < 0) return -1;
+    if (inst->operand_count != 0) {
+        fprintf(stderr, "Error: cbw/cwde/cdqe takes no operands\n");
+        return -1;
+    }
+
+    switch (inst->type) {
+        case INST_CBW:
+            /* CBW: 66 98 */
+            if (emit_byte(ctx, 0x66) < 0) return -1;
+            if (emit_byte(ctx, 0x98) < 0) return -1;
+            return 0;
+        case INST_CWDE:
+            /* CWDE: 98 */
+            if (emit_byte(ctx, 0x98) < 0) return -1;
+            return 0;
+        case INST_CDQE:
+            /* CDQE: REX.W + 98 */
+            if (emit_byte(ctx, 0x48) < 0) return -1;
+            if (emit_byte(ctx, 0x98) < 0) return -1;
+            return 0;
+        default:
+            fprintf(stderr, "Error: Invalid instruction for cbw/cwde/cdqe encoder\n");
+            return -1;
+    }
+}
+
+/* ENTER encoding */
+int encode_enter(assembler_context_t *ctx, const parsed_instruction_t *inst) {
+    if (inst->operand_count != 2) {
+        fprintf(stderr, "Error: enter requires 2 immediate operands\n");
+        return -1;
+    }
+
+    const operand_t *size = &inst->operands[0];
+    const operand_t *nest = &inst->operands[1];
+
+    if (size->type != OPERAND_IMM || nest->type != OPERAND_IMM) {
+        fprintf(stderr, "Error: enter operands must be immediates\n");
+        return -1;
+    }
+
+    if (size->immediate < 0 || size->immediate > 0xFFFF) {
+        fprintf(stderr, "Error: enter first operand must fit in 16 bits\n");
+        return -1;
+    }
+
+    if (nest->immediate < 0 || nest->immediate > 0xFF) {
+        fprintf(stderr, "Error: enter second operand must fit in 8 bits\n");
+        return -1;
+    }
+
+    if (emit_byte(ctx, 0xC8) < 0) return -1;
+    if (emit_le16(ctx, (int16_t)size->immediate) < 0) return -1;
+    if (emit_byte(ctx, (uint8_t)nest->immediate) < 0) return -1;
     return 0;
 }
 
@@ -337,6 +406,99 @@ int encode_setcc(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (emit_byte(ctx, 0x0F) < 0) return -1;
     if (emit_byte(ctx, 0x90 + cc) < 0) return -1;
     if (emit_modrm_sib(ctx, 0, op, REG_SIZE_8) < 0) return -1;
+
+    return 0;
+}
+
+/* CMOVcc encoding */
+int encode_cmov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
+    if (inst->operand_count != 2) {
+        fprintf(stderr, "Error: cmov requires 2 operands\n");
+        return -1;
+    }
+
+    const operand_t *dst = &inst->operands[0];
+    const operand_t *src = &inst->operands[1];
+
+    if (dst->type != OPERAND_REG) {
+        fprintf(stderr, "Error: cmov destination must be register\n");
+        return -1;
+    }
+
+    if (src->type != OPERAND_REG && src->type != OPERAND_MEM) {
+        fprintf(stderr, "Error: cmov source must be register or memory\n");
+        return -1;
+    }
+
+    reg_size_t size = dst->reg_size;
+    if (size == REG_SIZE_8 || size == REG_SIZE_8H || size == REG_SIZE_XMM) {
+        fprintf(stderr, "Error: cmov only supports 16/32/64-bit operands\n");
+        return -1;
+    }
+
+    if (src->type == OPERAND_REG && src->reg_size != size) {
+        fprintf(stderr, "Error: cmov source and destination register sizes must match\n");
+        return -1;
+    }
+
+    uint8_t cc;
+    switch (inst->type) {
+        case INST_CMOVA:  cc = 0x7; break;
+        case INST_CMOVAE: cc = 0x3; break;
+        case INST_CMOVB:  cc = 0x2; break;
+        case INST_CMOVBE: cc = 0x6; break;
+        case INST_CMOVE:  cc = 0x4; break;
+        case INST_CMOVG:  cc = 0xF; break;
+        case INST_CMOVGE: cc = 0xD; break;
+        case INST_CMOVL:  cc = 0xC; break;
+        case INST_CMOVLE: cc = 0xE; break;
+        case INST_CMOVNE: cc = 0x5; break;
+        case INST_CMOVNO: cc = 0x1; break;
+        case INST_CMOVNP: cc = 0xB; break;
+        case INST_CMOVNS: cc = 0x9; break;
+        case INST_CMOVO:  cc = 0x0; break;
+        case INST_CMOVP:  cc = 0xA; break;
+        case INST_CMOVS:  cc = 0x8; break;
+        default:
+            fprintf(stderr, "Error: Unknown cmov variant\n");
+            return -1;
+    }
+
+    bool is_64bit = (size == REG_SIZE_64);
+    if (size == REG_SIZE_16) {
+        if (emit_byte(ctx, 0x66) < 0) return -1;
+    }
+
+    if (emit_rex(ctx, is_64bit, dst, src, NULL) < 0) return -1;
+    if (emit_byte(ctx, 0x0F) < 0) return -1;
+    if (emit_byte(ctx, 0x40 + cc) < 0) return -1;
+    if (emit_modrm_sib(ctx, dst->reg & 7, src, size) < 0) return -1;
+
+    return 0;
+}
+
+/* BSWAP encoding */
+int encode_bswap(assembler_context_t *ctx, const parsed_instruction_t *inst) {
+    if (inst->operand_count != 1) {
+        fprintf(stderr, "Error: bswap requires 1 operand\n");
+        return -1;
+    }
+
+    const operand_t *op = &inst->operands[0];
+    if (op->type != OPERAND_REG) {
+        fprintf(stderr, "Error: bswap operand must be register\n");
+        return -1;
+    }
+
+    if (op->reg_size != REG_SIZE_32 && op->reg_size != REG_SIZE_64) {
+        fprintf(stderr, "Error: bswap only supports 32-bit or 64-bit registers\n");
+        return -1;
+    }
+
+    bool is_64bit = (op->reg_size == REG_SIZE_64);
+    if (emit_rex(ctx, is_64bit, NULL, op, NULL) < 0) return -1;
+    if (emit_byte(ctx, 0x0F) < 0) return -1;
+    if (emit_byte(ctx, (uint8_t)(0xC8 + (op->reg & 7))) < 0) return -1;
 
     return 0;
 }

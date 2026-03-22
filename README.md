@@ -7,7 +7,7 @@ Written in C with no external dependencies beyond the standard library.
 
 - **ELF64 Output**: Generates standard Linux executables
 - **Modern x86_64 Support**: 64-bit registers, RIP-relative addressing,
-  full instruction set
+    and a practical instruction subset
 - **Sections**: Support for `.text`, `.data`, `.bss`, and `.rodata` sections
 - **Labels & Symbols**: Full label support with forward/backward references
 - **Memory Operands**: Direct, indirect, and displaced addressing modes
@@ -22,6 +22,7 @@ Written in C with no external dependencies beyond the standard library.
 - `push` / `pop` - Stack operations
 - `lea` - Load effective address
 - `movzx` / `movsx` - Move with zero/sign extension
+- `xchg` / `bswap` - Register exchange and byte-swap operations
 
 ### Arithmetic
 

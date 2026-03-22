@@ -175,6 +175,7 @@ typedef enum {
     INST_JNS, INST_JO, INST_JP, INST_JS,
     INST_CALL,
     INST_RET,
+    INST_INT,
     INST_SYSCALL,
     INST_SYSRET,
 

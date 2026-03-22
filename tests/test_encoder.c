@@ -9,6 +9,11 @@
 
 /* External encoder functions from x86_64_controlflow.c */
 extern int encode_jcc(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_cwd_cdq_cqo(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_cbw_cwde_cdqe(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_enter(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_cmov(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_bswap(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_bit_manip(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_shld_shrd(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_bit_scan(assembler_context_t *ctx, const parsed_instruction_t *inst);
@@ -300,6 +305,225 @@ int test_jnz_encoding(void) {
     ASSERT_EQ_HEX(ctx_jne.output[0], ctx_jnz.output[0]);  /* 0F */
     ASSERT_EQ_HEX(ctx_jne.output[1], ctx_jnz.output[1]);  /* 85 */
     
+    return 0;
+}
+
+/* Test: CMOVNE rbx, rax encoding */
+int test_cmovne_rbx_rax(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_CMOVNE,
+        .operand_count = 2,
+        .operands = {
+            make_reg_operand(RBX, REG_SIZE_64),
+            make_reg_operand(RAX, REG_SIZE_64)
+        }
+    };
+
+    /* cmovne rbx, rax = 48 0F 45 D8 */
+    ASSERT_EQ(0, encode_cmov(&ctx, &inst));
+    ASSERT_EQ(4, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x48, ctx.output[0]);
+    ASSERT_EQ_HEX(0x0F, ctx.output[1]);
+    ASSERT_EQ_HEX(0x45, ctx.output[2]);
+    ASSERT_EQ_HEX(0xD8, ctx.output[3]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: CMOVG r8, r9 encoding with extended registers */
+int test_cmovg_r8_r9(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_CMOVG,
+        .operand_count = 2,
+        .operands = {
+            make_reg_operand(R8, REG_SIZE_64),
+            make_reg_operand(R9, REG_SIZE_64)
+        }
+    };
+
+    /* cmovg r8, r9 = 4D 0F 4F C1 */
+    ASSERT_EQ(0, encode_cmov(&ctx, &inst));
+    ASSERT_EQ(4, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x4D, ctx.output[0]);
+    ASSERT_EQ_HEX(0x0F, ctx.output[1]);
+    ASSERT_EQ_HEX(0x4F, ctx.output[2]);
+    ASSERT_EQ_HEX(0xC1, ctx.output[3]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: CDQ encoding through instruction dispatcher */
+int test_encode_instruction_cdq(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_CDQ,
+        .operand_count = 0,
+        .line_number = 1
+    };
+
+    ASSERT_EQ(0, encode_instruction(&ctx, &inst));
+    ASSERT_EQ(1, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x99, ctx.output[0]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: CQO keeps 64-bit form (REX.W + 99) */
+int test_encode_cqo_bytes(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_CQO,
+        .operand_count = 0,
+        .line_number = 1
+    };
+
+    ASSERT_EQ(0, encode_cwd_cdq_cqo(&ctx, &inst));
+    ASSERT_EQ(2, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x48, ctx.output[0]);
+    ASSERT_EQ_HEX(0x99, ctx.output[1]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: BSWAP eax encoding */
+int test_bswap_eax(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_BSWAP,
+        .operand_count = 1,
+        .operands = {
+            make_reg_operand(EAX, REG_SIZE_32)
+        }
+    };
+
+    /* bswap eax = 0F C8 */
+    ASSERT_EQ(0, encode_bswap(&ctx, &inst));
+    ASSERT_EQ(2, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x0F, ctx.output[0]);
+    ASSERT_EQ_HEX(0xC8, ctx.output[1]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: BSWAP r8 encoding via central dispatcher */
+int test_encode_instruction_bswap_r8(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_BSWAP,
+        .operand_count = 1,
+        .operands = {
+            make_reg_operand(R8, REG_SIZE_64)
+        },
+        .line_number = 1
+    };
+
+    /* bswap r8 = 49 0F C8 */
+    ASSERT_EQ(0, encode_instruction(&ctx, &inst));
+    ASSERT_EQ(3, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x49, ctx.output[0]);
+    ASSERT_EQ_HEX(0x0F, ctx.output[1]);
+    ASSERT_EQ_HEX(0xC8, ctx.output[2]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: ENTER encoding through dedicated encoder */
+int test_encode_enter_bytes(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_ENTER,
+        .operand_count = 2,
+        .operands = {
+            make_imm_operand(0x20),
+            make_imm_operand(0x01)
+        },
+        .line_number = 1
+    };
+
+    /* enter 0x20, 0x01 = C8 20 00 01 */
+    ASSERT_EQ(0, encode_enter(&ctx, &inst));
+    ASSERT_EQ(4, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0xC8, ctx.output[0]);
+    ASSERT_EQ_HEX(0x20, ctx.output[1]);
+    ASSERT_EQ_HEX(0x00, ctx.output[2]);
+    ASSERT_EQ_HEX(0x01, ctx.output[3]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: CBW/CWDE/CWD encodings through instruction dispatcher */
+int test_encode_instruction_signext_legacy(void) {
+    assembler_context_t ctx;
+
+    setup_test_context(&ctx);
+    parsed_instruction_t cbw = {.type = INST_CBW, .operand_count = 0, .line_number = 1};
+    ASSERT_EQ(0, encode_instruction(&ctx, &cbw));
+    ASSERT_EQ(2, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x66, ctx.output[0]);
+    ASSERT_EQ_HEX(0x98, ctx.output[1]);
+    free(ctx.text_section);
+
+    setup_test_context(&ctx);
+    parsed_instruction_t cwde = {.type = INST_CWDE, .operand_count = 0, .line_number = 1};
+    ASSERT_EQ(0, encode_instruction(&ctx, &cwde));
+    ASSERT_EQ(1, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x98, ctx.output[0]);
+    free(ctx.text_section);
+
+    setup_test_context(&ctx);
+    parsed_instruction_t cwd = {.type = INST_CWD, .operand_count = 0, .line_number = 1};
+    ASSERT_EQ(0, encode_instruction(&ctx, &cwd));
+    ASSERT_EQ(2, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x66, ctx.output[0]);
+    ASSERT_EQ_HEX(0x99, ctx.output[1]);
+    free(ctx.text_section);
+
+    return 0;
+}
+
+/* Test: INT imm8 encoding through instruction dispatcher */
+int test_encode_instruction_int_imm8(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_INT,
+        .operand_count = 1,
+        .operands = {
+            make_imm_operand(0x80)
+        },
+        .line_number = 1
+    };
+
+    ASSERT_EQ(0, encode_instruction(&ctx, &inst));
+    ASSERT_EQ(2, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0xCD, ctx.output[0]);
+    ASSERT_EQ_HEX(0x80, ctx.output[1]);
+
+    free(ctx.text_section);
     return 0;
 }
 
@@ -1880,6 +2104,15 @@ TEST_SUITE(encoder) {
     TEST(nop);
     TEST(mov_r64_r64);
     TEST(jnz_encoding);
+    TEST(cmovne_rbx_rax);
+    TEST(cmovg_r8_r9);
+    TEST(encode_instruction_cdq);
+    TEST(encode_cqo_bytes);
+    TEST(bswap_eax);
+    TEST(encode_instruction_bswap_r8);
+    TEST(encode_enter_bytes);
+    TEST(encode_instruction_signext_legacy);
+    TEST(encode_instruction_int_imm8);
     TEST(r8h_rex_conflict);
     TEST(add_high8_rex_conflict);
     TEST(sub_high8_rex_conflict);

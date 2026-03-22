@@ -81,6 +81,23 @@ Use AL/BL/CL/DL or the low byte of R8-R15 (R8B-R15B) instead for compatibility.
 
 ## Instructions
 
+### Non-SSE Scalar Support Matrix
+
+This matrix lists the currently supported non-SSE scalar instructions by family.
+
+| Family | Supported Instructions |
+| :--- | :--- |
+| Data movement | `mov`, `movzx`, `movsx`, `lea`, `push`, `pop`, `xchg`, `bswap` |
+| Integer arithmetic/logic | `add`, `adc`, `sub`, `sbb`, `inc`, `dec`, `neg`, `not`, `cmp`, `xor`, `or`, `and`, `test`, `mul`, `imul`, `div`, `idiv` |
+| Shifts/rotates | `shl`, `shr`, `sal`, `sar`, `rol`, `ror`, `rcl`, `rcr`, `shld`, `shrd` |
+| Bit test/scan | `bt`, `bts`, `btr`, `btc`, `bsf`, `bsr` |
+| Control flow | `jmp`, `ja`, `jae`, `jb`, `jbe`, `je`, `jg`, `jge`, `jl`, `jle`, `jne`, `jnz`, `jno`, `jnp`, `jns`, `jo`, `jp`, `js`, `call`, `ret` |
+| Conditional move/set | `cmova`, `cmovae`, `cmovb`, `cmovbe`, `cmove`, `cmovg`, `cmovge`, `cmovl`, `cmovle`, `cmovne`, `cmovno`, `cmovnp`, `cmovns`, `cmovo`, `cmovp`, `cmovs`, `seta`, `setae`, `setb`, `setbe`, `sete`, `setg`, `setge`, `setl`, `setle`, `setne`, `setno`, `setnp`, `setns`, `seto`, `setp`, `sets` |
+| System/flags | `int`, `syscall`, `sysret`, `nop`, `hlt`, `clc`, `stc`, `cmc`, `cld`, `std`, `cli`, `sti` |
+| Sign-extension helpers | `cbw`, `cwde`, `cdqe`, `cwd`, `cdq`, `cqo` |
+| Stack frame | `leave`, `enter` |
+| String move | `movsb`, `movsw`, `movsd`, `movsq` |
+
 ### Data Movement
 
 #### MOV - Move Data
