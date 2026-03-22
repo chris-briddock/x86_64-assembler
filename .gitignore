@@ -1,0 +1,32 @@
+# Build outputs
+/bin/
+/obj/
+
+# Generated test/program output
+/test_out
+/*.dbg
+
+# C/C++ compiled artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Debug and crash artifacts
+*.core
+core
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor/IDE settings
+.vscode/
+.idea/
