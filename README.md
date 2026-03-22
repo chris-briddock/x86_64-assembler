@@ -1,0 +1,249 @@
+# x86_64 Assembler
+
+A lightweight x86_64 assembler for Linux that generates ELF64 executables.
+Written in C with no external dependencies beyond the standard library.
+
+## Features
+
+- **ELF64 Output**: Generates standard Linux executables
+- **Modern x86_64 Support**: 64-bit registers, RIP-relative addressing,
+  full instruction set
+- **Sections**: Support for `.text`, `.data`, `.bss`, and `.rodata` sections
+- **Labels & Symbols**: Full label support with forward/backward references
+- **Memory Operands**: Direct, indirect, and displaced addressing modes
+- **Parser Diagnostics**: Contextual parse errors with source line and caret position
+- **Minimal Dependencies**: Only requires GCC/Clang and standard C library
+
+## Supported Instructions
+
+### Data Movement
+
+- `mov` - Move data between registers, memory, and immediates
+- `push` / `pop` - Stack operations
+- `lea` - Load effective address
+- `movzx` / `movsx` - Move with zero/sign extension
+
+### Arithmetic
+
+- `add`, `sub` - Addition and subtraction
+- `inc`, `dec` - Increment and decrement
+- `neg`, `not` - Negation and bitwise NOT
+- `and`, `or`, `xor` - Bitwise operations
+- `cmp` - Compare
+
+### Control Flow
+
+- `jmp` - Unconditional jump
+- `je`, `jne`, `ja`, `jae`, `jb`, `jbe` - Conditional jumps
+- `jg`, `jge`, `jl`, `jle` - Signed conditional jumps
+- `jo`, `jno`, `js`, `jns`, `jp`, `jnp` - Flag-based jumps
+- `call` / `ret` - Function calls
+
+### System
+
+- `syscall` - Linux system call interface
+
+### SSE (Baseline)
+
+- Baseline SSE move and arithmetic support is implemented for selected XMM forms.
+- Unsupported operand forms now fail with targeted diagnostics in parser/encoder paths.
+- See [docs/ASSEMBLY_REFERENCE.md](docs/ASSEMBLY_REFERENCE.md) for the supported-form matrix and test mappings.
+
+## Building
+
+```bash
+make
+```
+
+This creates the assembler binary at `bin/x86_64-asm`.
+
+## Usage
+
+```bash
+./bin/x86_64-asm <input.asm> -o <output>
+chmod +x <output>
+./<output>
+```
+
+### Example
+
+```bash
+./bin/x86_64-asm examples/hello.asm -o hello
+chmod +x hello
+./hello
+```
+
+## Assembly Syntax
+
+### Basic Program Structure
+
+```asm
+section .data
+    msg: db $48, $65, $6C, $6C, $6F  ; "Hello"
+    len: equ $5
+
+section .text
+global _start
+_start:
+    mov rax, $1        ; sys_write
+    mov rdi, $1        ; stdout
+    lea rsi, [msg]     ; message address
+    mov rdx, $len      ; length
+    syscall
+
+    mov rax, $60       ; sys_exit
+    mov rdi, $0        ; exit code 0
+    syscall
+```
+
+### Key Syntax Elements
+
+- **Comments**: Start with `;`
+- **Immediates**: Prefixed with `$` (e.g., `$42`, `$0xFF`)
+- **Registers**: Use standard names (`rax`, `ebx`, `al`, `ah`, etc.)
+- **Labels**: End with colon (`label:`)
+- **Memory**: Square brackets (`[rax]`, `[rbx + 8]`, `[rip + label]`)
+
+### Sections
+
+- `.text` - Code section (executable)
+- `.data` - Initialized data (readable, writable)
+- `.bss` - Uninitialized data (readable, writable)
+- `.rodata` - Read-only data
+
+## Testing
+
+### Run All Tests
+
+```bash
+make test-unit        # Run encoder and parser unit tests
+make test-integration # Run integration tests
+make test            # Run legacy example tests
+```
+
+`make test-unit` now prints individual suite summaries and a final combined summary
+(`Total`, `Passed`, `Failed`) aggregated across encoder + parser tests.
+
+### Test Coverage
+
+- **Encoder Tests** (50 tests): Encoding verification including SSE scalar, packed integer, and packed comparison edge-cases
+- **Parser Tests** (28 tests): Syntax parsing and parser-side SSE form validation
+- **Integration Tests** (18 tests): End-to-end assembly pipeline including SSE/debug/include paths
+
+## Documentation
+
+- [Assembly Reference](docs/ASSEMBLY_REFERENCE.md)
+- [Examples Walkthrough](docs/EXAMPLES_WALKTHROUGH.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Parser Diagnostics](docs/PARSER_DIAGNOSTICS.md)
+
+## Project Structure
+
+```text
+.
+├── bin/              # Compiled binaries
+├── examples/         # Example assembly programs
+├── obj/              # Object files
+├── src/              # Source code
+│   ├── asm.c         # Main entry point
+│   ├── x86_64_asm.c  # Core assembler logic
+│   ├── x86_64_asm.h  # Header file
+│   ├── x86_64_encoder.c    # Instruction encoding
+│   ├── x86_64_parser.c     # Assembly parser
+│   └── x86_64_controlflow.c # Control flow instructions
+├── tests/            # Test suite
+│   ├── test_framework.c/h  # Minimal test framework
+│   ├── test_encoder.c      # Encoder unit tests
+│   ├── test_parser.c       # Parser unit tests
+│   └── test_integration.c  # Integration tests
+└── plans/            # Development plans and documentation
+```
+
+## Examples
+
+### Simple Exit Program
+
+```asm
+section .text
+global _start
+_start:
+    mov rax, $60   ; sys_exit
+    mov rdi, $42   ; exit code
+    syscall
+```
+
+### Loop Example
+
+```asm
+section .text
+global _start
+_start:
+    mov rcx, $5      ; Counter
+    mov rax, $0      ; Sum
+loop_start:
+    add rax, $1
+    dec rcx
+    jne loop_start   ; Jump if not zero
+    mov rdi, rax     ; Exit with sum
+    mov rax, $60
+    syscall
+```
+
+### Function Call
+
+```asm
+section .text
+global _start
+_start:
+    mov rdi, $10
+    call double
+    mov rdi, rax     ; Exit with result
+    mov rax, $60
+    syscall
+
+double:
+    mov rax, rdi
+    add rax, rdi     ; rax = rdi * 2
+    ret
+```
+
+## Current Constraints and Remaining Gaps
+
+- Linux ELF64 output only (no other output formats yet)
+- x86_64 architectural constraint: high 8-bit registers (`ah`/`bh`/`ch`/`dh`) cannot be used in REX-prefixed encodings
+- SSE support has strong unit/integration coverage, but not a complete instruction/operand edge-case matrix
+- `-g` emits a useful DWARF baseline (`.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`) plus `<output>.dbg`, but not full production-grade DWARF coverage
+
+### Recently Addressed
+
+- `.include` support for quoted relative/absolute paths (with nested includes)
+- Include/diagnostic/regression hardening around common parser/encoder edge cases
+
+## CI/CD
+
+This project uses GitHub Actions for continuous integration. The workflow:
+
+1. Builds the assembler
+2. Runs all unit tests
+3. Runs all integration tests
+4. Tests example programs
+
+See `.github/workflows/ci.yml` for details.
+
+## License
+
+MIT License - See LICENSE file for details.
+
+## Contributing
+
+Contributions are welcome! Please ensure:
+
+1. All tests pass (`make test-unit test-integration`)
+2. Code follows existing style
+3. New features include tests
+
+## Acknowledgments
+
+- Intel 64 and IA-32 Architectures Software Developer's Manual
+- System V AMD64 ABI
+- ELF-64 Object File Format Specification
