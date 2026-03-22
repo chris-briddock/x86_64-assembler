@@ -1,6 +1,6 @@
 # Build outputs
-/bin/
-/obj/
+/bin
+/obj
 
 # Generated test/program output
 /test_out

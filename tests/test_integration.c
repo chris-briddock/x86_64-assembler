@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <ctype.h>
 
 typedef struct {
     uint8_t e_ident[16];
@@ -861,6 +862,89 @@ int test_integration_dwarf_overflow_failure(void) {
     return 0;
 }
 
+/* Test: All supported output formats should write valid artifacts */
+int test_integration_output_formats_compile(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n";
+    char asm_file[] = "/tmp/test_fmt_src_XXXXXX.asm";
+    char out_elf[] = "/tmp/test_fmt_elf_XXXXXX";
+    char out_bin[] = "/tmp/test_fmt_bin_XXXXXX";
+    char out_hex[] = "/tmp/test_fmt_hex_XXXXXX";
+    int asm_fd = -1;
+    int out_fd = -1;
+    assembler_context_t *ctx = NULL;
+    struct stat st;
+
+    asm_fd = mkstemps(asm_file, 4);
+    ASSERT_TRUE(asm_fd >= 0);
+    ASSERT_EQ((int)strlen(source), (int)write(asm_fd, source, strlen(source)));
+    close(asm_fd);
+
+    ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
+    ASSERT_TRUE(ctx->text_size > 0);
+
+    out_fd = mkstemp(out_elf);
+    ASSERT_TRUE(out_fd >= 0);
+    close(out_fd);
+    ASSERT_EQ(0, asm_write_elf64(ctx, out_elf));
+    ASSERT_EQ(0, stat(out_elf, &st));
+    ASSERT_TRUE(st.st_size > 0);
+    {
+        unsigned char magic[4];
+        FILE *f = fopen(out_elf, "rb");
+        ASSERT_NOT_NULL(f);
+        ASSERT_EQ(4, (int)fread(magic, 1, sizeof(magic), f));
+        fclose(f);
+        ASSERT_EQ(0x7f, magic[0]);
+        ASSERT_EQ('E', magic[1]);
+        ASSERT_EQ('L', magic[2]);
+        ASSERT_EQ('F', magic[3]);
+    }
+
+    out_fd = mkstemp(out_bin);
+    ASSERT_TRUE(out_fd >= 0);
+    close(out_fd);
+    ASSERT_EQ(0, asm_write_binary(ctx, out_bin));
+    ASSERT_EQ(0, stat(out_bin, &st));
+    ASSERT_EQ((long long)ctx->text_size, (long long)st.st_size);
+
+    out_fd = mkstemp(out_hex);
+    ASSERT_TRUE(out_fd >= 0);
+    close(out_fd);
+    ASSERT_EQ(0, asm_write_hex(ctx, out_hex));
+    ASSERT_EQ(0, stat(out_hex, &st));
+    ASSERT_TRUE(st.st_size > 0);
+    {
+        FILE *f = fopen(out_hex, "r");
+        int c;
+        int seen_hex_digit = 0;
+        ASSERT_NOT_NULL(f);
+        while ((c = fgetc(f)) != EOF) {
+            if (isxdigit((unsigned char)c)) {
+                seen_hex_digit = 1;
+                continue;
+            }
+            ASSERT_TRUE(c == ' ' || c == '\n' || c == '\r' || c == '\t');
+        }
+        fclose(f);
+        ASSERT_TRUE(seen_hex_digit);
+    }
+
+    asm_free(ctx);
+    unlink(asm_file);
+    unlink(out_elf);
+    unlink(out_bin);
+    unlink(out_hex);
+    return 0;
+}
+
 /* Test Suite: Integration Tests */
 TEST_SUITE(integration) {
     TEST(integration_exit);
@@ -882,6 +966,7 @@ TEST_SUITE(integration) {
     TEST(integration_dwarf_sections);
     TEST(integration_dwarf_readelf_validation);
     TEST(integration_dwarf_overflow_failure);
+    TEST(integration_output_formats_compile);
 }
 
 /* Main entry point */
