@@ -15,6 +15,9 @@ typedef struct {
     int passed;
     int failed;
     int total;
+    int suite_passed;
+    int suite_failed;
+    int suite_total;
     const char *current_suite;
     const char *current_test;
 } test_state_t;
@@ -25,9 +28,9 @@ extern test_state_t g_test_state;
 #define TEST_SUITE(name) \
     void test_suite_##name(void); \
     void run_test_suite_##name(void) { \
-        g_test_state.current_suite = #name; \
-        printf("\n=== Test Suite: %s ===\n", #name); \
+        test_suite_begin(#name); \
         test_suite_##name(); \
+        test_suite_end(); \
     } \
     void test_suite_##name(void)
 
@@ -35,13 +38,16 @@ extern test_state_t g_test_state;
     do { \
         g_test_state.current_test = #name; \
         g_test_state.total++; \
+        g_test_state.suite_total++; \
         printf("  TEST: %s ... ", #name); \
         int _test_result = test_##name(); \
         if (_test_result == 0) { \
             g_test_state.passed++; \
+            g_test_state.suite_passed++; \
             printf("PASS\n"); \
         } else { \
             g_test_state.failed++; \
+            g_test_state.suite_failed++; \
             printf("FAIL\n"); \
         } \
     } while (0)
@@ -101,6 +107,8 @@ extern test_state_t g_test_state;
 #define RUN_TEST_SUITE(name) run_test_suite_##name()
 
 void test_init(void);
+void test_suite_begin(const char *suite_name);
+void test_suite_end(void);
 void test_report(void);
 int test_final_status(void);
 

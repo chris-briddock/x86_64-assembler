@@ -1308,9 +1308,14 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
     uint32_t off_producer = 0;
     uint32_t off_name = 0;
     uint32_t off_comp_dir = 0;
+    uint32_t off_type_u64 = 0;
+    uint32_t off_type_u64_ptr = 0;
     uint32_t symbol_str_off[MAX_SYMBOLS] = {0};
-    int text_symbol_indices[MAX_SYMBOLS] = {0};
-    int text_symbol_count = 0;
+    bool symbol_str_has_off[MAX_SYMBOLS] = {0};
+    int function_symbol_indices[MAX_SYMBOLS] = {0};
+    int function_symbol_count = 0;
+    int label_symbol_indices[MAX_SYMBOLS] = {0};
+    int label_symbol_count = 0;
 
 #define DW_APPEND_U8(buf, len_ptr, value) \
     do { if (!append_u8_checked((buf), (len_ptr), sizeof(buf), (value))) goto dwarf_overflow; } while (0)
@@ -1345,7 +1350,13 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
         off_comp_dir = (uint32_t)debug_str_size;
         DW_APPEND_BYTES(debug_str, &debug_str_size, source_dir, strlen(source_dir) + 1);
 
-        /* Build a text-symbol index and string table offsets for subprogram DIEs. */
+        off_type_u64 = (uint32_t)debug_str_size;
+        DW_APPEND_BYTES(debug_str, &debug_str_size, "u64", 4);
+
+        off_type_u64_ptr = (uint32_t)debug_str_size;
+        DW_APPEND_BYTES(debug_str, &debug_str_size, "u64*", 5);
+
+        /* Build symbol indexes and .debug_str offsets for function/label DIEs. */
         for (int i = 0; i < ctx->symbol_count; i++) {
             if (!ctx->symbols[i].is_resolved || ctx->symbols[i].is_external || ctx->symbols[i].section != 0) {
                 continue;
@@ -1354,38 +1365,56 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
                 ctx->symbols[i].address > ctx->base_address + ctx->text_size) {
                 continue;
             }
-            if (!ctx->symbols[i].is_function) {
-                continue;
+            if (!symbol_str_has_off[i]) {
+                symbol_str_off[i] = (uint32_t)debug_str_size;
+                symbol_str_has_off[i] = true;
+                size_t name_len = strlen(ctx->symbols[i].name);
+                DW_APPEND_BYTES(debug_str, &debug_str_size, ctx->symbols[i].name, name_len + 1);
             }
 
-            text_symbol_indices[text_symbol_count++] = i;
-            symbol_str_off[i] = (uint32_t)debug_str_size;
-            size_t name_len = strlen(ctx->symbols[i].name);
-            DW_APPEND_BYTES(debug_str, &debug_str_size, ctx->symbols[i].name, name_len + 1);
+            if (ctx->symbols[i].is_function) {
+                function_symbol_indices[function_symbol_count++] = i;
+            } else {
+                label_symbol_indices[label_symbol_count++] = i;
+            }
         }
 
         /* Ensure we always emit at least one function DIE for _start if present. */
-        if (text_symbol_count == 0) {
+        if (function_symbol_count == 0) {
             for (int i = 0; i < ctx->symbol_count; i++) {
                 if (ctx->symbols[i].section == 0 && strcmp(ctx->symbols[i].name, "_start") == 0) {
-                    text_symbol_indices[text_symbol_count++] = i;
-                    symbol_str_off[i] = (uint32_t)debug_str_size;
-                    size_t name_len = strlen(ctx->symbols[i].name);
-                    DW_APPEND_BYTES(debug_str, &debug_str_size, ctx->symbols[i].name, name_len + 1);
+                    function_symbol_indices[function_symbol_count++] = i;
+                    if (!symbol_str_has_off[i]) {
+                        symbol_str_off[i] = (uint32_t)debug_str_size;
+                        symbol_str_has_off[i] = true;
+                        size_t name_len = strlen(ctx->symbols[i].name);
+                        DW_APPEND_BYTES(debug_str, &debug_str_size, ctx->symbols[i].name, name_len + 1);
+                    }
                     break;
                 }
             }
         }
 
-        /* Sort text symbols by address for high_pc calculation. */
-        for (int i = 0; i < text_symbol_count; i++) {
-            for (int j = i + 1; j < text_symbol_count; j++) {
-                int si = text_symbol_indices[i];
-                int sj = text_symbol_indices[j];
+        /* Sort symbols by address for deterministic high_pc and DIE ordering. */
+        for (int i = 0; i < function_symbol_count; i++) {
+            for (int j = i + 1; j < function_symbol_count; j++) {
+                int si = function_symbol_indices[i];
+                int sj = function_symbol_indices[j];
                 if (ctx->symbols[sj].address < ctx->symbols[si].address) {
-                    int tmp = text_symbol_indices[i];
-                    text_symbol_indices[i] = text_symbol_indices[j];
-                    text_symbol_indices[j] = tmp;
+                    int tmp = function_symbol_indices[i];
+                    function_symbol_indices[i] = function_symbol_indices[j];
+                    function_symbol_indices[j] = tmp;
+                }
+            }
+        }
+        for (int i = 0; i < label_symbol_count; i++) {
+            for (int j = i + 1; j < label_symbol_count; j++) {
+                int si = label_symbol_indices[i];
+                int sj = label_symbol_indices[j];
+                if (ctx->symbols[sj].address < ctx->symbols[si].address) {
+                    int tmp = label_symbol_indices[i];
+                    label_symbol_indices[i] = label_symbol_indices[j];
+                    label_symbol_indices[j] = tmp;
                 }
             }
         }
@@ -1411,8 +1440,32 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
         DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
 
         DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 2);      /* abbrev code */
-        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x2E);   /* DW_TAG_subprogram */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x24);   /* DW_TAG_base_type */
         DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);        /* no children */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x03);   /* DW_AT_name */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0E);   /* DW_FORM_strp */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x3E);   /* DW_AT_encoding */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0B);   /* DW_FORM_data1 */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0B);   /* DW_AT_byte_size */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0B);   /* DW_FORM_data1 */
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
+
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 3);      /* abbrev code */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0F);   /* DW_TAG_pointer_type */
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);        /* no children */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x03);   /* DW_AT_name */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0E);   /* DW_FORM_strp */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0B);   /* DW_AT_byte_size */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0B);   /* DW_FORM_data1 */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x49);   /* DW_AT_type */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x13);   /* DW_FORM_ref4 */
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
+
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 4);      /* abbrev code */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x2E);   /* DW_TAG_subprogram */
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 1);        /* has children */
         DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x03);   /* DW_AT_name */
         DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0E);   /* DW_FORM_strp */
         DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x3A);   /* DW_AT_decl_file */
@@ -1427,6 +1480,34 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
         DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x01);   /* DW_FORM_addr */
         DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x12);   /* DW_AT_high_pc */
         DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x07);   /* DW_FORM_data8 */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x49);   /* DW_AT_type */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x13);   /* DW_FORM_ref4 */
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
+
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 5);      /* abbrev code */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0B);   /* DW_TAG_lexical_block */
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);        /* no children */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x11);   /* DW_AT_low_pc */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x01);   /* DW_FORM_addr */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x12);   /* DW_AT_high_pc */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x07);   /* DW_FORM_data8 */
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
+
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 6);      /* abbrev code */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0A);   /* DW_TAG_label */
+        DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);        /* no children */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x03);   /* DW_AT_name */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0E);   /* DW_FORM_strp */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x3A);   /* DW_AT_decl_file */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0B);   /* DW_FORM_data1 */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x3B);   /* DW_AT_decl_line */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0F);   /* DW_FORM_udata */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x39);   /* DW_AT_decl_column */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x0F);   /* DW_FORM_udata */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x11);   /* DW_AT_low_pc */
+        DW_APPEND_ULEB(debug_abbrev, &debug_abbrev_size, 0x01);   /* DW_FORM_addr */
         DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
         DW_APPEND_U8(debug_abbrev, &debug_abbrev_size, 0);
 
@@ -1439,23 +1520,36 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
         DW_APPEND_U8(debug_info, &debug_info_size, 8);            /* address size */
         DW_APPEND_ULEB(debug_info, &debug_info_size, 1);          /* abbrev code */
         DW_APPEND_LE32(debug_info, &debug_info_size, off_producer);
-        DW_APPEND_LE16(debug_info, &debug_info_size, 0x8001);     /* DW_LANG_Mips_Assembler */
+        DW_APPEND_LE16(debug_info, &debug_info_size, 0x0001);     /* DW_LANG_Asm (roadmap target) */
         DW_APPEND_LE32(debug_info, &debug_info_size, off_name);
         DW_APPEND_LE32(debug_info, &debug_info_size, off_comp_dir);
         DW_APPEND_LE32(debug_info, &debug_info_size, 0);          /* DW_AT_stmt_list */
         DW_APPEND_LE64(debug_info, &debug_info_size, ctx->base_address);
         DW_APPEND_LE64(debug_info, &debug_info_size, (uint64_t)ctx->text_size);
 
+        /* Emit shared base/pointer type DIEs so subprograms can carry DW_AT_type refs. */
+        uint32_t base_type_ref_off = (uint32_t)debug_info_size;
+        DW_APPEND_ULEB(debug_info, &debug_info_size, 2);          /* base type DIE */
+        DW_APPEND_LE32(debug_info, &debug_info_size, off_type_u64);
+        DW_APPEND_U8(debug_info, &debug_info_size, 0x07);         /* DW_ATE_unsigned */
+        DW_APPEND_U8(debug_info, &debug_info_size, 8);
+
+        uint32_t pointer_type_ref_off = (uint32_t)debug_info_size;
+        DW_APPEND_ULEB(debug_info, &debug_info_size, 3);          /* pointer type DIE */
+        DW_APPEND_LE32(debug_info, &debug_info_size, off_type_u64_ptr);
+        DW_APPEND_U8(debug_info, &debug_info_size, 8);
+        DW_APPEND_LE32(debug_info, &debug_info_size, base_type_ref_off);
+
         /* Emit one subprogram DIE per text symbol. */
-        for (int idx = 0; idx < text_symbol_count; idx++) {
-            int sym_idx = text_symbol_indices[idx];
+        for (int idx = 0; idx < function_symbol_count; idx++) {
+            int sym_idx = function_symbol_indices[idx];
             uint64_t low_pc = ctx->symbols[sym_idx].address;
-            uint64_t next_addr = (idx + 1 < text_symbol_count)
-                                 ? ctx->symbols[text_symbol_indices[idx + 1]].address
+            uint64_t next_addr = (idx + 1 < function_symbol_count)
+                                 ? ctx->symbols[function_symbol_indices[idx + 1]].address
                                  : (ctx->base_address + ctx->text_size);
             uint64_t span = (next_addr > low_pc) ? (next_addr - low_pc) : 0;
 
-            DW_APPEND_ULEB(debug_info, &debug_info_size, 2);      /* subprogram DIE */
+            DW_APPEND_ULEB(debug_info, &debug_info_size, 4);      /* subprogram DIE */
             DW_APPEND_LE32(debug_info, &debug_info_size, symbol_str_off[sym_idx]);
             DW_APPEND_U8(debug_info, &debug_info_size, 1);        /* file index from line table */
             DW_APPEND_ULEB(debug_info, &debug_info_size,
@@ -1465,6 +1559,26 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
             DW_APPEND_U8(debug_info, &debug_info_size, ctx->symbols[sym_idx].is_global ? 1 : 0);
             DW_APPEND_LE64(debug_info, &debug_info_size, low_pc);
             DW_APPEND_LE64(debug_info, &debug_info_size, span);
+            DW_APPEND_LE32(debug_info, &debug_info_size, pointer_type_ref_off);
+
+            /* Minimal lexical scope to represent a function body block. */
+            DW_APPEND_ULEB(debug_info, &debug_info_size, 5);      /* lexical block DIE */
+            DW_APPEND_LE64(debug_info, &debug_info_size, low_pc);
+            DW_APPEND_LE64(debug_info, &debug_info_size, span);
+            DW_APPEND_U8(debug_info, &debug_info_size, 0);        /* end of subprogram children */
+        }
+
+        /* Emit non-function text labels as DW_TAG_label DIEs. */
+        for (int idx = 0; idx < label_symbol_count; idx++) {
+            int sym_idx = label_symbol_indices[idx];
+            DW_APPEND_ULEB(debug_info, &debug_info_size, 6);      /* label DIE */
+            DW_APPEND_LE32(debug_info, &debug_info_size, symbol_str_off[sym_idx]);
+            DW_APPEND_U8(debug_info, &debug_info_size, 1);        /* file index from line table */
+            DW_APPEND_ULEB(debug_info, &debug_info_size,
+                           (uint32_t)(ctx->symbols[sym_idx].decl_line > 0 ? ctx->symbols[sym_idx].decl_line : 1));
+            DW_APPEND_ULEB(debug_info, &debug_info_size,
+                           (uint32_t)(ctx->symbols[sym_idx].decl_column > 0 ? ctx->symbols[sym_idx].decl_column : 1));
+            DW_APPEND_LE64(debug_info, &debug_info_size, ctx->symbols[sym_idx].address);
         }
 
         DW_APPEND_U8(debug_info, &debug_info_size, 0);            /* end of children */

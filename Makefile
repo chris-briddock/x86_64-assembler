@@ -2,6 +2,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g
+LDFLAGS =
 DEPFLAGS = -MMD -MP
 SRCDIR = src
 OBJDIR = obj
@@ -17,7 +18,7 @@ TARGET = $(BINDIR)/x86_64-asm
 TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_FRAMEWORK = $(TESTDIR)/test_framework.c
 
-.PHONY: all clean test test-encoder test-parser test-integration dirs
+.PHONY: all clean test test-encoder test-parser test-integration coverage dirs
 
 all: dirs $(TARGET)
 
@@ -25,7 +26,7 @@ dirs:
 	@mkdir -p $(OBJDIR) $(BINDIR)
 
 $(TARGET): $(OBJECTS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
@@ -42,14 +43,14 @@ clean:
 test-encoder: all $(TESTDIR)/test_encoder.c $(TEST_FRAMEWORK)
 	$(CC) $(CFLAGS) -c -o $(TESTDIR)/test_framework.o $(TEST_FRAMEWORK)
 	$(CC) $(CFLAGS) -c -o $(TESTDIR)/test_encoder.o $(TESTDIR)/test_encoder.c
-	$(CC) $(CFLAGS) -o $(BINDIR)/test_encoder $(TESTDIR)/test_encoder.o $(TESTDIR)/test_framework.o \
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BINDIR)/test_encoder $(TESTDIR)/test_encoder.o $(TESTDIR)/test_framework.o \
 		$(filter-out $(OBJDIR)/asm.o,$(OBJECTS))
 	./$(BINDIR)/test_encoder
 
 test-parser: all $(TESTDIR)/test_parser.c $(TEST_FRAMEWORK)
 	$(CC) $(CFLAGS) -c -o $(TESTDIR)/test_framework.o $(TEST_FRAMEWORK)
 	$(CC) $(CFLAGS) -c -o $(TESTDIR)/test_parser.o $(TESTDIR)/test_parser.c
-	$(CC) $(CFLAGS) -o $(BINDIR)/test_parser $(TESTDIR)/test_parser.o $(TESTDIR)/test_framework.o \
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BINDIR)/test_parser $(TESTDIR)/test_parser.o $(TESTDIR)/test_framework.o \
 		$(filter-out $(OBJDIR)/asm.o,$(OBJECTS))
 	./$(BINDIR)/test_parser
 
@@ -81,9 +82,18 @@ test-unit:
 test-integration: all $(TESTDIR)/test_integration.c $(TEST_FRAMEWORK)
 	$(CC) $(CFLAGS) -c -o $(TESTDIR)/test_framework.o $(TEST_FRAMEWORK)
 	$(CC) $(CFLAGS) -c -o $(TESTDIR)/test_integration.o $(TESTDIR)/test_integration.c
-	$(CC) $(CFLAGS) -o $(BINDIR)/test_integration $(TESTDIR)/test_integration.o $(TESTDIR)/test_framework.o \
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $(BINDIR)/test_integration $(TESTDIR)/test_integration.o $(TESTDIR)/test_framework.o \
 		$(filter-out $(OBJDIR)/asm.o,$(OBJECTS))
 	./$(BINDIR)/test_integration
+
+coverage: clean
+	@mkdir -p coverage
+	$(MAKE) CFLAGS="$(CFLAGS) --coverage" LDFLAGS="--coverage" test-encoder
+	$(MAKE) CFLAGS="$(CFLAGS) --coverage" LDFLAGS="--coverage" test-parser
+	$(MAKE) CFLAGS="$(CFLAGS) --coverage" LDFLAGS="--coverage" test-integration
+	@gcov -b -c -o $(OBJDIR) $(SRCDIR)/*.c | tee coverage/gcov.txt
+	@awk -F'[:%]' '/^Lines executed:/ { sum += $$2; n++ } END { if (n > 0) printf("Average line coverage: %.2f%% across %d entries\n", sum / n, n); else print "Average line coverage: no data" }' coverage/gcov.txt
+	@awk -F'[:%]' '/^Branches executed:/ { sum += $$2; n++ } END { if (n > 0) printf("Average branch coverage: %.2f%% across %d entries\n", sum / n, n); else print "Average branch coverage: no data" }' coverage/gcov.txt
 
 test: all
 	@echo "Running integration tests..."

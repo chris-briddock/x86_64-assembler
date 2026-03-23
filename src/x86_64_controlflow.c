@@ -8,6 +8,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
+#include <stdarg.h>
 
 /* External emit functions */
 extern int emit_byte(assembler_context_t *ctx, uint8_t byte);
@@ -18,11 +19,46 @@ extern int emit_rex(assembler_context_t *ctx, bool w, const operand_t *reg_op,
 extern int emit_modrm_sib(assembler_context_t *ctx, uint8_t reg_opcode,
                           const operand_t *operand, reg_size_t size);
 
+/* Standardized controlflow diagnostic helpers for roadmap phase 2.1.1. */
+static void controlflow_diag_emit(const parsed_instruction_t *inst,
+                                  const char *category,
+                                  const char *message,
+                                  const char *suggestion) {
+    int line = inst ? inst->line_number : 0;
+    fprintf(stderr, "Error at line %d, column 1: [%s] %s\n", line, category, message);
+    if (suggestion && suggestion[0] != '\0') {
+        fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+    }
+}
+
+static void controlflow_diagf(const parsed_instruction_t *inst,
+                              const char *category,
+                              const char *suggestion,
+                              const char *fmt,
+                              ...) {
+    char message[512];
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    controlflow_diag_emit(inst, category, message, suggestion);
+}
+
 /* Add a fixup for forward reference */
-static int add_fixup(assembler_context_t *ctx, const char *label,
-                     int size, instruction_type_t inst_type) {
+static int add_fixup(assembler_context_t *ctx,
+                     const parsed_instruction_t *inst,
+                     const char *label,
+                     int size,
+                     instruction_type_t inst_type) {
     if (ctx->fixup_count >= MAX_SYMBOLS) {
-        fprintf(stderr, "Error: Too many fixups\n");
+        controlflow_diag_emit(
+            inst,
+            "Constraint",
+            "Maximum number of pending fixups reached.",
+            "Reduce unresolved forward references or increase fixup capacity."
+        );
         return -1;
     }
 
@@ -40,7 +76,12 @@ static int add_fixup(assembler_context_t *ctx, const char *label,
 /* JMP encoding */
 int encode_jmp(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1) {
-        fprintf(stderr, "Error: jmp requires 1 operand at line %d\n", inst->line_number);
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "Provide exactly one operand for jmp (label, register, or memory target).",
+            "Use `jmp label`, `jmp rax`, or `jmp [rax]`."
+        );
         return -1;
     }
 
@@ -49,7 +90,7 @@ int encode_jmp(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     /* jmp label - relative jump (always use fixup for correctness) */
     if (op->type == OPERAND_LABEL) {
         if (emit_byte(ctx, 0xE9) < 0) return -1;
-        if (add_fixup(ctx, op->label, 4, INST_JMP) < 0) return -1;
+        if (add_fixup(ctx, inst, op->label, 4, INST_JMP) < 0) return -1;
         if (emit_le32(ctx, 0) < 0) return -1; /* Placeholder */
         return 0;
     }
@@ -71,21 +112,36 @@ int encode_jmp(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         return 0;
     }
 
-    fprintf(stderr, "Error: Unsupported jmp operand at line %d\n", inst->line_number);
+    controlflow_diag_emit(
+        inst,
+        "Encoding",
+        "Unsupported jmp operand type.",
+        "Use a label, register, or memory operand for jmp."
+    );
     return -1;
 }
 
 /* Conditional jumps encoding */
 int encode_jcc(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1) {
-        fprintf(stderr, "Error: Conditional jump requires 1 operand at line %d\n", inst->line_number);
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "Conditional jump requires exactly one label operand.",
+            "Use forms like `je target` or `jnz target`."
+        );
         return -1;
     }
 
     const operand_t *op = &inst->operands[0];
 
     if (op->type != OPERAND_LABEL) {
-        fprintf(stderr, "Error: Conditional jump requires label operand\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "Conditional jump target must be a label.",
+            "Replace immediates/registers with a label target such as `jne done`."
+        );
         return -1;
     }
 
@@ -110,7 +166,12 @@ int encode_jcc(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         case INST_JP:  cc = 0xA; break;  /* Parity (PF=1) */
         case INST_JS:  cc = 0x8; break;  /* Sign (SF=1) */
         default:
-            fprintf(stderr, "Error: Unknown conditional jump\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "Unknown conditional jump mnemonic.",
+                "Use a supported Jcc mnemonic such as je/jne/jg/jl/jz/jnz."
+            );
             return -1;
     }
 
@@ -121,7 +182,7 @@ int encode_jcc(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     /* Near jump: 0F 80+cc cd */
     if (emit_byte(ctx, 0x0F) < 0) return -1;
     if (emit_byte(ctx, 0x80 + cc) < 0) return -1;
-    if (add_fixup(ctx, op->label, 4, inst->type) < 0) return -1;
+    if (add_fixup(ctx, inst, op->label, 4, inst->type) < 0) return -1;
     if (emit_le32(ctx, 0) < 0) return -1; /* Placeholder */
 
     return 0;
@@ -140,13 +201,23 @@ int encode_call_ret(assembler_context_t *ctx, const parsed_instruction_t *inst) 
             if (emit_le16(ctx, (int16_t)inst->operands[0].immediate) < 0) return -1;
             return 0;
         }
-        fprintf(stderr, "Error: ret with invalid operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "ret supports no operands or a single immediate stack-pop value.",
+            "Use `ret` or `ret $imm16`."
+        );
         return -1;
     }
 
     if (inst->type == INST_CALL) {
         if (inst->operand_count != 1) {
-            fprintf(stderr, "Error: call requires 1 operand at line %d\n", inst->line_number);
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "call requires exactly one operand.",
+                "Use `call label`, `call rax`, or `call [rax]`."
+            );
             return -1;
         }
 
@@ -155,7 +226,7 @@ int encode_call_ret(assembler_context_t *ctx, const parsed_instruction_t *inst) 
         /* call label - relative call (always use fixup for correctness) */
         if (op->type == OPERAND_LABEL) {
             if (emit_byte(ctx, 0xE8) < 0) return -1;
-            if (add_fixup(ctx, op->label, 4, INST_CALL) < 0) return -1;
+            if (add_fixup(ctx, inst, op->label, 4, INST_CALL) < 0) return -1;
             if (emit_le32(ctx, 0) < 0) return -1;
             return 0;
         }
@@ -178,7 +249,12 @@ int encode_call_ret(assembler_context_t *ctx, const parsed_instruction_t *inst) 
         }
     }
 
-    fprintf(stderr, "Error: Unsupported call/ret at line %d\n", inst->line_number);
+    controlflow_diag_emit(
+        inst,
+        "Encoding",
+        "Unsupported call/ret operand form.",
+        "Use supported call targets (label/register/memory) or valid ret forms."
+    );
     return -1;
 }
 
@@ -207,7 +283,12 @@ int encode_nop(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         return 0;
     }
     /* Multi-byte NOP can be added later */
-    fprintf(stderr, "Error: nop with operands not supported\n");
+    controlflow_diag_emit(
+        inst,
+        "Encoding",
+        "nop with operands is not supported.",
+        "Use plain `nop` without operands."
+    );
     return -1;
 }
 
@@ -221,7 +302,12 @@ int encode_hlt(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* INT 0x80 encoding (for Linux 32-bit compatibility) */
 int encode_int(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1 || inst->operands[0].type != OPERAND_IMM) {
-        fprintf(stderr, "Error: int requires immediate operand\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "int requires exactly one immediate operand.",
+            "Use `int $imm8`, for example `int $0x80`."
+        );
         return -1;
     }
 
@@ -234,7 +320,12 @@ int encode_int(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* CDQ/CQO encoding */
 int encode_cwd_cdq_cqo(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 0) {
-        fprintf(stderr, "Error: cwd/cdq/cqo takes no operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "cwd/cdq/cqo do not take operands.",
+            "Use `cwd`, `cdq`, or `cqo` without operands."
+        );
         return -1;
     }
 
@@ -254,7 +345,12 @@ int encode_cwd_cdq_cqo(assembler_context_t *ctx, const parsed_instruction_t *ins
             if (emit_byte(ctx, 0x99) < 0) return -1;
             return 0;
         default:
-            fprintf(stderr, "Error: Invalid instruction for cwd/cdq/cqo encoder\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "Invalid instruction for cwd/cdq/cqo encoder.",
+                "Dispatch only cwd, cdq, or cqo into this encoder."
+            );
             return -1;
     }
 }
@@ -269,7 +365,12 @@ int encode_cwd(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 
 int encode_cbw_cwde_cdqe(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 0) {
-        fprintf(stderr, "Error: cbw/cwde/cdqe takes no operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "cbw/cwde/cdqe do not take operands.",
+            "Use `cbw`, `cwde`, or `cdqe` without operands."
+        );
         return -1;
     }
 
@@ -289,7 +390,12 @@ int encode_cbw_cwde_cdqe(assembler_context_t *ctx, const parsed_instruction_t *i
             if (emit_byte(ctx, 0x98) < 0) return -1;
             return 0;
         default:
-            fprintf(stderr, "Error: Invalid instruction for cbw/cwde/cdqe encoder\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "Invalid instruction for cbw/cwde/cdqe encoder.",
+                "Dispatch only cbw, cwde, or cdqe into this encoder."
+            );
             return -1;
     }
 }
@@ -297,7 +403,12 @@ int encode_cbw_cwde_cdqe(assembler_context_t *ctx, const parsed_instruction_t *i
 /* ENTER encoding */
 int encode_enter(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: enter requires 2 immediate operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "enter requires exactly two immediate operands.",
+            "Use `enter $stack_size, $nesting_level`."
+        );
         return -1;
     }
 
@@ -305,17 +416,34 @@ int encode_enter(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     const operand_t *nest = &inst->operands[1];
 
     if (size->type != OPERAND_IMM || nest->type != OPERAND_IMM) {
-        fprintf(stderr, "Error: enter operands must be immediates\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "enter operands must both be immediates.",
+            "Use immediate literals like `enter $32, $0`."
+        );
         return -1;
     }
 
     if (size->immediate < 0 || size->immediate > 0xFFFF) {
-        fprintf(stderr, "Error: enter first operand must fit in 16 bits\n");
+        controlflow_diagf(
+            inst,
+            "Constraint",
+            "Use a value in the range 0..65535 for the first enter operand.",
+            "enter first operand must fit in 16 bits (got %lld)",
+            (long long)size->immediate
+        );
         return -1;
     }
 
     if (nest->immediate < 0 || nest->immediate > 0xFF) {
-        fprintf(stderr, "Error: enter second operand must fit in 8 bits\n");
+        controlflow_diagf(
+            inst,
+            "Constraint",
+            "Use a value in the range 0..255 for the second enter operand.",
+            "enter second operand must fit in 8 bits (got %lld)",
+            (long long)nest->immediate
+        );
         return -1;
     }
 
@@ -364,19 +492,34 @@ int encode_leave(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* SETcc encoding */
 int encode_setcc(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1) {
-        fprintf(stderr, "Error: setcc requires 1 operand\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "setcc requires exactly one destination operand.",
+            "Use forms like `sete al` or `setne [mem]`."
+        );
         return -1;
     }
 
     const operand_t *op = &inst->operands[0];
 
     if (op->type != OPERAND_REG && op->type != OPERAND_MEM) {
-        fprintf(stderr, "Error: setcc requires register or memory operand\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "setcc destination must be a register or memory operand.",
+            "Use an 8-bit register (e.g., al) or an 8-bit memory destination."
+        );
         return -1;
     }
 
     if (op->type == OPERAND_REG && op->reg_size != REG_SIZE_8 && op->reg_size != REG_SIZE_8H) {
-        fprintf(stderr, "Error: setcc requires 8-bit operand\n");
+        controlflow_diag_emit(
+            inst,
+            "Constraint",
+            "setcc requires an 8-bit destination register.",
+            "Use one of al/cl/dl/bl/spl/bpl/sil/dil/r8b-r15b/ah-ch-dh-bh."
+        );
         return -1;
     }
 
@@ -413,7 +556,12 @@ int encode_setcc(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* CMOVcc encoding */
 int encode_cmov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: cmov requires 2 operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "cmov requires exactly two operands.",
+            "Use forms like `cmovne rax, rbx` or `cmove rax, [mem]`."
+        );
         return -1;
     }
 
@@ -421,23 +569,43 @@ int encode_cmov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     const operand_t *src = &inst->operands[1];
 
     if (dst->type != OPERAND_REG) {
-        fprintf(stderr, "Error: cmov destination must be register\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "cmov destination must be a register.",
+            "Use `cmovcc reg, reg/mem` with a register destination."
+        );
         return -1;
     }
 
     if (src->type != OPERAND_REG && src->type != OPERAND_MEM) {
-        fprintf(stderr, "Error: cmov source must be register or memory\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "cmov source must be a register or memory operand.",
+            "Use `cmovcc reg, reg` or `cmovcc reg, [mem]`."
+        );
         return -1;
     }
 
     reg_size_t size = dst->reg_size;
     if (size == REG_SIZE_8 || size == REG_SIZE_8H || size == REG_SIZE_XMM) {
-        fprintf(stderr, "Error: cmov only supports 16/32/64-bit operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Constraint",
+            "cmov supports only 16-bit, 32-bit, or 64-bit general-purpose registers.",
+            "Switch to ax/eax/rax (or matching width) for cmov destinations."
+        );
         return -1;
     }
 
     if (src->type == OPERAND_REG && src->reg_size != size) {
-        fprintf(stderr, "Error: cmov source and destination register sizes must match\n");
+        controlflow_diag_emit(
+            inst,
+            "Constraint",
+            "cmov source and destination register sizes must match.",
+            "Use same-width registers (for example, rax with rbx or eax with ecx)."
+        );
         return -1;
     }
 
@@ -460,7 +628,12 @@ int encode_cmov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         case INST_CMOVP:  cc = 0xA; break;
         case INST_CMOVS:  cc = 0x8; break;
         default:
-            fprintf(stderr, "Error: Unknown cmov variant\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "Unknown cmov variant.",
+                "Use a supported cmov mnemonic such as cmove/cmovne/cmovg/cmovl."
+            );
             return -1;
     }
 
@@ -480,18 +653,33 @@ int encode_cmov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* BSWAP encoding */
 int encode_bswap(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1) {
-        fprintf(stderr, "Error: bswap requires 1 operand\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "bswap requires exactly one register operand.",
+            "Use forms like `bswap eax` or `bswap rax`."
+        );
         return -1;
     }
 
     const operand_t *op = &inst->operands[0];
     if (op->type != OPERAND_REG) {
-        fprintf(stderr, "Error: bswap operand must be register\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "bswap operand must be a register.",
+            "Use `bswap reg32` or `bswap reg64` only."
+        );
         return -1;
     }
 
     if (op->reg_size != REG_SIZE_32 && op->reg_size != REG_SIZE_64) {
-        fprintf(stderr, "Error: bswap only supports 32-bit or 64-bit registers\n");
+        controlflow_diag_emit(
+            inst,
+            "Constraint",
+            "bswap supports only 32-bit and 64-bit registers.",
+            "Use eax..r15d or rax..r15 as the operand."
+        );
         return -1;
     }
 
@@ -506,7 +694,12 @@ int encode_bswap(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* XCHG encoding */
 int encode_xchg(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: xchg requires 2 operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "xchg requires exactly two operands.",
+            "Use forms like `xchg rax, rbx` or `xchg [rax], rbx`."
+        );
         return -1;
     }
 
@@ -552,7 +745,12 @@ int encode_xchg(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         return 0;
     }
 
-    fprintf(stderr, "Error: Unsupported xchg operands\n");
+    controlflow_diag_emit(
+        inst,
+        "Encoding",
+        "Unsupported xchg operand combination.",
+        "Use register-register or register-memory operands with matching widths."
+    );
     return -1;
 }
 
@@ -583,7 +781,12 @@ int encode_imul(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         const operand_t *src = &inst->operands[1];
 
         if (dst->type != OPERAND_REG) {
-            fprintf(stderr, "Error: IMUL destination must be register\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "imul destination must be a register.",
+                "Use forms like `imul rax, rbx` or `imul rax, [rbx]`."
+            );
             return -1;
         }
 
@@ -604,7 +807,12 @@ int encode_imul(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         const operand_t *imm = &inst->operands[2];
 
         if (dst->type != OPERAND_REG || imm->type != OPERAND_IMM) {
-            fprintf(stderr, "Error: IMUL 3-operand form requires reg, reg/mem, imm\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "imul 3-operand form requires register destination, register/memory source, and immediate.",
+                "Use `imul reg, reg_or_mem, imm`."
+            );
             return -1;
         }
 
@@ -628,14 +836,24 @@ int encode_imul(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         return 0;
     }
 
-    fprintf(stderr, "Error: IMUL requires 1, 2, or 3 operands\n");
+    controlflow_diag_emit(
+        inst,
+        "Encoding",
+        "imul requires 1, 2, or 3 operands.",
+        "Use `imul src`, `imul dst, src`, or `imul dst, src, imm`."
+    );
     return -1;
 }
 
 /* DIV/IDIV/MUL encoding */
 int encode_div_idiv_mul(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1) {
-        fprintf(stderr, "Error: div/idiv/mul requires 1 operand\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "div/idiv/mul requires exactly one operand.",
+            "Use forms like `div rbx`, `idiv [rax]`, or `mul rcx`."
+        );
         return -1;
     }
 
@@ -661,7 +879,12 @@ int encode_div_idiv_mul(assembler_context_t *ctx, const parsed_instruction_t *in
             opcode = 0xF7;
             break;
         default:
-            fprintf(stderr, "Error: Unknown multiply/divide instruction\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "Unknown multiply/divide instruction.",
+                "Use one of: mul, div, idiv."
+            );
             return -1;
     }
 
@@ -675,7 +898,12 @@ int encode_div_idiv_mul(assembler_context_t *ctx, const parsed_instruction_t *in
 /* TEST encoding */
 int encode_test(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: test requires 2 operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "test requires exactly two operands.",
+            "Use forms like `test rax, rbx` or `test rax, 1`."
+        );
         return -1;
     }
 
@@ -725,14 +953,24 @@ int encode_test(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         return 0;
     }
 
-    fprintf(stderr, "Error: Unsupported test operands\n");
+    controlflow_diag_emit(
+        inst,
+        "Encoding",
+        "Unsupported test operand combination.",
+        "Use `test reg_or_mem, reg` or `test reg_or_mem, imm`."
+    );
     return -1;
 }
 
 /* NOT encoding (already in encode_unary_arithmetic, but separate for clarity) */
 int encode_not(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1) {
-        fprintf(stderr, "Error: not requires 1 operand\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "not requires exactly one operand.",
+            "Use forms like `not rax` or `not [rax]`."
+        );
         return -1;
     }
 
@@ -752,7 +990,12 @@ int encode_not(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* SHL/SHR/SAL/SAR/ROL/ROR/RCL/RCR encoding */
 int encode_shift(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count < 1 || inst->operand_count > 2) {
-        fprintf(stderr, "Error: shift requires 1 or 2 operands\n");
+        controlflow_diag_emit(
+            inst,
+            "Encoding",
+            "shift instruction requires one or two operands.",
+            "Use forms like `shl rax` or `shl rax, 1` or `shl rax, cl`."
+        );
         return -1;
     }
 
@@ -774,7 +1017,12 @@ int encode_shift(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         case INST_SHR: reg_opcode = 5; break;
         case INST_SAR: reg_opcode = 7; break;
         default:
-            fprintf(stderr, "Error: Unknown shift instruction\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "Unknown shift/rotate instruction.",
+                "Use one of: shl/sal, shr, sar, rol, ror, rcl, rcr."
+            );
             return -1;
     }
 
@@ -788,7 +1036,12 @@ int encode_shift(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         } else if (op2->type == OPERAND_IMM) {
             count = (int)op2->immediate;
         } else {
-            fprintf(stderr, "Error: shift count must be immediate or CL\n");
+            controlflow_diag_emit(
+                inst,
+                "Constraint",
+                "shift count must be an immediate value or CL register.",
+                "Use `..., imm` or `..., cl` as the second operand."
+            );
             return -1;
         }
     }
@@ -821,10 +1074,16 @@ int encode_shift(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* BT/BTS/BTR/BTC encoding - Bit Test and Modify instructions */
 int encode_bit_manip(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: %s requires 2 operands\n",
-                inst->type == INST_BT ? "bt" :
-                inst->type == INST_BTS ? "bts" :
-                inst->type == INST_BTR ? "btr" : "btc");
+        const char *mnem = inst->type == INST_BT ? "bt" :
+                           inst->type == INST_BTS ? "bts" :
+                           inst->type == INST_BTR ? "btr" : "btc";
+        controlflow_diagf(
+            inst,
+            "Encoding",
+            "Use forms like `bt rax, 1` or `bts [rax], cl`.",
+            "%s requires exactly two operands.",
+            mnem
+        );
         return -1;
     }
 
@@ -852,7 +1111,12 @@ int encode_bit_manip(assembler_context_t *ctx, const parsed_instruction_t *inst)
             reg_opcode = 7;  /* BTC uses /7 */
             break;
         default:
-            fprintf(stderr, "Error: Unknown bit manipulation instruction\n");
+            controlflow_diag_emit(
+                inst,
+                "Encoding",
+                "Unknown bit manipulation instruction.",
+                "Use one of: bt, bts, btr, btc."
+            );
             return -1;
     }
 
@@ -861,7 +1125,12 @@ int encode_bit_manip(assembler_context_t *ctx, const parsed_instruction_t *inst)
     bool use_cl = (op2->type == OPERAND_REG && op2->reg == 1); /* CL register */
 
     if (!use_imm && !use_cl) {
-        fprintf(stderr, "Error: bit index must be immediate or CL register\n");
+        controlflow_diag_emit(
+            inst,
+            "Constraint",
+            "bit index must be an immediate value or CL register.",
+            "Use `..., imm` or `..., cl` as the second operand."
+        );
         return -1;
     }
 
@@ -900,8 +1169,14 @@ int encode_bit_manip(assembler_context_t *ctx, const parsed_instruction_t *inst)
 /* SHLD/SHRD encoding - Double Precision Shift */
 int encode_shld_shrd(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 3) {
-        fprintf(stderr, "Error: %s requires 3 operands\n",
-                inst->type == INST_SHLD ? "shld" : "shrd");
+        const char *mnem = inst->type == INST_SHLD ? "shld" : "shrd";
+        controlflow_diagf(
+            inst,
+            "Encoding",
+            "Use forms like `shld rax, rbx, 1` or `shrd rax, rbx, cl`.",
+            "%s requires exactly three operands.",
+            mnem
+        );
         return -1;
     }
 
@@ -916,8 +1191,14 @@ int encode_shld_shrd(assembler_context_t *ctx, const parsed_instruction_t *inst)
 
     /* Source must be a register */
     if (src->type != OPERAND_REG) {
-        fprintf(stderr, "Error: %s source operand must be a register\n",
-                inst->type == INST_SHLD ? "shld" : "shrd");
+        const char *mnem = inst->type == INST_SHLD ? "shld" : "shrd";
+        controlflow_diagf(
+            inst,
+            "Encoding",
+            "Set the second operand to a register source (e.g., rbx).",
+            "%s source operand must be a register.",
+            mnem
+        );
         return -1;
     }
 
@@ -926,8 +1207,14 @@ int encode_shld_shrd(assembler_context_t *ctx, const parsed_instruction_t *inst)
     bool use_imm = (cnt->type == OPERAND_IMM);
 
     if (!use_cl && !use_imm) {
-        fprintf(stderr, "Error: %s count must be immediate or CL\n",
-                inst->type == INST_SHLD ? "shld" : "shrd");
+        const char *mnem = inst->type == INST_SHLD ? "shld" : "shrd";
+        controlflow_diagf(
+            inst,
+            "Constraint",
+            "Use an immediate count or CL as the third operand.",
+            "%s count must be immediate or CL register.",
+            mnem
+        );
         return -1;
     }
 
@@ -955,8 +1242,14 @@ int encode_shld_shrd(assembler_context_t *ctx, const parsed_instruction_t *inst)
 /* BSF/BSR encoding - Bit Scan Forward/Reverse */
 int encode_bit_scan(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: %s requires 2 operands\n",
-                inst->type == INST_BSF ? "bsf" : "bsr");
+        const char *mnem = inst->type == INST_BSF ? "bsf" : "bsr";
+        controlflow_diagf(
+            inst,
+            "Encoding",
+            "Use forms like `bsf rax, rbx` or `bsr rcx, [rax]`.",
+            "%s requires exactly two operands.",
+            mnem
+        );
         return -1;
     }
 
@@ -965,8 +1258,14 @@ int encode_bit_scan(assembler_context_t *ctx, const parsed_instruction_t *inst) 
 
     /* Destination must be a register */
     if (dst->type != OPERAND_REG) {
-        fprintf(stderr, "Error: %s destination must be a register\n",
-                inst->type == INST_BSF ? "bsf" : "bsr");
+        const char *mnem = inst->type == INST_BSF ? "bsf" : "bsr";
+        controlflow_diagf(
+            inst,
+            "Encoding",
+            "Set the first operand to a destination register.",
+            "%s destination must be a register.",
+            mnem
+        );
         return -1;
     }
 

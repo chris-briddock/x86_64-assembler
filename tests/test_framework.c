@@ -7,16 +7,35 @@
 #include <unistd.h>
 
 /* Global test state */
-test_state_t g_test_state = {0, 0, 0, NULL, NULL};
+test_state_t g_test_state = {
+    .passed = 0,
+    .failed = 0,
+    .total = 0,
+    .suite_passed = 0,
+    .suite_failed = 0,
+    .suite_total = 0,
+    .current_suite = NULL,
+    .current_test = NULL
+};
 
 /* stderr capture state */
 static int g_stderr_saved_fd = -1;
 static FILE *g_stderr_capture_file = NULL;
 
+static double compute_percent(int numerator, int denominator) {
+    if (denominator <= 0) {
+        return 0.0;
+    }
+    return (100.0 * (double)numerator) / (double)denominator;
+}
+
 void test_init(void) {
     g_test_state.passed = 0;
     g_test_state.failed = 0;
     g_test_state.total = 0;
+    g_test_state.suite_passed = 0;
+    g_test_state.suite_failed = 0;
+    g_test_state.suite_total = 0;
     g_test_state.current_suite = NULL;
     g_test_state.current_test = NULL;
     printf("====================================\n");
@@ -24,13 +43,30 @@ void test_init(void) {
     printf("====================================\n");
 }
 
+void test_suite_begin(const char *suite_name) {
+    g_test_state.current_suite = suite_name;
+    g_test_state.suite_passed = 0;
+    g_test_state.suite_failed = 0;
+    g_test_state.suite_total = 0;
+    printf("\n=== Test Suite: %s ===\n", suite_name);
+}
+
+void test_suite_end(void) {
+    double suite_coverage = compute_percent(g_test_state.suite_passed, g_test_state.suite_total);
+    printf("  Coverage: %.1f%% (%d/%d passed)\n", suite_coverage,
+           g_test_state.suite_passed, g_test_state.suite_total);
+}
+
 void test_report(void) {
+    double coverage = compute_percent(g_test_state.passed, g_test_state.total);
+
     printf("\n====================================\n");
     printf("           Test Results\n");
     printf("====================================\n");
     printf("Total:  %d\n", g_test_state.total);
     printf("Passed: %d\n", g_test_state.passed);
     printf("Failed: %d\n", g_test_state.failed);
+    printf("Coverage: %.1f%% (%d/%d passed)\n", coverage, g_test_state.passed, g_test_state.total);
     printf("====================================\n");
     
     if (g_test_state.failed == 0) {

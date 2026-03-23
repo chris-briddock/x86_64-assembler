@@ -376,15 +376,27 @@ int test_parse_enter_and_legacy_signext(void) {
 /* Regression test: Unknown instruction should fail parsing */
 int test_parse_unknown_instruction(void) {
     int count = 0;
+    char *captured_err;
     const char *source =
         "section .text\n"
         "global _start\n"
         "_start:\n"
         "    invalid_instruction\n";
 
+    ASSERT_EQ(0, test_capture_stderr_begin());
     parsed_instruction_t *insts = parse_source(source, &count);
+    captured_err = test_capture_stderr_end();
+
     ASSERT_NULL(insts);
     ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Error at line ");
+    ASSERT_STR_CONTAINS(captured_err, ", column ");
+    ASSERT_STR_CONTAINS(captured_err, "[Syntax] Unknown instruction");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+    ASSERT_STR_CONTAINS(captured_err, "^");
+
+    free(captured_err);
 
     return 0;
 }
@@ -443,6 +455,104 @@ int test_parse_sse_arith_imm_src_invalid(void) {
     ASSERT_STR_CONTAINS(captured_err, "source must be XMM or memory");
 
     free(captured_err);
+    return 0;
+}
+
+/* Test: Parser should reject invalid scale factor 5 */
+int test_parse_memory_invalid_scale5(void) {
+    int count = 0;
+    char *captured_err;
+    const char *source = "mov rax, [rbx + rcx * 5]\n";
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source(source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Error at line 1, column");
+    ASSERT_STR_CONTAINS(captured_err, "[Syntax]");
+    ASSERT_STR_CONTAINS(captured_err, "Expected scale factor (1, 2, 4, or 8)");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Test: Parser should reject invalid scale factor 6 */
+int test_parse_memory_invalid_scale6(void) {
+    int count = 0;
+    char *captured_err;
+    const char *source = "mov rax, [rbx + rcx * 6]\n";
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source(source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Expected scale factor (1, 2, 4, or 8)");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Test: Parser should reject invalid scale factor 7 */
+int test_parse_memory_invalid_scale7(void) {
+    int count = 0;
+    char *captured_err;
+    const char *source = "mov rax, [rbx + rcx * 7]\n";
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source(source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Expected scale factor (1, 2, 4, or 8)");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Test: Parser should reject RIP-relative form that also includes index/base */
+int test_parse_rip_relative_with_index_invalid(void) {
+    int count = 0;
+    char *captured_err;
+    const char *source = "mov rax, [rip + rcx * 2]\n";
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source(source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "RIP-relative addressing cannot combine base/index registers");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Test: Parser should accept legal RIP-relative addressing without base/index */
+int test_parse_rip_relative_legal(void) {
+    int count = 0;
+    const char *source = "mov rax, [rip + 8]\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(OPERAND_MEM, insts[0].operands[1].type);
+    ASSERT_TRUE(insts[0].operands[1].mem.is_rip_relative);
+    ASSERT_EQ(8, insts[0].operands[1].mem.displacement);
+    ASSERT_FALSE(insts[0].operands[1].mem.has_base);
+    ASSERT_FALSE(insts[0].operands[1].mem.has_index);
+
+    free_instructions(insts);
     return 0;
 }
 
@@ -635,6 +745,11 @@ TEST_SUITE(parser) {
     TEST(parse_sse_move_mem_dst_imm_src_invalid);
     TEST(parse_sse_arith_non_xmm_dst_invalid);
     TEST(parse_sse_arith_imm_src_invalid);
+    TEST(parse_memory_invalid_scale5);
+    TEST(parse_memory_invalid_scale6);
+    TEST(parse_memory_invalid_scale7);
+    TEST(parse_rip_relative_with_index_invalid);
+    TEST(parse_rip_relative_legal);
     TEST(macro_definition);
     TEST(macro_expansion);
     TEST(macro_multiple_params);

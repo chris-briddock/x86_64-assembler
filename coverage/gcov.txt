@@ -1,0 +1,36 @@
+File 'src/asm.c'
+Lines executed:0.00% of 68
+Branches executed:0.00% of 40
+Taken at least once:0.00% of 40
+Calls executed:0.00% of 32
+Creating 'asm.c.gcov'
+
+File 'src/x86_64_asm.c'
+Lines executed:76.42% of 1073
+Branches executed:85.53% of 912
+Taken at least once:52.08% of 912
+Calls executed:70.34% of 263
+Creating 'x86_64_asm.c.gcov'
+
+File 'src/x86_64_controlflow.c'
+Lines executed:37.03% of 505
+Branches executed:41.45% of 550
+Taken at least once:22.18% of 550
+Calls executed:31.09% of 193
+Creating 'x86_64_controlflow.c.gcov'
+
+File 'src/x86_64_encoder.c'
+Lines executed:75.49% of 710
+Branches executed:84.11% of 950
+Taken at least once:61.79% of 950
+Calls executed:61.79% of 212
+Creating 'x86_64_encoder.c.gcov'
+
+File 'src/x86_64_parser.c'
+Lines executed:69.43% of 929
+Branches executed:83.01% of 765
+Taken at least once:58.69% of 765
+Calls executed:57.55% of 139
+Creating 'x86_64_parser.c.gcov'
+
+Lines executed:66.61% of 3285

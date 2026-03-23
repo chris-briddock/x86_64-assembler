@@ -274,6 +274,8 @@ copy_loop:
 
 The assembler supports a baseline SSE subset. This matrix documents currently supported forms and where coverage exists in tests.
 
+For the expanded roadmap matrix (including addressing/register-band depth and gap tracking), see [SSE Coverage Matrix](SSE_COVERAGE_MATRIX.md).
+
 #### Move Instructions
 
 | Instruction | Supported Forms | Representative Tests |

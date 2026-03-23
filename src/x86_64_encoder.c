@@ -9,6 +9,28 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <stdarg.h>
+
+/* Standardized encoder diagnostic helpers for roadmap phase 2.1.1. */
+static void encoder_diag_emit(int line, const char *category,
+                              const char *message, const char *suggestion) {
+    fprintf(stderr, "Error at line %d, column 1: [%s] %s\n", line, category, message);
+    if (suggestion && suggestion[0] != '\0') {
+        fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+    }
+}
+
+static void encoder_diagf(int line, const char *category,
+                          const char *suggestion, const char *fmt, ...) {
+    char message[512];
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    encoder_diag_emit(line, category, message, suggestion);
+}
 
 /* ============================================================================
  * REGISTER TABLE AND PARSING
@@ -300,6 +322,16 @@ int emit_modrm_sib(assembler_context_t *ctx, uint8_t reg_opcode,
 
     const mem_operand_t *mem = &operand->mem;
 
+    if (mem->has_index && !(mem->scale == 1 || mem->scale == 2 || mem->scale == 4 || mem->scale == 8)) {
+        fprintf(stderr, "Error: Invalid scale factor %d (expected 1, 2, 4, or 8)\n", mem->scale);
+        return -1;
+    }
+
+    if (mem->is_rip_relative && (mem->has_index || mem->has_base)) {
+        fprintf(stderr, "Error: RIP-relative addressing cannot combine base/index registers\n");
+        return -1;
+    }
+
     /* RIP-relative addressing: mod=00, r/m=101 with 32-bit displacement */
     if (mem->is_rip_relative) {
         /* RIP-relative: [RIP + disp32] - mod=00, r/m=101 */
@@ -402,9 +434,12 @@ int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 
     /* Check for high 8-bit register with REX conflict */
     if (check_rex_conflict(inst, 0, 1)) {
-        fprintf(stderr, "Error: Cannot use AH/BH/CH/DH with registers R8-R15 or SPL/BPL/SIL/DIL at line %d\n",
-                inst->line_number);
-        fprintf(stderr, "       Use AL/BL/CL/DL or low byte of R8-R15 instead\n");
+        encoder_diagf(
+            inst->line_number,
+            "Constraint",
+            "Use AL/BL/CL/DL or the low byte of R8-R15 instead.",
+            "Cannot use AH/BH/CH/DH with registers R8-R15 or SPL/BPL/SIL/DIL"
+        );
         return -1;
     }
 
@@ -608,9 +643,12 @@ int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst
 
     /* Check for high 8-bit register with REX conflict */
     if (check_rex_conflict(inst, 0, 1)) {
-        fprintf(stderr, "Error: Cannot use AH/BH/CH/DH with registers R8-R15 or SPL/BPL/SIL/DIL at line %d\n",
-                inst->line_number);
-        fprintf(stderr, "       Use AL/BL/CL/DL or low byte of R8-R15 instead\n");
+        encoder_diagf(
+            inst->line_number,
+            "Constraint",
+            "Use AL/BL/CL/DL or the low byte of R8-R15 instead.",
+            "Cannot use AH/BH/CH/DH with registers R8-R15 or SPL/BPL/SIL/DIL"
+        );
         return -1;
     }
 
@@ -807,6 +845,15 @@ int encode_lea(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     }
 
     reg_size_t size = dst->reg_size;
+    if (size == REG_SIZE_8 || size == REG_SIZE_8H) {
+        fprintf(stderr, "Error: lea destination must be 16, 32, or 64-bit register\n");
+        return -1;
+    }
+
+    if (size == REG_SIZE_16) {
+        if (emit_byte(ctx, 0x66) < 0) return -1;
+    }
+
     bool is_64bit = (size == REG_SIZE_64);
 
     /* 8D /r - LEA r64, m */
@@ -865,7 +912,12 @@ static int is_xmm_reg(reg_t reg) {
  */
 int encode_sse_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: SSE move requires 2 operands at line %d\n", inst->line_number);
+        encoder_diagf(
+            inst->line_number,
+            "Encoding",
+            "Use exactly two operands, for example: movups xmm0, [rax] or movups [rax], xmm0.",
+            "SSE move requires 2 operands"
+        );
         return -1;
     }
 
@@ -892,7 +944,12 @@ int encode_sse_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 
     /* Validate memory form first for clearer diagnostics. */
     if (dst_is_mem && src_is_mem) {
-        fprintf(stderr, "Error: SSE move cannot have two memory operands at line %d\n", inst->line_number);
+        encoder_diagf(
+            inst->line_number,
+            "Encoding",
+            "Use one memory operand and one XMM register operand.",
+            "SSE move cannot have two memory operands"
+        );
         return -1;
     }
 
@@ -901,19 +958,32 @@ int encode_sse_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
      * - dst=mem allows src=xmm only
      */
     if (dst_is_mem && !src_is_xmm) {
-        fprintf(stderr, "Error: SSE move memory destination requires XMM source at line %d\n",
-                inst->line_number);
+        encoder_diagf(
+            inst->line_number,
+            "Encoding",
+            "Use an XMM source register when writing to memory, e.g. movups [rax], xmm0.",
+            "SSE move memory destination requires XMM source"
+        );
         return -1;
     }
     if (dst_is_xmm && !src_is_xmm && !src_is_mem) {
-        fprintf(stderr, "Error: SSE move XMM destination requires XMM or memory source at line %d\n",
-                inst->line_number);
+        encoder_diagf(
+            inst->line_number,
+            "Encoding",
+            "Use an XMM register or memory operand as the source for an XMM destination.",
+            "SSE move XMM destination requires XMM or memory source"
+        );
         return -1;
     }
 
     /* Validate: at least one XMM operand required for SSE move. */
     if (!dst_is_xmm && !src_is_xmm) {
-        fprintf(stderr, "Error: SSE move requires at least one XMM operand at line %d\n", inst->line_number);
+        encoder_diagf(
+            inst->line_number,
+            "Encoding",
+            "Use at least one XMM register operand for SSE moves.",
+            "SSE move requires at least one XMM operand"
+        );
         return -1;
     }
 
@@ -1057,7 +1127,12 @@ int encode_sse_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
  */
 int encode_sse_arith(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: SSE arithmetic requires 2 operands at line %d\n", inst->line_number);
+        encoder_diagf(
+            inst->line_number,
+            "Encoding",
+            "Use exactly two operands, e.g. addps xmm0, xmm1 or addps xmm0, [rax].",
+            "SSE arithmetic requires 2 operands"
+        );
         return -1;
     }
 
@@ -1066,7 +1141,12 @@ int encode_sse_arith(assembler_context_t *ctx, const parsed_instruction_t *inst)
 
     /* Validate destination is XMM register */
     if (dst->type != OPERAND_REG || !is_xmm_reg(dst->reg)) {
-        fprintf(stderr, "Error: SSE arithmetic destination must be XMM register at line %d\n", inst->line_number);
+        encoder_diagf(
+            inst->line_number,
+            "Encoding",
+            "Use an XMM destination register, e.g. addps xmm0, xmm1.",
+            "SSE arithmetic destination must be XMM register"
+        );
         return -1;
     }
     if (dst->reg_size != REG_SIZE_XMM) {
@@ -1080,7 +1160,12 @@ int encode_sse_arith(assembler_context_t *ctx, const parsed_instruction_t *inst)
     bool src_is_mem = (src->type == OPERAND_MEM);
 
     if (!src_is_xmm && !src_is_mem) {
-        fprintf(stderr, "Error: SSE arithmetic source must be XMM or memory at line %d\n", inst->line_number);
+        encoder_diagf(
+            inst->line_number,
+            "Encoding",
+            "Use an XMM register or memory source operand.",
+            "SSE arithmetic source must be XMM or memory"
+        );
         return -1;
     }
     if (src_is_xmm && src->reg_size != REG_SIZE_XMM) {

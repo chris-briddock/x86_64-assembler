@@ -42,6 +42,15 @@ typedef struct {
     uint64_t sh_entsize;
 } test_elf64_shdr_t;
 
+typedef struct {
+    uint32_t st_name;
+    uint8_t st_info;
+    uint8_t st_other;
+    uint16_t st_shndx;
+    uint64_t st_value;
+    uint64_t st_size;
+} test_elf64_sym_t;
+
 static size_t decode_uleb128_at(const unsigned char *buf, size_t len, size_t pos, uint64_t *out) {
     uint64_t value = 0;
     int shift = 0;
@@ -57,6 +66,30 @@ static size_t decode_uleb128_at(const unsigned char *buf, size_t len, size_t pos
     }
 
     return (size_t)-1;
+}
+
+static size_t decode_sleb128_at(const unsigned char *buf, size_t len, size_t pos, int64_t *out) {
+    int64_t value = 0;
+    int shift = 0;
+    uint8_t byte = 0;
+
+    while (pos < len && shift < 64) {
+        byte = buf[pos++];
+        value |= ((int64_t)(byte & 0x7F)) << shift;
+        shift += 7;
+        if ((byte & 0x80) == 0) {
+            break;
+        }
+    }
+
+    if ((byte & 0x80) != 0) return (size_t)-1;
+
+    if (shift < 64 && (byte & 0x40)) {
+        value |= -((int64_t)1 << shift);
+    }
+
+    *out = value;
+    return pos;
 }
 
 /* Assemble from an existing file path and run resulting executable. */
@@ -404,7 +437,10 @@ int test_integration_enter_invalid_operands(void) {
 
     ASSERT_EQ(-1, result);
     ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Error at line");
+    ASSERT_STR_CONTAINS(captured_err, "column 1: [Constraint]");
     ASSERT_STR_CONTAINS(captured_err, "enter first operand must fit in 16 bits");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
 
     free(captured_err);
     return 0;
@@ -433,7 +469,10 @@ int test_integration_enter_invalid_nesting(void) {
 
     ASSERT_EQ(-1, result);
     ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Error at line");
+    ASSERT_STR_CONTAINS(captured_err, "column 1: [Constraint]");
     ASSERT_STR_CONTAINS(captured_err, "enter second operand must fit in 8 bits");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
 
     free(captured_err);
     return 0;
@@ -545,6 +584,252 @@ int test_integration_sse_mixed_controlflow(void) {
     return 0;
 }
 
+/* Test: Scalar SSE result should round-trip back into scalar register path */
+int test_integration_sse_scalar_to_gpr_runtime(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    sub rsp, $32\n"
+        "    mov rax, $0x3f800000\n"   /* 1.0f */
+        "    mov [rsp], rax\n"
+        "    movss xmm0, [rsp]\n"
+        "    addss xmm0, xmm0\n"      /* 2.0f -> 0x40000000 */
+        "    movss [rsp + 8], xmm0\n"
+        "    mov eax, [rsp + 8]\n"
+        "    cmp eax, $0x40000000\n"
+        "    jne fail\n"
+        "    mov rdi, $11\n"
+        "    jmp done\n"
+        "fail:\n"
+        "    mov rdi, $77\n"
+        "done:\n"
+        "    add rsp, $32\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(11, exit_code);
+    return 0;
+}
+
+/* Test: Program should touch all 16 XMM registers and execute deterministically */
+int test_integration_sse_all_xmm_registers_runtime(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    sub rsp, $32\n"
+        "    pxor xmm0, xmm0\n"
+        "    pxor xmm1, xmm1\n"
+        "    pxor xmm2, xmm2\n"
+        "    pxor xmm3, xmm3\n"
+        "    pxor xmm4, xmm4\n"
+        "    pxor xmm5, xmm5\n"
+        "    pxor xmm6, xmm6\n"
+        "    pxor xmm7, xmm7\n"
+        "    pxor xmm8, xmm8\n"
+        "    pxor xmm9, xmm9\n"
+        "    pxor xmm10, xmm10\n"
+        "    pxor xmm11, xmm11\n"
+        "    pxor xmm12, xmm12\n"
+        "    pxor xmm13, xmm13\n"
+        "    pxor xmm14, xmm14\n"
+        "    pcmpeqd xmm15, xmm15\n"
+        "    movdqu [rsp], xmm15\n"
+        "    mov rdi, [rsp]\n"
+        "    add rsp, $32\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(255, exit_code);
+    return 0;
+}
+
+/* Test: Multiple SSE instructions in sequence should execute and produce stable result */
+int test_integration_sse_sequence_runtime(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    sub rsp, $64\n"
+        "    mov rax, $3\n"
+        "    mov [rsp], rax\n"
+        "    mov rax, $4\n"
+        "    mov [rsp + 8], rax\n"
+        "    mov rax, $7\n"
+        "    mov [rsp + 16], rax\n"
+        "    mov rax, $9\n"
+        "    mov [rsp + 24], rax\n"
+        "    movdqu xmm0, [rsp]\n"
+        "    movdqu xmm1, [rsp + 16]\n"
+        "    paddd xmm0, xmm1\n"
+        "    psubd xmm0, [rsp + 16]\n"
+        "    pxor xmm2, xmm2\n"
+        "    por xmm2, xmm0\n"
+        "    movdqu [rsp + 32], xmm2\n"
+        "    mov rdi, [rsp + 32]\n"
+        "    add rsp, $64\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(3, exit_code);
+    return 0;
+}
+
+/* Test: SSE helper call should preserve caller XMM state via explicit save/restore */
+int test_integration_sse_function_call_preserve_runtime(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    sub rsp, $96\n"
+        "    pxor xmm1, xmm1\n"
+        "    pcmpeqd xmm1, xmm1\n"   /* Caller sentinel */
+        "    call sse_worker\n"
+        "    movdqu [rsp + 48], xmm1\n"
+        "    mov rax, [rsp + 48]\n"
+        "    add rax, $1\n"
+        "    jne bad\n"
+        "    mov rdi, $13\n"
+        "    jmp done\n"
+        "bad:\n"
+        "    mov rdi, $99\n"
+        "done:\n"
+        "    add rsp, $96\n"
+        "    mov rax, $60\n"
+        "    syscall\n"
+        "\n"
+        "sse_worker:\n"
+        "    movdqu [rsp + 16], xmm1\n"  /* Save caller XMM1 */
+        "    pxor xmm0, xmm0\n"
+        "    pcmpeqd xmm0, xmm0\n"
+        "    movdqu xmm1, [rsp + 16]\n"  /* Restore caller XMM1 */
+        "    ret\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(13, exit_code);
+    return 0;
+}
+
+/* Test: Packed SSE arithmetic should produce deterministic memory result */
+int test_integration_sse_packed_arith_runtime(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    sub rsp, $64\n"
+        "    mov rax, $1\n"
+        "    mov [rsp], rax\n"
+        "    mov rax, $2\n"
+        "    mov [rsp + 8], rax\n"
+        "    mov rax, $4\n"
+        "    mov [rsp + 16], rax\n"
+        "    mov rax, $8\n"
+        "    mov [rsp + 24], rax\n"
+        "    movdqu xmm0, [rsp]\n"
+        "    movdqu xmm1, [rsp + 16]\n"
+        "    paddd xmm0, xmm1\n"
+        "    movdqu [rsp + 32], xmm0\n"
+        "    mov rdi, [rsp + 32]\n"
+        "    add rsp, $64\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(5, exit_code);
+    return 0;
+}
+
+/* Test: Packed compare/logical path should propagate all-ones lane pattern */
+int test_integration_sse_packed_logic_runtime(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    sub rsp, $32\n"
+        "    pxor xmm0, xmm0\n"
+        "    pcmpeqd xmm0, xmm0\n"
+        "    pxor xmm1, xmm1\n"
+        "    pcmpeqd xmm1, xmm1\n"
+        "    pandn xmm1, xmm0\n"
+        "    por xmm1, xmm0\n"
+        "    movdqu [rsp], xmm1\n"
+        "    mov rdi, [rsp]\n"
+        "    add rsp, $32\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(255, exit_code);
+    return 0;
+}
+
+/* Test: Packed SSE arithmetic with SIB-indexed memory operands should execute correctly */
+int test_integration_sse_packed_sib_runtime(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    sub rsp, $128\n"
+        "    mov r8, rsp\n"
+        "    mov r9, $2\n"     /* vec1 at rsp + 16 */
+        "    mov r10, $6\n"    /* vec2 at rsp + 48 */
+        "\n"
+        "    mov rax, $1\n"
+        "    mov [rsp + 16], rax\n"
+        "    mov rax, $2\n"
+        "    mov [rsp + 24], rax\n"
+        "\n"
+        "    mov rax, $5\n"
+        "    mov [rsp + 48], rax\n"
+        "    mov rax, $7\n"
+        "    mov [rsp + 56], rax\n"
+        "\n"
+        "    movdqu xmm0, [r8 + r9*8]\n"
+        "    paddd xmm0, [r8 + r10*8]\n"
+        "    movdqu [rsp + 80], xmm0\n"
+        "\n"
+        "    mov rdi, [rsp + 80]\n"
+        "    add rsp, $128\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(6, exit_code);
+    return 0;
+}
+
+/* Test: Packed compare/logical ops with SIB-indexed memory should execute correctly */
+int test_integration_sse_packed_logic_sib_runtime(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    sub rsp, $128\n"
+        "    mov r8, rsp\n"
+        "    mov r9, $4\n"     /* lane storage at rsp + 32 */
+        "\n"
+        "    pxor xmm0, xmm0\n"
+        "    pcmpeqd xmm0, xmm0\n"
+        "    movdqu [r8 + r9*8], xmm0\n"
+        "\n"
+        "    pxor xmm1, xmm1\n"
+        "    por xmm1, [r8 + r9*8]\n"
+        "    movdqu [rsp + 96], xmm1\n"
+        "\n"
+        "    mov rdi, [rsp + 96]\n"
+        "    add rsp, $128\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(255, exit_code);
+    return 0;
+}
+
 /* Test: High 8-bit register should fail when paired with REX-required register */
 int test_integration_high8_rex_conflict(void) {
     const char *source =
@@ -577,6 +862,7 @@ int test_integration_dwarf_sections(void) {
         "global _start\n"
         "_start:\n"
         "    call helper\n"
+        "after_call:\n"
         "    mov rax, $60\n"
         "    mov rdi, $0\n"
         "    syscall\n"
@@ -597,12 +883,18 @@ int test_integration_dwarf_sections(void) {
     int decl_line_attr_found = 0;
     int decl_col_attr_found = 0;
     int comp_dir_attr_found = 0;
+    int type_attr_found = 0;
     int line_end_sequence_found = 0;
     int line_header_ok = 0;
     int debug_info_header_ok = 0;
     int debug_info_cu_abbrev_ok = 0;
     int debug_info_children_end_ok = 0;
+    int debug_info_language_ok = 0;
+    int base_type_die_count = 0;
+    int pointer_type_die_count = 0;
     int subprogram_die_count = 0;
+    int lexical_block_die_count = 0;
+    int label_die_count = 0;
     unsigned char *bytes = NULL;
 
     ASSERT_TRUE(fd >= 0);
@@ -673,6 +965,10 @@ int test_integration_dwarf_sections(void) {
                 size_t p = 12;
                 size_t cu_attr_size = 4 + 2 + 4 + 4 + 4 + 8 + 8;
                 if (p + cu_attr_size <= info_len) {
+                    uint16_t language = (uint16_t)info[p + 4] | ((uint16_t)info[p + 5] << 8);
+                    if (language == 0x0001) {
+                        debug_info_language_ok = 1;
+                    }
                     p += cu_attr_size;
 
                     while (p < info_len) {
@@ -682,28 +978,86 @@ int test_integration_dwarf_sections(void) {
                             break;
                         }
 
-                        if (abbrev_code != 2) {
-                            break;
+                        if (abbrev_code == 2) {
+                            /* base_type DIE: name(strp), encoding(data1), byte_size(data1) */
+                            if (p + 6 > info_len) break;
+                            p += 4;
+                            p += 1;
+                            p += 1;
+                            base_type_die_count++;
+                            continue;
                         }
 
-                        /* subprogram DIE: name(strp), decl_file(data1), decl_line(uleb),
-                         * decl_col(uleb), external(flag), low_pc(addr), high_pc(data8) */
-                        if (p + 5 > info_len) break;
-                        p += 4; /* name */
-                        p += 1; /* decl_file */
+                        if (abbrev_code == 3) {
+                            /* pointer_type DIE: name(strp), byte_size(data1), type(ref4) */
+                            if (p + 9 > info_len) break;
+                            p += 4;
+                            p += 1;
+                            p += 4;
+                            pointer_type_die_count++;
+                            continue;
+                        }
 
-                        uint64_t uleb_val = 0;
-                        p = decode_uleb128_at(info, info_len, p, &uleb_val);
-                        if (p == (size_t)-1) break;
-                        p = decode_uleb128_at(info, info_len, p, &uleb_val);
-                        if (p == (size_t)-1) break;
+                        if (abbrev_code == 4) {
+                            /* subprogram DIE: name(strp), decl_file(data1), decl_line(uleb),
+                             * decl_col(uleb), external(flag), low_pc(addr), high_pc(data8), type(ref4) */
+                            if (p + 5 > info_len) break;
+                            p += 4; /* name */
+                            p += 1; /* decl_file */
 
-                        if (p + 17 > info_len) break;
-                        p += 1;  /* external */
-                        p += 8;  /* low_pc */
-                        p += 8;  /* high_pc */
+                            uint64_t uleb_val = 0;
+                            p = decode_uleb128_at(info, info_len, p, &uleb_val);
+                            if (p == (size_t)-1) break;
+                            p = decode_uleb128_at(info, info_len, p, &uleb_val);
+                            if (p == (size_t)-1) break;
 
-                        subprogram_die_count++;
+                            if (p + 21 > info_len) break;
+                            p += 1;  /* external */
+                            p += 8;  /* low_pc */
+                            p += 8;  /* high_pc */
+                            p += 4;  /* type */
+                            subprogram_die_count++;
+
+                            /* subprogram children: optional lexical blocks, then 0 terminator */
+                            while (p < info_len) {
+                                uint8_t child_code = info[p++];
+                                if (child_code == 0) {
+                                    break;
+                                }
+                                if (child_code != 5) {
+                                    p = info_len;
+                                    break;
+                                }
+                                if (p + 16 > info_len) {
+                                    p = info_len;
+                                    break;
+                                }
+                                p += 8; /* low_pc */
+                                p += 8; /* high_pc */
+                                lexical_block_die_count++;
+                            }
+                            continue;
+                        }
+
+                        if (abbrev_code == 6) {
+                            /* label DIE: name(strp), decl_file(data1), decl_line(uleb), decl_col(uleb), low_pc(addr) */
+                            if (p + 5 > info_len) break;
+                            p += 4;
+                            p += 1;
+
+                            uint64_t uleb_val = 0;
+                            p = decode_uleb128_at(info, info_len, p, &uleb_val);
+                            if (p == (size_t)-1) break;
+                            p = decode_uleb128_at(info, info_len, p, &uleb_val);
+                            if (p == (size_t)-1) break;
+
+                            if (p + 8 > info_len) break;
+                            p += 8;
+                            label_die_count++;
+                            continue;
+                        }
+
+                        break;
                     }
                 }
             }
@@ -717,6 +1071,7 @@ int test_integration_dwarf_sections(void) {
                 if (abbr[j] == 0x3B && abbr[j + 1] == 0x0F) decl_line_attr_found = 1; /* decl_line/udata */
                 if (abbr[j] == 0x39 && abbr[j + 1] == 0x0F) decl_col_attr_found = 1; /* decl_column/udata */
                 if (abbr[j] == 0x1B && abbr[j + 1] == 0x0E) comp_dir_attr_found = 1; /* comp_dir/strp */
+                if (abbr[j] == 0x49 && (abbr[j + 1] == 0x13 || abbr[j + 1] == 0x10)) type_attr_found = 1; /* type/ref4|ref_addr */
             }
         }
         if (strcmp(name, ".debug_line") == 0) {
@@ -790,7 +1145,13 @@ int test_integration_dwarf_sections(void) {
     ASSERT_TRUE(debug_info_header_ok);
     ASSERT_TRUE(debug_info_cu_abbrev_ok);
     ASSERT_TRUE(debug_info_children_end_ok);
+    ASSERT_TRUE(debug_info_language_ok);
+    ASSERT_TRUE(base_type_die_count >= 1);
+    ASSERT_TRUE(pointer_type_die_count >= 1);
     ASSERT_TRUE(subprogram_die_count >= 2);
+    ASSERT_TRUE(lexical_block_die_count >= 1);
+    ASSERT_TRUE(label_die_count >= 1);
+    ASSERT_TRUE(type_attr_found);
 
     free(bytes);
     unlink(asm_file);
@@ -806,6 +1167,7 @@ int test_integration_dwarf_readelf_validation(void) {
         "global _start\n"
         "_start:\n"
         "    call helper\n"
+        "after_call:\n"
         "    mov rax, $60\n"
         "    mov rdi, $0\n"
         "    syscall\n"
@@ -818,6 +1180,10 @@ int test_integration_dwarf_readelf_validation(void) {
     char line[512];
     int saw_comp_dir = 0;
     int saw_subprogram = 0;
+    int saw_language = 0;
+    int saw_type_attr = 0;
+    int saw_lexical_block = 0;
+    int saw_label_tag = 0;
     int saw_start = 0;
     int saw_line_section = 0;
     int saw_file_name = 0;
@@ -849,6 +1215,10 @@ int test_integration_dwarf_readelf_validation(void) {
     while (fgets(line, sizeof(line), info)) {
         if (strstr(line, "DW_AT_comp_dir")) saw_comp_dir = 1;
         if (strstr(line, "DW_TAG_subprogram")) saw_subprogram = 1;
+        if (strstr(line, "DW_AT_language")) saw_language = 1;
+        if (strstr(line, "DW_AT_type")) saw_type_attr = 1;
+        if (strstr(line, "DW_TAG_lexical_block")) saw_lexical_block = 1;
+        if (strstr(line, "DW_TAG_label")) saw_label_tag = 1;
         if (strstr(line, "_start")) saw_start = 1;
     }
     int info_status = pclose(info);
@@ -866,9 +1236,95 @@ int test_integration_dwarf_readelf_validation(void) {
 
     ASSERT_TRUE(saw_comp_dir);
     ASSERT_TRUE(saw_subprogram);
+    ASSERT_TRUE(saw_language);
+    ASSERT_TRUE(saw_type_attr);
+    ASSERT_TRUE(saw_lexical_block);
+    ASSERT_TRUE(saw_label_tag);
     ASSERT_TRUE(saw_start);
     ASSERT_TRUE(saw_line_section);
     ASSERT_TRUE(saw_file_name);
+
+    unlink(asm_file);
+    unlink(bin_file);
+    return 0;
+}
+
+/* Test: Validate DWARF output using dwarfdump/llvm-dwarfdump when available */
+int test_integration_dwarf_dwarfdump_validation(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    call helper\n"
+        "after_call:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n"
+        "helper:\n"
+        "    ret\n";
+    char asm_file[] = "/tmp/test_dbg_dwarfdump_XXXXXX.asm";
+    char bin_file[256];
+    int fd = mkstemps(asm_file, 4);
+    char cmd[512];
+    char line[512];
+    int saw_compile_unit = 0;
+    int saw_subprogram = 0;
+    int saw_lexical_block = 0;
+    int saw_label_tag = 0;
+    int saw_start = 0;
+    int saw_stmt_list = 0;
+    int saw_decl_line = 0;
+    const char *dump_tool = NULL;
+
+    if (system("command -v dwarfdump >/dev/null 2>&1") == 0) {
+        dump_tool = "dwarfdump";
+    } else if (system("command -v llvm-dwarfdump >/dev/null 2>&1") == 0) {
+        dump_tool = "llvm-dwarfdump";
+    }
+
+    if (dump_tool == NULL) {
+        /* Skip in environments where no dwarfdump-compatible tool is available. */
+        return 0;
+    }
+
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)strlen(source), (int)write(fd, source, strlen(source)));
+    close(fd);
+
+    strncpy(bin_file, asm_file, sizeof(bin_file) - 1);
+    bin_file[sizeof(bin_file) - 1] = '\0';
+    char *dot = strrchr(bin_file, '.');
+    if (dot) *dot = '\0';
+
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    ctx->emit_debug_map = true;
+    ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
+    ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
+    asm_free(ctx);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd), "%s %s 2>/dev/null", dump_tool, bin_file) < (int)sizeof(cmd));
+    FILE *dump = popen(cmd, "r");
+    ASSERT_NOT_NULL(dump);
+    while (fgets(line, sizeof(line), dump)) {
+        if (strstr(line, "DW_TAG_compile_unit")) saw_compile_unit = 1;
+        if (strstr(line, "DW_TAG_subprogram")) saw_subprogram = 1;
+        if (strstr(line, "DW_TAG_lexical_block")) saw_lexical_block = 1;
+        if (strstr(line, "DW_TAG_label")) saw_label_tag = 1;
+        if (strstr(line, "_start")) saw_start = 1;
+        if (strstr(line, "DW_AT_stmt_list")) saw_stmt_list = 1;
+        if (strstr(line, "DW_AT_decl_line")) saw_decl_line = 1;
+    }
+    int dump_status = pclose(dump);
+    ASSERT_EQ(0, dump_status);
+
+    ASSERT_TRUE(saw_compile_unit);
+    ASSERT_TRUE(saw_subprogram);
+    ASSERT_TRUE(saw_lexical_block);
+    ASSERT_TRUE(saw_label_tag);
+    ASSERT_TRUE(saw_start);
+    ASSERT_TRUE(saw_stmt_list);
+    ASSERT_TRUE(saw_decl_line);
 
     unlink(asm_file);
     unlink(bin_file);
@@ -938,6 +1394,352 @@ int test_integration_dwarf_overflow_failure(void) {
 
     free(captured_err);
     asm_free(ctx);
+    free(source);
+    unlink(asm_file);
+    unlink(bin_file);
+    return 0;
+}
+
+/* Test: .debug_line should carry known source line mappings for a simple program */
+int test_integration_dwarf_line_table_known_lines(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $1\n"
+        "    mov rdi, $2\n"
+        "    add rdi, $3\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+    char asm_file[] = "/tmp/test_dbg_line_XXXXXX.asm";
+    char bin_file[256];
+    int fd = mkstemps(asm_file, 4);
+    unsigned char *bytes = NULL;
+    int saw_line_4 = 0;
+    int saw_line_5 = 0;
+    int saw_line_6 = 0;
+    int saw_line_7 = 0;
+
+    if (system("command -v readelf >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)strlen(source), (int)write(fd, source, strlen(source)));
+    close(fd);
+
+    strncpy(bin_file, asm_file, sizeof(bin_file) - 1);
+    bin_file[sizeof(bin_file) - 1] = '\0';
+    char *dot = strrchr(bin_file, '.');
+    if (dot) *dot = '\0';
+
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    ctx->emit_debug_map = true;
+    ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
+    ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
+    asm_free(ctx);
+
+    FILE *f = fopen(bin_file, "rb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(0, fseek(f, 0, SEEK_END));
+    long size = ftell(f);
+    ASSERT_TRUE(size > 0);
+    ASSERT_EQ(0, fseek(f, 0, SEEK_SET));
+
+    bytes = malloc((size_t)size);
+    ASSERT_NOT_NULL(bytes);
+    ASSERT_EQ(size, (long)fread(bytes, 1, (size_t)size, f));
+    fclose(f);
+
+    const test_elf64_ehdr_t *eh = (const test_elf64_ehdr_t *)bytes;
+    const test_elf64_shdr_t *shdrs = (const test_elf64_shdr_t *)(bytes + eh->e_shoff);
+    const test_elf64_shdr_t *shstr = &shdrs[eh->e_shstrndx];
+    const char *sec_names = (const char *)(bytes + shstr->sh_offset);
+    const test_elf64_shdr_t *line_sh = NULL;
+
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        const char *sname = sec_names + shdrs[i].sh_name;
+        if (strcmp(sname, ".debug_line") == 0) {
+            line_sh = &shdrs[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(line_sh);
+    ASSERT_TRUE(line_sh->sh_size >= 16);
+
+    const unsigned char *line_sec = bytes + line_sh->sh_offset;
+    size_t line_len = line_sh->sh_size;
+    uint32_t unit_length = (uint32_t)line_sec[0] |
+                           ((uint32_t)line_sec[1] << 8) |
+                           ((uint32_t)line_sec[2] << 16) |
+                           ((uint32_t)line_sec[3] << 24);
+    uint16_t version = (uint16_t)line_sec[4] | ((uint16_t)line_sec[5] << 8);
+    uint32_t header_length = (uint32_t)line_sec[6] |
+                             ((uint32_t)line_sec[7] << 8) |
+                             ((uint32_t)line_sec[8] << 16) |
+                             ((uint32_t)line_sec[9] << 24);
+    ASSERT_EQ(4, version);
+    ASSERT_TRUE((size_t)unit_length + 4 <= line_len);
+
+    size_t p = 10 + header_length;
+    int current_line = 1;
+
+    while (p < line_len) {
+        uint8_t op = line_sec[p++];
+        if (op == 0) {
+            if (p >= line_len) break;
+            uint8_t ext_len = line_sec[p++];
+            if (p + ext_len > line_len) break;
+            if (ext_len > 0 && line_sec[p] == 1) {
+                break; /* DW_LNE_end_sequence */
+            }
+            p += ext_len;
+            continue;
+        }
+
+        if (op == 2) {
+            uint64_t adv = 0;
+            p = decode_uleb128_at(line_sec, line_len, p, &adv);
+            if (p == (size_t)-1) break;
+            continue;
+        }
+
+        if (op == 3) {
+            int64_t delta = 0;
+            p = decode_sleb128_at(line_sec, line_len, p, &delta);
+            if (p == (size_t)-1) break;
+            current_line += (int)delta;
+            continue;
+        }
+
+        if (op == 1) {
+            if (current_line == 4) saw_line_4 = 1;
+            if (current_line == 5) saw_line_5 = 1;
+            if (current_line == 6) saw_line_6 = 1;
+            if (current_line == 7) saw_line_7 = 1;
+            continue;
+        }
+
+        break;
+    }
+
+    ASSERT_TRUE(saw_line_4);
+    ASSERT_TRUE(saw_line_5);
+    ASSERT_TRUE(saw_line_6);
+    ASSERT_TRUE(saw_line_7);
+
+    free(bytes);
+    unlink(asm_file);
+    unlink(bin_file);
+    return 0;
+}
+
+/* Test: DWARF DIE names should stay consistent with text symbols in .symtab */
+int test_integration_dwarf_symbol_table_crosscheck(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    call helper\n"
+        "after_call:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n"
+        "helper:\n"
+        "    ret\n";
+    char asm_file[] = "/tmp/test_dbg_sym_XXXXXX.asm";
+    char bin_file[256];
+    int fd = mkstemps(asm_file, 4);
+    char cmd[512];
+    char line[512];
+    unsigned char *bytes = NULL;
+    int have_start = 0;
+    int have_helper = 0;
+    int have_after_call = 0;
+    int dwarf_has_start = 0;
+    int dwarf_has_helper = 0;
+    int dwarf_has_after_call = 0;
+
+    if (system("command -v readelf >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)strlen(source), (int)write(fd, source, strlen(source)));
+    close(fd);
+
+    strncpy(bin_file, asm_file, sizeof(bin_file) - 1);
+    bin_file[sizeof(bin_file) - 1] = '\0';
+    char *dot = strrchr(bin_file, '.');
+    if (dot) *dot = '\0';
+
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    ctx->emit_debug_map = true;
+    ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
+    ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
+    asm_free(ctx);
+
+    FILE *f = fopen(bin_file, "rb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(0, fseek(f, 0, SEEK_END));
+    long size = ftell(f);
+    ASSERT_TRUE(size > 0);
+    ASSERT_EQ(0, fseek(f, 0, SEEK_SET));
+
+    bytes = malloc((size_t)size);
+    ASSERT_NOT_NULL(bytes);
+    ASSERT_EQ(size, (long)fread(bytes, 1, (size_t)size, f));
+    fclose(f);
+
+    const test_elf64_ehdr_t *eh = (const test_elf64_ehdr_t *)bytes;
+    const test_elf64_shdr_t *shdrs = (const test_elf64_shdr_t *)(bytes + eh->e_shoff);
+    const test_elf64_shdr_t *shstr = &shdrs[eh->e_shstrndx];
+    const char *sec_names = (const char *)(bytes + shstr->sh_offset);
+    const test_elf64_shdr_t *symtab_sh = NULL;
+    const test_elf64_shdr_t *strtab_sh = NULL;
+
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        const char *sname = sec_names + shdrs[i].sh_name;
+        if (strcmp(sname, ".symtab") == 0) symtab_sh = &shdrs[i];
+        if (strcmp(sname, ".strtab") == 0) strtab_sh = &shdrs[i];
+    }
+
+    if (!symtab_sh || !strtab_sh) {
+        free(bytes);
+        unlink(asm_file);
+        unlink(bin_file);
+        return 0;
+    }
+
+    ASSERT_TRUE(symtab_sh->sh_entsize == sizeof(test_elf64_sym_t));
+
+    const test_elf64_sym_t *syms = (const test_elf64_sym_t *)(bytes + symtab_sh->sh_offset);
+    size_t sym_count = (size_t)(symtab_sh->sh_size / symtab_sh->sh_entsize);
+    const char *strtab = (const char *)(bytes + strtab_sh->sh_offset);
+    size_t strtab_size = strtab_sh->sh_size;
+
+    for (size_t i = 0; i < sym_count; i++) {
+        uint32_t off = syms[i].st_name;
+        if (off >= strtab_size) continue;
+        const char *name = strtab + off;
+        if (strcmp(name, "_start") == 0) have_start = 1;
+        if (strcmp(name, "helper") == 0) have_helper = 1;
+        if (strcmp(name, "after_call") == 0) have_after_call = 1;
+    }
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd), "readelf --debug-dump=info %s 2>/dev/null", bin_file) < (int)sizeof(cmd));
+    FILE *info = popen(cmd, "r");
+    ASSERT_NOT_NULL(info);
+    while (fgets(line, sizeof(line), info)) {
+        if (strstr(line, "_start")) dwarf_has_start = 1;
+        if (strstr(line, "helper")) dwarf_has_helper = 1;
+        if (strstr(line, "after_call")) dwarf_has_after_call = 1;
+    }
+    int info_status = pclose(info);
+    ASSERT_EQ(0, info_status);
+
+    ASSERT_TRUE(have_start);
+    ASSERT_TRUE(have_helper);
+    ASSERT_TRUE(have_after_call);
+    ASSERT_TRUE(dwarf_has_start);
+    ASSERT_TRUE(dwarf_has_helper);
+    ASSERT_TRUE(dwarf_has_after_call);
+
+    free(bytes);
+    unlink(asm_file);
+    unlink(bin_file);
+    return 0;
+}
+
+/* Test: Large (50+ function) DWARF generation should succeed and remain structured */
+int test_integration_dwarf_large_program_success(void) {
+    char asm_file[] = "/tmp/test_dbg_large_ok_XXXXXX.asm";
+    char bin_file[256];
+    int fd = mkstemps(asm_file, 4);
+    assembler_context_t *ctx;
+    char *source;
+    size_t cap = 160000;
+    size_t len = 0;
+    int func_count = 64;
+    unsigned char *bytes = NULL;
+
+    ASSERT_TRUE(fd >= 0);
+
+    source = malloc(cap);
+    ASSERT_NOT_NULL(source);
+
+    len += (size_t)snprintf(source + len, cap - len,
+                            "section .text\n"
+                            "global _start\n"
+                            "_start:\n");
+
+    for (int i = 0; i < func_count; i++) {
+        len += (size_t)snprintf(source + len, cap - len,
+                                "    call f_%03d\n", i);
+    }
+
+    len += (size_t)snprintf(source + len, cap - len,
+                            "    mov rax, $60\n"
+                            "    mov rdi, $0\n"
+                            "    syscall\n");
+
+    for (int i = 0; i < func_count; i++) {
+        len += (size_t)snprintf(source + len, cap - len,
+                                "f_%03d:\n"
+                                "    ret\n", i);
+    }
+
+    ASSERT_TRUE(len < cap - 1);
+    ASSERT_EQ((int)len, (int)write(fd, source, len));
+    close(fd);
+
+    strncpy(bin_file, asm_file, sizeof(bin_file) - 1);
+    bin_file[sizeof(bin_file) - 1] = '\0';
+    char *dot = strrchr(bin_file, '.');
+    if (dot) *dot = '\0';
+
+    ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    ctx->emit_debug_map = true;
+
+    ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
+    ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
+    asm_free(ctx);
+
+    FILE *f = fopen(bin_file, "rb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(0, fseek(f, 0, SEEK_END));
+    long size = ftell(f);
+    ASSERT_TRUE(size > 0);
+    ASSERT_EQ(0, fseek(f, 0, SEEK_SET));
+
+    bytes = malloc((size_t)size);
+    ASSERT_NOT_NULL(bytes);
+    ASSERT_EQ(size, (long)fread(bytes, 1, (size_t)size, f));
+    fclose(f);
+
+    const test_elf64_ehdr_t *eh = (const test_elf64_ehdr_t *)bytes;
+    const test_elf64_shdr_t *shdrs = (const test_elf64_shdr_t *)(bytes + eh->e_shoff);
+    const test_elf64_shdr_t *shstr = &shdrs[eh->e_shstrndx];
+    const char *names = (const char *)(bytes + shstr->sh_offset);
+    size_t debug_info_size = 0;
+    size_t debug_line_size = 0;
+
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        const char *name = names + shdrs[i].sh_name;
+        if (strcmp(name, ".debug_info") == 0) debug_info_size = shdrs[i].sh_size;
+        if (strcmp(name, ".debug_line") == 0) debug_line_size = shdrs[i].sh_size;
+    }
+
+    ASSERT_TRUE(debug_info_size > 0);
+    ASSERT_TRUE(debug_line_size > 0);
+    ASSERT_TRUE(debug_info_size < 16384);
+    ASSERT_TRUE(debug_line_size < 65536);
+
+    free(bytes);
     free(source);
     unlink(asm_file);
     unlink(bin_file);
@@ -1047,10 +1849,22 @@ TEST_SUITE(integration) {
     TEST(integration_include_relative);
     TEST(integration_sse_smoke);
     TEST(integration_sse_mixed_controlflow);
+    TEST(integration_sse_scalar_to_gpr_runtime);
+    TEST(integration_sse_all_xmm_registers_runtime);
+    TEST(integration_sse_sequence_runtime);
+    TEST(integration_sse_function_call_preserve_runtime);
+    TEST(integration_sse_packed_arith_runtime);
+    TEST(integration_sse_packed_logic_runtime);
+    TEST(integration_sse_packed_sib_runtime);
+    TEST(integration_sse_packed_logic_sib_runtime);
     TEST(integration_high8_rex_conflict);
     TEST(integration_dwarf_sections);
     TEST(integration_dwarf_readelf_validation);
+    TEST(integration_dwarf_dwarfdump_validation);
     TEST(integration_dwarf_overflow_failure);
+    TEST(integration_dwarf_line_table_known_lines);
+    TEST(integration_dwarf_symbol_table_crosscheck);
+    TEST(integration_dwarf_large_program_success);
     TEST(integration_output_formats_compile);
 }
 

@@ -146,6 +146,63 @@ mov rax, [rbx + rcx] ; Base + index
 mov rax, [rbx]       ; No displacement
 ```
 
+### SSE Operand/Form Errors
+
+**Problem**: SSE instruction fails with operand-form diagnostics.
+
+**Common errors**:
+
+1. `SSE move requires at least one XMM operand`
+2. `SSE move cannot have two memory operands`
+3. `SSE arithmetic destination must be XMM register`
+4. `source must be XMM or memory`
+
+**Examples**:
+
+```asm
+; Wrong - no XMM operand
+movaps [rax], [rbx]
+
+; Wrong - destination must be XMM for arithmetic
+addps [rax], xmm1
+
+; Wrong - immediate sources are not supported for SSE arithmetic
+addps xmm0, $1
+
+; Correct
+movaps xmm0, [rax]
+movaps [rax + 16], xmm0
+addps xmm0, xmm1
+```
+
+**How to debug quickly**:
+
+1. Ensure at least one operand is an XMM register.
+2. For arithmetic/packed/compare/logical SSE families, keep destination as XMM register.
+3. Use memory or XMM source operands only (no immediates/GPRs).
+4. Check [SSE Coverage Matrix](SSE_COVERAGE_MATRIX.md) for currently supported forms.
+
+### High 8-bit Register + REX Conflict
+
+**Problem**: You see errors mentioning `AH/BH/CH/DH` with REX-prefixed encodings.
+
+This is an x86_64 architectural constraint, not a temporary assembler bug.
+
+**Example that fails**:
+
+```asm
+add ah, r8b
+```
+
+**Why it fails**:
+
+- `r8b` requires a REX prefix.
+- `ah`/`bh`/`ch`/`dh` are incompatible with REX-prefixed byte encodings.
+
+**Fix**:
+
+- Use `al`/`bl`/`cl`/`dl` or byte forms of extended registers instead of high 8-bit registers.
+
 ## Runtime Issues
 
 ### "Segmentation fault (core dumped)"

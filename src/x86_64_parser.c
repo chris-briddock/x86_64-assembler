@@ -203,18 +203,20 @@ static void parser_init(parser_state_t *p, const char *input) {
     p->peek.type = TOK_NONE;
 }
 
-/* Print diagnostic error with source context */
-static void parser_error_context(parser_state_t *p, const char *message) {
+/* Print diagnostic error with source context and remediation hint. */
+static void parser_error_context_ex(parser_state_t *p, const char *category,
+                                    const char *message, const char *suggestion) {
     /* Find end of current line */
     const char *line_end = p->pos;
     while (*line_end && *line_end != '\n') line_end++;
     
     /* Calculate line length and column */
     int line_len = (int)(line_end - p->line_start);
-    int col = (int)(p->pos - p->line_start);
+    int col = (int)(p->pos - p->line_start) + 1;
     
     /* Print error message */
-    fprintf(stderr, "Error at line %d: %s\n", p->line, message);
+        fprintf(stderr, "Error at line %d, column %d: [%s] %s\n",
+            p->line, col, category, message);
     
     /* Print the source line */
     fprintf(stderr, "  ");
@@ -225,8 +227,22 @@ static void parser_error_context(parser_state_t *p, const char *message) {
     
     /* Print column indicator */
     fprintf(stderr, "  ");
-    for (int i = 0; i < col; i++) fputc(' ', stderr);
+    for (int i = 1; i < col; i++) fputc(' ', stderr);
     fprintf(stderr, "^\n");
+
+    if (suggestion && suggestion[0] != '\0') {
+        fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+    }
+}
+
+/* Backward-compatible wrapper for existing parser call sites. */
+static void parser_error_context(parser_state_t *p, const char *message) {
+    parser_error_context_ex(
+        p,
+        "Syntax",
+        message,
+        "Check instruction syntax and operands against the assembly reference."
+    );
 }
 
 /* Skip whitespace and comments */
@@ -413,6 +429,10 @@ static reg_t parse_reg(const char *name, reg_size_t *size) {
     return parse_register(name, size);
 }
 
+static bool is_valid_scale_factor(int64_t scale) {
+    return scale == 1 || scale == 2 || scale == 4 || scale == 8;
+}
+
 /* Parse memory operand [base+index*scale+disp] or [label] or [rip+label] */
 static int parse_memory_operand(parser_state_t *p, mem_operand_t *mem) {
     memset(mem, 0, sizeof(*mem));
@@ -442,6 +462,10 @@ static int parse_memory_operand(parser_state_t *p, mem_operand_t *mem) {
                 /* Check for scale factor */
                 if (expect(p, TOK_STAR)) {
                     if (p->current.type == TOK_NUMBER) {
+                        if (!is_valid_scale_factor(p->current.value)) {
+                            parser_error_context(p, "Expected scale factor (1, 2, 4, or 8)");
+                            return -1;
+                        }
                         mem->index = reg;
                         mem->has_index = true;
                         mem->scale = (int)p->current.value;
@@ -498,6 +522,10 @@ static int parse_memory_operand(parser_state_t *p, mem_operand_t *mem) {
                     /* Check for scale factor */
                     if (expect(p, TOK_STAR)) {
                         if (p->current.type == TOK_NUMBER) {
+                            if (!is_valid_scale_factor(p->current.value)) {
+                                parser_error_context(p, "Expected scale factor (1, 2, 4, or 8)");
+                                return -1;
+                            }
                             mem->index = reg;
                             mem->has_index = true;
                             mem->scale = (int)p->current.value;
@@ -531,6 +559,10 @@ static int parse_memory_operand(parser_state_t *p, mem_operand_t *mem) {
             advance(p);
             if (p->current.type == TOK_NUMBER) {
                 if (mem->has_index) {
+                    if (!is_valid_scale_factor(p->current.value)) {
+                        parser_error_context(p, "Expected scale factor (1, 2, 4, or 8)");
+                        return -1;
+                    }
                     mem->scale = (int)p->current.value;
                 } else {
                     parser_error_context(p, "Scale factor requires an index register");
@@ -549,6 +581,11 @@ static int parse_memory_operand(parser_state_t *p, mem_operand_t *mem) {
 
     if (!expect(p, TOK_RBRACKET)) {
         parser_error_context(p, "Expected ']' to close memory operand");
+        return -1;
+    }
+
+    if (mem->is_rip_relative && (mem->has_base || mem->has_index)) {
+        parser_error_context(p, "RIP-relative addressing cannot combine base/index registers");
         return -1;
     }
 
