@@ -542,8 +542,38 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
                             emit_byte(ctx, (v >> (j * 8)) & 0xFF);
                         }
                     }
+                } else if (inst->operands[i].type == OPERAND_STRING && inst->type == INST_DB) {
+                    /* String literal for db directive - emit each character as a byte */
+                    const char *str = inst->operands[i].string;
+                    for (size_t j = 0; j < strlen(str); j++) {
+                        emit_byte(ctx, (uint8_t)str[j]);
+                    }
                 }
             }
+            return 0;
+
+        case INST_RESB:
+        case INST_RESW:
+        case INST_RESD:
+        case INST_RESQ:
+            /* Reserve uninitialized space - emit zeros */
+            if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_IMM) {
+                int64_t count = inst->operands[0].immediate;
+                int size = (inst->type == INST_RESB) ? 1 :
+                          (inst->type == INST_RESW) ? 2 :
+                          (inst->type == INST_RESD) ? 4 : 8;
+                for (int64_t i = 0; i < count * size; i++) {
+                    emit_byte(ctx, 0);
+                }
+            }
+            return 0;
+
+        case INST_EQU:
+            /* equ is handled in the first pass - no emission needed */
+            return 0;
+
+        case INST_TIMES:
+            /* times is handled during parsing/expansion - should not reach here */
             return 0;
 
         case INST_GLOBAL:
@@ -557,12 +587,139 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
         case INST_SECTION:
             /* Section directive - change current section */
             if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                if (strcmp(inst->operands[0].label, ".data") == 0 ||
-                    strcmp(inst->operands[0].label, "data") == 0) {
-                    ctx->current_section = 1;
+                const char *section_name = inst->operands[0].label;
+                if (strcmp(section_name, ".data") == 0 ||
+                    strcmp(section_name, "data") == 0 ||
+                    strcmp(section_name, ".bss") == 0 ||
+                    strcmp(section_name, "bss") == 0 ||
+                    strcmp(section_name, ".rodata") == 0 ||
+                    strcmp(section_name, "rodata") == 0) {
+                    ctx->current_section = 1;  /* Data section */
                 } else {
-                    ctx->current_section = 0;
+                    ctx->current_section = 0;  /* Text section */
                 }
+            }
+            return 0;
+
+        case INST_ALIGN:
+            /* Align directive - pad to alignment boundary */
+            if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_IMM) {
+                int alignment = (int)inst->operands[0].immediate;
+                if (alignment > 0 && (alignment & (alignment - 1)) == 0) {  /* Power of 2 */
+                    uint64_t current_addr = ctx->current_address;
+                    uint64_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
+                    int padding = (int)(aligned_addr - current_addr);
+                    
+                    /* Emit padding: NOPs for text section, zeros for data section */
+                    for (int i = 0; i < padding; i++) {
+                        if (ctx->current_section == 0) {
+                            emit_byte(ctx, 0x90);  /* NOP in text section */
+                        } else {
+                            emit_byte(ctx, 0x00);  /* Zero in data section */
+                        }
+                    }
+                } else {
+                    fprintf(stderr, "Error: align directive requires a power of 2 at line %d\n",
+                            inst->line_number);
+                    return -1;
+                }
+            } else {
+                fprintf(stderr, "Error: align directive requires an immediate operand at line %d\n",
+                        inst->line_number);
+                return -1;
+            }
+            return 0;
+
+        case INST_INCBIN:
+            /* Include binary file - read and emit bytes */
+            if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_STRING) {
+                const char *filename = inst->operands[0].string;
+                FILE *fp = fopen(filename, "rb");
+                if (!fp) {
+                    fprintf(stderr, "Error: Cannot open incbin file '%s' at line %d\n",
+                            filename, inst->line_number);
+                    return -1;
+                }
+                
+                /* Get file size */
+                fseek(fp, 0, SEEK_END);
+                long file_size = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+                
+                if (file_size < 0) {
+                    fprintf(stderr, "Error: Cannot determine size of incbin file '%s' at line %d\n",
+                            filename, inst->line_number);
+                    fclose(fp);
+                    return -1;
+                }
+                
+                /* Read and emit file contents */
+                uint8_t buffer[1024];
+                size_t bytes_read;
+                while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+                    for (size_t i = 0; i < bytes_read; i++) {
+                        emit_byte(ctx, buffer[i]);
+                    }
+                }
+                
+                if (ferror(fp)) {
+                    fprintf(stderr, "Error: Failed to read incbin file '%s' at line %d\n",
+                            filename, inst->line_number);
+                    fclose(fp);
+                    return -1;
+                }
+                
+                fclose(fp);
+            } else {
+                fprintf(stderr, "Error: incbin directive requires a string filename at line %d\n",
+                        inst->line_number);
+                return -1;
+            }
+            return 0;
+
+        case INST_COMM:
+        case INST_LCOMM:
+            /* Common symbol declaration - reserve uninitialized space in BSS */
+            if (inst->operand_count >= 2 &&
+                inst->operands[0].type == OPERAND_LABEL &&
+                inst->operands[1].type == OPERAND_IMM) {
+                const char *symbol = inst->operands[0].label;
+                int64_t size = inst->operands[1].immediate;
+                int64_t alignment = (inst->operand_count >= 3) ?
+                                   inst->operands[2].immediate : 1;
+                
+                if (size <= 0) {
+                    fprintf(stderr, "Error: %s size must be positive at line %d\n",
+                            (inst->type == INST_COMM) ? ".comm" : ".lcomm",
+                            inst->line_number);
+                    return -1;
+                }
+                
+                /* Add symbol to BSS section */
+                /* For now, treat as data section address */
+                uint64_t addr = ctx->current_address;
+                
+                /* Apply alignment if specified */
+                if (alignment > 1) {
+                    addr = (addr + alignment - 1) & ~(alignment - 1);
+                    int padding = (int)(addr - ctx->current_address);
+                    for (int i = 0; i < padding; i++) {
+                        emit_byte(ctx, 0);
+                    }
+                }
+                
+                /* Add symbol */
+                add_symbol(ctx, symbol, addr, (inst->type == INST_COMM), false, 1);
+                
+                /* Reserve space by emitting zeros */
+                for (int64_t i = 0; i < size; i++) {
+                    emit_byte(ctx, 0);
+                }
+            } else {
+                fprintf(stderr, "Error: %s requires symbol name and size at line %d\n",
+                        (inst->type == INST_COMM) ? ".comm" : ".lcomm",
+                        inst->line_number);
+                return -1;
             }
             return 0;
 
@@ -825,8 +982,13 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         /* Handle section directives */
         if (inst->type == INST_SECTION) {
             if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                if (strcmp(inst->operands[0].label, ".data") == 0 ||
-                    strcmp(inst->operands[0].label, "data") == 0) {
+                const char *section_name = inst->operands[0].label;
+                if (strcmp(section_name, ".data") == 0 ||
+                    strcmp(section_name, "data") == 0 ||
+                    strcmp(section_name, ".bss") == 0 ||
+                    strcmp(section_name, "bss") == 0 ||
+                    strcmp(section_name, ".rodata") == 0 ||
+                    strcmp(section_name, "rodata") == 0) {
                     ctx->current_section = 1;
                 } else {
                     ctx->current_section = 0;
@@ -864,8 +1026,13 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         /* Handle section directives */
         if (inst->type == INST_SECTION) {
             if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                if (strcmp(inst->operands[0].label, ".data") == 0 ||
-                    strcmp(inst->operands[0].label, "data") == 0) {
+                const char *section_name = inst->operands[0].label;
+                if (strcmp(section_name, ".data") == 0 ||
+                    strcmp(section_name, "data") == 0 ||
+                    strcmp(section_name, ".bss") == 0 ||
+                    strcmp(section_name, "bss") == 0 ||
+                    strcmp(section_name, ".rodata") == 0 ||
+                    strcmp(section_name, "rodata") == 0) {
                     ctx->current_section = 1;
                 } else {
                     ctx->current_section = 0;
@@ -898,13 +1065,105 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
             int size = (inst->type == INST_DB) ? 1 :
                       (inst->type == INST_DW) ? 2 :
                       (inst->type == INST_DD) ? 4 : 8;
+            /* Calculate total bytes - handle string literals for db */
+            int total_bytes = 0;
+            for (int j = 0; j < inst->operand_count; j++) {
+                if (inst->operands[j].type == OPERAND_STRING && inst->type == INST_DB) {
+                    total_bytes += (int)strlen(inst->operands[j].string);
+                } else {
+                    total_bytes += size;
+                }
+            }
             if (ctx->current_section == 0) {
-                ctx->current_address += size * inst->operand_count;
+                ctx->current_address += total_bytes;
             } else {
-                current_data_addr += size * inst->operand_count;
+                current_data_addr += total_bytes;
+            }
+        } else if (inst->type == INST_RESB || inst->type == INST_RESW ||
+                   inst->type == INST_RESD || inst->type == INST_RESQ) {
+            /* Reserve uninitialized space */
+            if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_IMM) {
+                int size = (inst->type == INST_RESB) ? 1 :
+                          (inst->type == INST_RESW) ? 2 :
+                          (inst->type == INST_RESD) ? 4 : 8;
+                int64_t reserved = inst->operands[0].immediate * size;
+                if (ctx->current_section == 0) {
+                    ctx->current_address += reserved;
+                } else {
+                    current_data_addr += reserved;
+                }
+            }
+        } else if (inst->type == INST_EQU) {
+            /* equ doesn't take up space - define symbol if not already done */
+            if (inst->has_label && inst->operand_count >= 1 &&
+                inst->operands[0].type == OPERAND_IMM) {
+                /* Check if symbol already exists */
+                bool exists = false;
+                for (int j = 0; j < ctx->symbol_count; j++) {
+                    if (strcmp(ctx->symbols[j].name, inst->label) == 0) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    /* equ defines an absolute constant, not an address */
+                    add_symbol(ctx, inst->label, (uint64_t)inst->operands[0].immediate,
+                              false, false, -1);  /* section -1 indicates constant */
+                }
+            }
+        } else if (inst->type == INST_ALIGN) {
+            /* Align directive - calculate padding bytes */
+            if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_IMM) {
+                int alignment = (int)inst->operands[0].immediate;
+                if (alignment > 0 && (alignment & (alignment - 1)) == 0) {  /* Power of 2 */
+                    uint64_t current_addr = (ctx->current_section == 0) ?
+                                           ctx->current_address : current_data_addr;
+                    uint64_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
+                    int padding = (int)(aligned_addr - current_addr);
+                    if (ctx->current_section == 0) {
+                        ctx->current_address += padding;
+                    } else {
+                        current_data_addr += padding;
+                    }
+                }
+            }
+        } else if (inst->type == INST_INCBIN) {
+            /* Include binary file - add file size to address */
+            if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_STRING) {
+                const char *filename = inst->operands[0].string;
+                FILE *fp = fopen(filename, "rb");
+                if (fp) {
+                    fseek(fp, 0, SEEK_END);
+                    long file_size = ftell(fp);
+                    fclose(fp);
+                    if (file_size > 0) {
+                        if (ctx->current_section == 0) {
+                            ctx->current_address += file_size;
+                        } else {
+                            current_data_addr += file_size;
+                        }
+                    }
+                }
+            }
+        } else if (inst->type == INST_COMM || inst->type == INST_LCOMM) {
+            /* Common symbol - add size to address */
+            if (inst->operand_count >= 2 && inst->operands[1].type == OPERAND_IMM) {
+                int64_t size = inst->operands[1].immediate;
+                int64_t alignment = (inst->operand_count >= 3) ?
+                                   inst->operands[2].immediate : 1;
+                
+                if (size > 0) {
+                    uint64_t *addr = (ctx->current_section == 0) ?
+                                    &ctx->current_address : &current_data_addr;
+                    /* Apply alignment */
+                    if (alignment > 1) {
+                        *addr = (*addr + alignment - 1) & ~(alignment - 1);
+                    }
+                    *addr += size;
+                }
             }
         } else if (inst->type != INST_GLOBAL && inst->type != INST_EXTERN &&
-                   inst->type != INST_NOP) {
+                   inst->type != INST_NOP && inst->type != INST_TIMES) {
             if (ctx->current_section == 0) {
                 ctx->current_address += estimate_instruction_size(inst);
             }
@@ -923,8 +1182,13 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         /* Handle section directives */
         if (inst->type == INST_SECTION) {
             if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                if (strcmp(inst->operands[0].label, ".data") == 0 ||
-                    strcmp(inst->operands[0].label, "data") == 0) {
+                const char *section_name = inst->operands[0].label;
+                if (strcmp(section_name, ".data") == 0 ||
+                    strcmp(section_name, "data") == 0 ||
+                    strcmp(section_name, ".bss") == 0 ||
+                    strcmp(section_name, "bss") == 0 ||
+                    strcmp(section_name, ".rodata") == 0 ||
+                    strcmp(section_name, "rodata") == 0) {
                     ctx->current_section = 1;
                 } else {
                     ctx->current_section = 0;
@@ -997,6 +1261,10 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
             continue;
         }
 
+        if (inst->type == INST_ALIGN) {
+            /* Align directive handled by encoder */
+        }
+
         if (ctx->line_map_count < MAX_LINE_MAP) {
             ctx->line_map[ctx->line_map_count].address = inst->address;
             ctx->line_map[ctx->line_map_count].line = inst->line_number > 0 ? inst->line_number : 1;
@@ -1023,8 +1291,13 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         /* Handle section directives */
         if (inst->type == INST_SECTION) {
             if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                if (strcmp(inst->operands[0].label, ".data") == 0 ||
-                    strcmp(inst->operands[0].label, "data") == 0) {
+                const char *section_name = inst->operands[0].label;
+                if (strcmp(section_name, ".data") == 0 ||
+                    strcmp(section_name, "data") == 0 ||
+                    strcmp(section_name, ".bss") == 0 ||
+                    strcmp(section_name, "bss") == 0 ||
+                    strcmp(section_name, ".rodata") == 0 ||
+                    strcmp(section_name, "rodata") == 0) {
                     ctx->current_section = 1;
                 } else {
                     ctx->current_section = 0;
@@ -1074,7 +1347,48 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                             emit_byte(ctx, (v >> (k * 8)) & 0xFF);
                         }
                     }
+                } else if (inst->operands[j].type == OPERAND_STRING && inst->type == INST_DB) {
+                    /* String literal for db directive */
+                    const char *str = inst->operands[j].string;
+                    for (size_t k = 0; k < strlen(str); k++) {
+                        emit_byte(ctx, (uint8_t)str[k]);
+                    }
                 }
+            }
+        } else if (inst->type == INST_RESB || inst->type == INST_RESW ||
+                   inst->type == INST_RESD || inst->type == INST_RESQ) {
+            /* Reserve uninitialized space - emit zeros */
+            if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_IMM) {
+                int64_t count = inst->operands[0].immediate;
+                int size = (inst->type == INST_RESB) ? 1 :
+                          (inst->type == INST_RESW) ? 2 :
+                          (inst->type == INST_RESD) ? 4 : 8;
+                for (int64_t k = 0; k < count * size; k++) {
+                    emit_byte(ctx, 0);
+                }
+            }
+        } else if (inst->type == INST_ALIGN) {
+            /* Align directive - handled by encoder */
+            if (encode_instruction(ctx, inst) < 0) {
+                fprintf(stderr, "Error: Failed to encode align at line %d\n", inst->line_number);
+                free_instructions(insts);
+                return -1;
+            }
+        } else if (inst->type == INST_INCBIN) {
+            /* Include binary file - handled by encoder */
+            if (encode_instruction(ctx, inst) < 0) {
+                fprintf(stderr, "Error: Failed to encode incbin at line %d\n", inst->line_number);
+                free_instructions(insts);
+                return -1;
+            }
+        } else if (inst->type == INST_COMM || inst->type == INST_LCOMM) {
+            /* Common symbol - handled by encoder */
+            if (encode_instruction(ctx, inst) < 0) {
+                fprintf(stderr, "Error: Failed to encode %s at line %d\n",
+                        (inst->type == INST_COMM) ? ".comm" : ".lcomm",
+                        inst->line_number);
+                free_instructions(insts);
+                return -1;
             }
         }
     }

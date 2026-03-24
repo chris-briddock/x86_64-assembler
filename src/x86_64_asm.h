@@ -235,6 +235,13 @@ typedef enum {
 
     /* Pseudo-instructions */
     INST_DB, INST_DW, INST_DD, INST_DQ,
+    INST_RESB, INST_RESW, INST_RESD, INST_RESQ,  /* Reserve uninitialized space */
+    INST_EQU,                                   /* Constant definition */
+    INST_TIMES,                                 /* Repeat directive */
+    INST_ALIGN,                                 /* Align directive */
+    INST_INCBIN,                                /* Include binary file */
+    INST_COMM,                                  /* Common symbol declaration */
+    INST_LCOMM,                                 /* Local common symbol declaration */
     INST_GLOBAL, INST_EXTERN, INST_SECTION,
 
     INST_UNKNOWN = -1

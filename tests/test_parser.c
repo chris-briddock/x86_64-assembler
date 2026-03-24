@@ -719,6 +719,618 @@ int test_macro_multiple_invocations(void) {
     return 0;
 }
 
+/* Test: Parse times directive expansion */
+int test_parse_times_directive(void) {
+    int count = 0;
+    const char *source = "times 3 nop\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(3, count);
+    ASSERT_EQ(INST_NOP, insts[0].type);
+    ASSERT_EQ(INST_NOP, insts[1].type);
+    ASSERT_EQ(INST_NOP, insts[2].type);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse times with larger count */
+int test_parse_times_large_count(void) {
+    int count = 0;
+    const char *source = "times 10 nop\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(10, count);
+    for (int i = 0; i < 10; i++) {
+        ASSERT_EQ(INST_NOP, insts[i].type);
+    }
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse equ directive */
+int test_parse_equ_directive(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    
+    const char *source = "BUFFER_SIZE equ 256\n";
+    int count = 0;
+    
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_EQU, insts[0].type);
+    ASSERT_TRUE(insts[0].has_label);
+    ASSERT_EQ_STR("BUFFER_SIZE", insts[0].label);
+    ASSERT_EQ(1, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[0].type);
+    ASSERT_EQ(256, insts[0].operands[0].immediate);
+    
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: Parse equ with hex value */
+int test_parse_equ_hex(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    
+    const char *source = "MAGIC equ 0x12345678\n";
+    int count = 0;
+    
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_EQU, insts[0].type);
+    ASSERT_EQ(0x12345678, insts[0].operands[0].immediate);
+    
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: Parse resb directive */
+int test_parse_resb(void) {
+    int count = 0;
+    const char *source = "buffer: resb 64\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_RESB, insts[0].type);
+    ASSERT_TRUE(insts[0].has_label);
+    ASSERT_EQ_STR("buffer", insts[0].label);
+    ASSERT_EQ(1, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[0].type);
+    ASSERT_EQ(64, insts[0].operands[0].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse resw directive */
+int test_parse_resw(void) {
+    int count = 0;
+    const char *source = "words: resw 10\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_RESW, insts[0].type);
+    ASSERT_EQ(10, insts[0].operands[0].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse resd directive */
+int test_parse_resd(void) {
+    int count = 0;
+    const char *source = "dwords: resd 5\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_RESD, insts[0].type);
+    ASSERT_EQ(5, insts[0].operands[0].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse resq directive */
+int test_parse_resq(void) {
+    int count = 0;
+    const char *source = "qwords: resq 4\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_RESQ, insts[0].type);
+    ASSERT_EQ(4, insts[0].operands[0].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse db with string literal */
+int test_parse_db_string(void) {
+    int count = 0;
+    const char *source = "msg: db \"Hello\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_DB, insts[0].type);
+    ASSERT_TRUE(insts[0].has_label);
+    ASSERT_EQ(1, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_STRING, insts[0].operands[0].type);
+    ASSERT_EQ_STR("Hello", insts[0].operands[0].string);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse db with string containing escape sequences */
+int test_parse_db_string_escapes(void) {
+    int count = 0;
+    const char *source = "msg: db \"Hello\\nWorld\\t!\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_DB, insts[0].type);
+    ASSERT_EQ(OPERAND_STRING, insts[0].operands[0].type);
+    /* The escape sequences should be processed: \n -> newline, \t -> tab */
+    ASSERT_TRUE(strchr(insts[0].operands[0].string, '\n') != NULL);
+    ASSERT_TRUE(strchr(insts[0].operands[0].string, '\t') != NULL);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse db with mixed string and immediates */
+int test_parse_db_mixed(void) {
+    int count = 0;
+    const char *source = "msg: db \"Hi\", 10, 0\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_DB, insts[0].type);
+    ASSERT_EQ(3, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_STRING, insts[0].operands[0].type);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[1].type);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[2].type);
+    ASSERT_EQ(10, insts[0].operands[1].immediate);
+    ASSERT_EQ(0, insts[0].operands[2].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse .bss section directive */
+int test_parse_bss_section(void) {
+    int count = 0;
+    const char *source =
+        "section .bss\n"
+        "buffer: resb 64\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_RESB, insts[1].type);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse .rodata section directive */
+int test_parse_rodata_section(void) {
+    int count = 0;
+    const char *source =
+        "section .rodata\n"
+        "msg: db \"Hello\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_DB, insts[1].type);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse character literal */
+int test_parse_char_literal(void) {
+    int count = 0;
+    const char *source = "mov al, 'A'\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(2, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_REG, insts[0].operands[0].type);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[1].type);
+    ASSERT_EQ(65, insts[0].operands[1].immediate);  /* 'A' = 65 */
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse character literal with escape sequence */
+int test_parse_char_literal_escape(void) {
+    int count = 0;
+    const char *source = "mov al, '\\n'\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[1].type);
+    ASSERT_EQ(10, insts[0].operands[1].immediate);  /* '\n' = 10 */
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse character literal in db directive */
+int test_parse_char_literal_in_db(void) {
+    int count = 0;
+    const char *source = "char_a: db 'A'\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_DB, insts[0].type);
+    ASSERT_TRUE(insts[0].has_label);
+    ASSERT_EQ(1, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[0].type);
+    ASSERT_EQ(65, insts[0].operands[0].immediate);  /* 'A' = 65 */
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse character literal in instruction */
+int test_parse_char_literal_in_instruction(void) {
+    int count = 0;
+    const char *source =
+        "section .text\n"
+        "mov al, 'A'\n"
+        "mov bl, '\\t'\n"
+        "mov cl, '\\0'\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(4, count);  /* section + 3 mov */
+    ASSERT_EQ(INST_MOV, insts[1].type);
+    ASSERT_EQ(INST_MOV, insts[2].type);
+    ASSERT_EQ(INST_MOV, insts[3].type);
+    ASSERT_EQ(65, insts[1].operands[1].immediate);   /* 'A' */
+    ASSERT_EQ(9, insts[2].operands[1].immediate);    /* '\t' */
+    ASSERT_EQ(0, insts[3].operands[1].immediate);    /* '\0' */
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse align directive */
+int test_parse_align(void) {
+    int count = 0;
+    const char *source =
+        "section .text\n"
+        "nop\n"
+        "align 8\n"
+        "nop\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(4, count);  /* section + nop + align + nop */
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_NOP, insts[1].type);
+    ASSERT_EQ(INST_ALIGN, insts[2].type);
+    ASSERT_EQ(1, insts[2].operand_count);
+    ASSERT_EQ(OPERAND_IMM, insts[2].operands[0].type);
+    ASSERT_EQ(8, insts[2].operands[0].immediate);
+    ASSERT_EQ(INST_NOP, insts[3].type);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse align directive with different alignments */
+int test_parse_align_various(void) {
+    int count = 0;
+    const char *source =
+        "section .text\n"
+        "align 4\n"
+        "align 8\n"
+        "align 16\n"
+        "align 32\n"
+        "align 64\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(6, count);  /* section + 5 align */
+    ASSERT_EQ(INST_ALIGN, insts[1].type);
+    ASSERT_EQ(4, insts[1].operands[0].immediate);
+    ASSERT_EQ(INST_ALIGN, insts[2].type);
+    ASSERT_EQ(8, insts[2].operands[0].immediate);
+    ASSERT_EQ(INST_ALIGN, insts[3].type);
+    ASSERT_EQ(16, insts[3].operands[0].immediate);
+    ASSERT_EQ(INST_ALIGN, insts[4].type);
+    ASSERT_EQ(32, insts[4].operands[0].immediate);
+    ASSERT_EQ(INST_ALIGN, insts[5].type);
+    ASSERT_EQ(64, insts[5].operands[0].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse align in data section */
+int test_parse_align_data(void) {
+    int count = 0;
+    const char *source =
+        "section .data\n"
+        "db 0x01\n"
+        "align 4\n"
+        "dd 0x12345678\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(4, count);  /* section + db + align + dd */
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_DB, insts[1].type);
+    ASSERT_EQ(INST_ALIGN, insts[2].type);
+    ASSERT_EQ(4, insts[2].operands[0].immediate);
+    ASSERT_EQ(INST_DD, insts[3].type);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse UTF-8 string with emoji */
+int test_parse_utf8_string(void) {
+    int count = 0;
+    const char *source =
+        "section .data\n"
+        "db \"Hello 🎉\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + db */
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_DB, insts[1].type);
+    ASSERT_EQ(1, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_STRING, insts[1].operands[0].type);
+    /* UTF-8 emoji 🎉 = 0xF0 0x9F 0x8E 0x89 (4 bytes) + 5 ASCII chars + null */
+    ASSERT_TRUE(strlen(insts[1].operands[0].string) >= 9);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse UTF-8 string with Chinese characters */
+int test_parse_utf8_chinese(void) {
+    int count = 0;
+    const char *source =
+        "section .data\n"
+        "db \"你好世界\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + db */
+    ASSERT_EQ(INST_DB, insts[1].type);
+    ASSERT_EQ(OPERAND_STRING, insts[1].operands[0].type);
+    /* Each Chinese char is 3 bytes in UTF-8, 4 chars = 12 bytes */
+    ASSERT_EQ(12, (int)strlen(insts[1].operands[0].string));
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse UTF-8 string mixed with escapes */
+int test_parse_utf8_mixed(void) {
+    int count = 0;
+    const char *source =
+        "section .data\n"
+        "db \"Text\\n你好\\tEnd\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + db */
+    ASSERT_EQ(INST_DB, insts[1].type);
+    ASSERT_EQ(OPERAND_STRING, insts[1].operands[0].type);
+    
+    /* Verify the string contains the UTF-8 content and escape sequences */
+    const char *str = insts[1].operands[0].string;
+    /* String should be: "Text\n你好\tEnd" */
+    ASSERT_TRUE(str[0] == 'T');
+    ASSERT_TRUE(str[1] == 'e');
+    ASSERT_TRUE(str[2] == 'x');
+    ASSERT_TRUE(str[3] == 't');
+    ASSERT_TRUE(str[4] == '\n');  /* Escaped newline */
+    /* Then 6 bytes of UTF-8 Chinese characters */
+    ASSERT_TRUE((unsigned char)str[5] == 0xE4);  /* First byte of 你 */
+    ASSERT_TRUE(str[11] == '\t');  /* Escaped tab after Chinese chars */
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse incbin directive */
+int test_parse_incbin(void) {
+    int count = 0;
+    const char *source =
+        "section .data\n"
+        "incbin \"test.bin\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + incbin */
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_INCBIN, insts[1].type);
+    ASSERT_EQ(1, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_STRING, insts[1].operands[0].type);
+    ASSERT_EQ_STR("test.bin", insts[1].operands[0].string);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: String concatenation (two strings) */
+int test_parse_string_concat(void) {
+    int count = 0;
+    const char *source =
+        "section .data\n"
+        "db \"Hello \" \"World\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + db */
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_DB, insts[1].type);
+    ASSERT_EQ(1, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_STRING, insts[1].operands[0].type);
+    ASSERT_EQ_STR("Hello World", insts[1].operands[0].string);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: String concatenation (multiple strings) */
+int test_parse_string_concat_multiple(void) {
+    int count = 0;
+    const char *source =
+        "section .data\n"
+        "db \"A\" \"B\" \"C\" \"D\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + db */
+    ASSERT_EQ(INST_DB, insts[1].type);
+    ASSERT_EQ(1, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_STRING, insts[1].operands[0].type);
+    ASSERT_EQ_STR("ABCD", insts[1].operands[0].string);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: String concatenation with escape sequences */
+int test_parse_string_concat_with_escapes(void) {
+    int count = 0;
+    const char *source =
+        "section .data\n"
+        "db \"Line1\\n\" \"Line2\\n\"\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + db */
+    ASSERT_EQ(INST_DB, insts[1].type);
+    ASSERT_EQ(1, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_STRING, insts[1].operands[0].type);
+    /* Result should be "Line1\nLine2\n" with actual newline chars */
+    const char *str = insts[1].operands[0].string;
+    ASSERT_TRUE(str[5] == '\n');  /* First \n */
+    ASSERT_TRUE(str[11] == '\n'); /* Second \n */
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: .comm directive */
+int test_parse_comm(void) {
+    int count = 0;
+    const char *source =
+        "section .bss\n"
+        ".comm buffer, 256\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + comm */
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_COMM, insts[1].type);
+    ASSERT_EQ(2, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_LABEL, insts[1].operands[0].type);
+    ASSERT_EQ_STR("buffer", insts[1].operands[0].label);
+    ASSERT_EQ(OPERAND_IMM, insts[1].operands[1].type);
+    ASSERT_EQ(256, insts[1].operands[1].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: .comm directive with alignment */
+int test_parse_comm_with_alignment(void) {
+    int count = 0;
+    const char *source =
+        "section .bss\n"
+        ".comm array, 1024, 8\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + comm */
+    ASSERT_EQ(INST_COMM, insts[1].type);
+    ASSERT_EQ(3, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_LABEL, insts[1].operands[0].type);
+    ASSERT_EQ_STR("array", insts[1].operands[0].label);
+    ASSERT_EQ(1024, insts[1].operands[1].immediate);
+    ASSERT_EQ(8, insts[1].operands[2].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: .lcomm directive */
+int test_parse_lcomm(void) {
+    int count = 0;
+    const char *source =
+        "section .bss\n"
+        ".lcomm local_buf, 128\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + lcomm */
+    ASSERT_EQ(INST_LCOMM, insts[1].type);
+    ASSERT_EQ(2, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_LABEL, insts[1].operands[0].type);
+    ASSERT_EQ_STR("local_buf", insts[1].operands[0].label);
+    ASSERT_EQ(128, insts[1].operands[1].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: .lcomm directive with alignment */
+int test_parse_lcomm_with_alignment(void) {
+    int count = 0;
+    const char *source =
+        "section .bss\n"
+        ".lcomm aligned_buf, 512, 16\n";
+    
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);  /* section + lcomm */
+    ASSERT_EQ(INST_LCOMM, insts[1].type);
+    ASSERT_EQ(3, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_LABEL, insts[1].operands[0].type);
+    ASSERT_EQ_STR("aligned_buf", insts[1].operands[0].label);
+    ASSERT_EQ(512, insts[1].operands[1].immediate);
+    ASSERT_EQ(16, insts[1].operands[2].immediate);
+    
+    free_instructions(insts);
+    return 0;
+}
+
 /* Test Suite: Parser Tests */
 TEST_SUITE(parser) {
     TEST(parse_mov);
@@ -756,6 +1368,51 @@ TEST_SUITE(parser) {
     TEST(macro_dollar_syntax);
     TEST(macro_no_params);
     TEST(macro_multiple_invocations);
+
+    /* New directive tests */
+    TEST(parse_times_directive);
+    TEST(parse_times_large_count);
+    TEST(parse_equ_directive);
+    TEST(parse_equ_hex);
+    TEST(parse_resb);
+    TEST(parse_resw);
+    TEST(parse_resd);
+    TEST(parse_resq);
+    TEST(parse_db_string);
+    TEST(parse_db_string_escapes);
+    TEST(parse_db_mixed);
+    TEST(parse_bss_section);
+    TEST(parse_rodata_section);
+    
+    /* Character literal tests */
+    TEST(parse_char_literal);
+    TEST(parse_char_literal_escape);
+    TEST(parse_char_literal_in_db);
+    TEST(parse_char_literal_in_instruction);
+    
+    /* Align directive tests */
+    TEST(parse_align);
+    TEST(parse_align_various);
+    TEST(parse_align_data);
+    
+    /* incbin directive tests */
+    TEST(parse_incbin);
+    
+    /* UTF-8 string tests */
+    TEST(parse_utf8_string);
+    TEST(parse_utf8_chinese);
+    TEST(parse_utf8_mixed);
+    
+    /* String concatenation tests */
+    TEST(parse_string_concat);
+    TEST(parse_string_concat_multiple);
+    TEST(parse_string_concat_with_escapes);
+    
+    /* Common symbol tests */
+    TEST(parse_comm);
+    TEST(parse_comm_with_alignment);
+    TEST(parse_lcomm);
+    TEST(parse_lcomm_with_alignment);
 }
 
 /* Main entry point */

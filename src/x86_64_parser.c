@@ -19,6 +19,7 @@ typedef enum {
     TOK_IDENTIFIER,
     TOK_NUMBER,
     TOK_STRING,
+    TOK_CHAR,       /* 'A' - character literal */
     TOK_COLON,      /* : */
     TOK_COMMA,      /* , */
     TOK_LBRACKET,   /* [ */
@@ -48,6 +49,44 @@ typedef struct {
     token_t peek;
     int line;
 } parser_state_t;
+
+/**
+ * Validate that a string contains valid UTF-8 encoding
+ * Returns: number of valid UTF-8 code points, or -1 if invalid
+ */
+static int validate_utf8(const char *str) {
+    int count = 0;
+    const unsigned char *s = (const unsigned char *)str;
+    
+    while (*s) {
+        if (*s < 0x80) {
+            /* ASCII (0xxxxxxx) */
+            count++;
+            s++;
+        } else if ((*s & 0xE0) == 0xC0) {
+            /* 2-byte sequence (110xxxxx 10xxxxxx) */
+            if (*(s + 1) == 0 || (*(s + 1) & 0xC0) != 0x80) return -1;
+            count++;
+            s += 2;
+        } else if ((*s & 0xF0) == 0xE0) {
+            /* 3-byte sequence (1110xxxx 10xxxxxx 10xxxxxx) */
+            if (*(s + 1) == 0 || *(s + 2) == 0) return -1;
+            if ((*(s + 1) & 0xC0) != 0x80 || (*(s + 2) & 0xC0) != 0x80) return -1;
+            count++;
+            s += 3;
+        } else if ((*s & 0xF8) == 0xF0) {
+            /* 4-byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx) */
+            if (*(s + 1) == 0 || *(s + 2) == 0 || *(s + 3) == 0) return -1;
+            if ((*(s + 1) & 0xC0) != 0x80 || (*(s + 2) & 0xC0) != 0x80 || (*(s + 3) & 0xC0) != 0x80) return -1;
+            count++;
+            s += 4;
+        } else {
+            /* Invalid UTF-8 lead byte */
+            return -1;
+        }
+    }
+    return count;
+}
 
 /* Instruction name table */
 typedef struct {
@@ -184,11 +223,23 @@ static const inst_name_t inst_table[] = {
     /* Pseudo-instructions */
     {"db", INST_DB}, {"dw", INST_DW},
     {"dd", INST_DD}, {"dq", INST_DQ},
+    {"resb", INST_RESB}, {"resw", INST_RESW},
+    {"resd", INST_RESD}, {"resq", INST_RESQ},
+    {"equ", INST_EQU},
+    {"times", INST_TIMES},
+    {"align", INST_ALIGN},
+    {"incbin", INST_INCBIN},
+    {"comm", INST_COMM},
+    {".comm", INST_COMM},
+    {"lcomm", INST_LCOMM},
+    {".lcomm", INST_LCOMM},
     {"global", INST_GLOBAL}, {"extern", INST_EXTERN},
     {".global", INST_GLOBAL}, {".extern", INST_EXTERN},
     {"section", INST_SECTION}, {".section", INST_SECTION},
     {".text", INST_SECTION}, {".data", INST_SECTION},
     {"text", INST_SECTION}, {"data", INST_SECTION},
+    {".bss", INST_SECTION}, {"bss", INST_SECTION},
+    {".rodata", INST_SECTION}, {"rodata", INST_SECTION},
 
     {NULL, INST_UNKNOWN}
 };
@@ -317,11 +368,45 @@ static token_t next_token(parser_state_t *p) {
         case '$': tok.type = TOK_DOLLAR; p->pos++; return tok;
     }
 
-    /* String literal */
-    if (*p->pos == '"' || *p->pos == '\'') {
-        char quote = *p->pos++;
+    /* Character literal (single-quoted) */
+    if (*p->pos == '\'') {
+        p->pos++;  /* Skip opening quote */
+        char ch = 0;
+        
+        if (*p->pos == '\\' && *(p->pos + 1)) {
+            /* Escape sequence */
+            p->pos++;
+            switch (*p->pos) {
+                case 'n': ch = '\n'; break;
+                case 't': ch = '\t'; break;
+                case 'r': ch = '\r'; break;
+                case '0': ch = '\0'; break;
+                case '\\': ch = '\\'; break;
+                case '"': ch = '"'; break;
+                case '\'': ch = '\''; break;
+                default: ch = *p->pos; break;
+            }
+            p->pos++;
+        } else if (*p->pos && *p->pos != '\'') {
+            /* Regular character */
+            ch = *p->pos++;
+        }
+        
+        /* Skip closing quote */
+        if (*p->pos == '\'') p->pos++;
+        
+        tok.type = TOK_CHAR;
+        tok.value = (int64_t)(unsigned char)ch;
+        tok.text[0] = ch;
+        tok.text[1] = '\0';
+        return tok;
+    }
+    
+    /* String literal (double-quoted) */
+    if (*p->pos == '"') {
+        p->pos++;  /* Skip opening quote */
         int i = 0;
-        while (*p->pos && *p->pos != quote && i < MAX_LINE_LENGTH - 1) {
+        while (*p->pos && *p->pos != '"' && i < MAX_LINE_LENGTH - 1) {
             if (*p->pos == '\\' && *(p->pos + 1)) {
                 p->pos++;
                 switch (*p->pos) {
@@ -340,8 +425,15 @@ static token_t next_token(parser_state_t *p) {
             }
         }
         tok.text[i] = '\0';
-        if (*p->pos == quote) p->pos++;
+        if (*p->pos == '"') p->pos++;
         tok.type = TOK_STRING;
+
+        /* Validate UTF-8 encoding */
+        if (validate_utf8(tok.text) < 0) {
+            fprintf(stderr, "Warning: Invalid UTF-8 sequence in string at line %d, column %d\n",
+                    tok.line, tok.column);
+        }
+        
         return tok;
     }
 
@@ -649,6 +741,32 @@ static int parse_operand(parser_state_t *p, operand_t *op) {
         return 0;
     }
 
+    /* Character literal (e.g., 'A', '\n') */
+    if (p->current.type == TOK_CHAR) {
+        op->type = OPERAND_IMM;
+        op->immediate = p->current.value;
+        advance(p);
+        return 0;
+    }
+
+    /* String literal (for db directive) */
+    if (p->current.type == TOK_STRING) {
+        op->type = OPERAND_STRING;
+        copy_bounded(op->string, sizeof(op->string), p->current.text);
+        advance(p);
+        
+        /* Handle string concatenation - merge adjacent string literals */
+        while (p->current.type == TOK_STRING) {
+            size_t current_len = strlen(op->string);
+            size_t to_add = strlen(p->current.text);
+            if (current_len + to_add < sizeof(op->string) - 1) {
+                strncat(op->string, p->current.text, sizeof(op->string) - current_len - 1);
+            }
+            advance(p);
+        }
+        return 0;
+    }
+
     fprintf(stderr, "Error: Unexpected token '%s' at line %d\n", p->current.text, p->line);
     parser_error_context(p, "Invalid operand syntax");
     return -1;
@@ -771,6 +889,37 @@ static int parse_instruction(parser_state_t *p, parsed_instruction_t *inst) {
         advance(p); /* colon */
     }
 
+    /* Handle 'equ' directive: symbol equ value */
+    /* This must be checked before mnemonic parsing since syntax is: symbol equ value */
+    if (p->current.type == TOK_IDENTIFIER && p->peek.type == TOK_IDENTIFIER) {
+        /* Check if next token is 'equ' */
+        if (strcasecmp(p->peek.text, "equ") == 0) {
+            /* Save the symbol name */
+            inst->has_label = true;
+            copy_bounded(inst->label, sizeof(inst->label), p->current.text);
+            inst->label_column = p->current.column;
+            inst->type = INST_EQU;
+            advance(p); /* symbol */
+            advance(p); /* 'equ' */
+            
+            /* Parse the value as a single operand */
+            if (p->current.type == TOK_NUMBER) {
+                if (inst->operand_count >= MAX_OPERANDS) {
+                    parser_error_context(p, "Too many operands");
+                    return -1;
+                }
+                inst->operands[inst->operand_count].type = OPERAND_IMM;
+                inst->operands[inst->operand_count].immediate = p->current.value;
+                inst->operand_count++;
+                advance(p);
+            } else {
+                parser_error_context(p, "equ directive requires a numeric value");
+                return -1;
+            }
+            return 0;
+        }
+    }
+
     /* Parse instruction mnemonic */
     if (p->current.type == TOK_IDENTIFIER) {
         inst->type = INST_UNKNOWN;
@@ -789,6 +938,49 @@ static int parse_instruction(parser_state_t *p, parsed_instruction_t *inst) {
         }
 
         advance(p);
+
+        /* Handle .comm and .lcomm directives: .comm symbol, size, alignment */
+        if (inst->type == INST_COMM || inst->type == INST_LCOMM) {
+            /* Parse symbol name (identifier) */
+            if (p->current.type != TOK_IDENTIFIER) {
+                parser_error_context(p, ".comm/.lcomm requires a symbol name");
+                return -1;
+            }
+            inst->operands[0].type = OPERAND_LABEL;
+            copy_bounded(inst->operands[0].label, sizeof(inst->operands[0].label), p->current.text);
+            inst->operand_count = 1;
+            advance(p);
+            
+            /* Expect comma */
+            if (p->current.type == TOK_COMMA) {
+                advance(p);
+            }
+            
+            /* Parse size (number) */
+            if (p->current.type != TOK_NUMBER) {
+                parser_error_context(p, ".comm/.lcomm requires a size");
+                return -1;
+            }
+            inst->operands[1].type = OPERAND_IMM;
+            inst->operands[1].immediate = p->current.value;
+            inst->operand_count = 2;
+            advance(p);
+            
+            /* Optional alignment */
+            if (p->current.type == TOK_COMMA) {
+                advance(p);
+                if (p->current.type != TOK_NUMBER) {
+                    parser_error_context(p, ".comm/.lcomm alignment must be a number");
+                    return -1;
+                }
+                inst->operands[2].type = OPERAND_IMM;
+                inst->operands[2].immediate = p->current.value;
+                inst->operand_count = 3;
+                advance(p);
+            }
+            
+            return 0;
+        }
     } else if (inst->has_label) {
         /* Label-only line */
         inst->type = INST_NOP;
@@ -855,8 +1047,14 @@ parsed_instruction_t *parse_source_internal(const char *source, int *count) {
             insts = new_insts;
         }
 
+        /* Save position before parsing to check for explicit nop vs empty line */
+        token_type_t prev_type = p.current.type;
+        
         if (parse_instruction(&p, &insts[n]) == 0) {
             if (insts[n].type != INST_NOP || insts[n].has_label) {
+                n++;
+            } else if (prev_type == TOK_IDENTIFIER) {
+                /* This was an explicit instruction like 'nop', not an empty line */
                 n++;
             }
         } else {
@@ -874,15 +1072,133 @@ parsed_instruction_t *parse_source_internal(const char *source, int *count) {
     return insts;
 }
 
+/* Parse and expand times directive: times N instruction -> instruction repeated N times */
+static int parse_times_directive(const char *line, int *repeat_count, char *instruction_part) {
+    const char *p = line;
+    
+    /* Skip leading whitespace */
+    while (*p && isspace((unsigned char)*p)) p++;
+    
+    /* Check if line starts with 'times' */
+    if (strncasecmp(p, "times", 5) != 0) {
+        return -1;  /* Not a times directive */
+    }
+    p += 5;
+    
+    /* Skip whitespace after 'times' */
+    while (*p && isspace((unsigned char)*p)) p++;
+    
+    /* Parse the repeat count */
+    *repeat_count = 0;
+    if (*p == '$') p++;  /* Skip optional $ prefix */
+    
+    /* Parse number (decimal or hex) */
+    if (*p == '0' && (*(p+1) == 'x' || *(p+1) == 'X')) {
+        /* Hex number */
+        p += 2;
+        while (*p && isxdigit((unsigned char)*p)) {
+            *repeat_count = *repeat_count * 16 + (isdigit(*p) ? *p - '0' :
+                            (tolower(*p) - 'a' + 10));
+            p++;
+        }
+    } else {
+        /* Decimal number */
+        while (*p && isdigit((unsigned char)*p)) {
+            *repeat_count = *repeat_count * 10 + (*p - '0');
+            p++;
+        }
+    }
+    
+    if (*repeat_count <= 0 || *repeat_count > 10000) {
+        return -1;  /* Invalid repeat count */
+    }
+    
+    /* Skip whitespace after count */
+    while (*p && isspace((unsigned char)*p)) p++;
+    
+    /* Copy the instruction part */
+    int i = 0;
+    while (*p && *p != '\n' && *p != ';' && !(p[0] == '/' && p[1] == '/') &&
+           i < MAX_LINE_LENGTH - 1) {
+        instruction_part[i++] = *p++;
+    }
+    instruction_part[i] = '\0';
+    
+    /* Trim trailing whitespace */
+    while (i > 0 && isspace((unsigned char)instruction_part[i-1])) {
+        instruction_part[--i] = '\0';
+    }
+    
+    return (i > 0) ? 0 : -1;  /* Success if we have an instruction */
+}
+
+/* Helper to expand times directive even without macro context */
+static char *expand_times_only(const char *source) {
+    size_t output_size = strlen(source) * 4 + 1;
+    char *output = malloc(output_size);
+    if (!output) return NULL;
+    
+    size_t out_pos = 0;
+    const char *p = source;
+    char line[MAX_LINE_LENGTH];
+    
+    while (*p) {
+        /* Read a line */
+        int i = 0;
+        const char *line_start = p;
+        while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) {
+            line[i++] = *p++;
+        }
+        line[i] = '\0';
+        if (*p == '\n') p++;
+        
+        /* Check for times directive */
+        int repeat_count;
+        char times_instruction[MAX_LINE_LENGTH];
+        if (parse_times_directive(line, &repeat_count, times_instruction) == 0) {
+            /* Expand times directive by repeating the instruction */
+            for (int r = 0; r < repeat_count; r++) {
+                size_t inst_len = strlen(times_instruction);
+                if (out_pos + inst_len + 1 < output_size - 1) {
+                    memcpy(output + out_pos, times_instruction, inst_len);
+                    out_pos += inst_len;
+                    output[out_pos++] = '\n';
+                }
+            }
+            continue;
+        }
+        
+        /* Copy line as-is */
+        size_t line_len = p - line_start;
+        if (out_pos + line_len < output_size - 1) {
+            memcpy(output + out_pos, line_start, line_len);
+            out_pos += line_len;
+        }
+    }
+    
+    output[out_pos] = '\0';
+    return output;
+}
+
 /* Main parse function with macro preprocessing */
 parsed_instruction_t *parse_source(const char *source, int *count) {
-    /* Simple case: no assembler context, parse directly */
-    if (!g_asm_ctx) {
+    /* First, always expand times directive */
+    char *times_expanded = expand_times_only(source);
+    if (!times_expanded) {
         return parse_source_internal(source, count);
+    }
+
+    /* Simple case: no assembler context, parse the times-expanded source */
+    if (!g_asm_ctx) {
+        parsed_instruction_t *insts = parse_source_internal(times_expanded, count);
+        free(times_expanded);
+        return insts;
     }
     
     /* Preprocess macros */
-    char *preprocessed = preprocess_macros(g_asm_ctx, source);
+    char *preprocessed = preprocess_macros(g_asm_ctx, times_expanded);
+    free(times_expanded);
+    
     if (!preprocessed) {
         fprintf(stderr, "Error: Macro preprocessing failed\n");
         return NULL;
@@ -1591,7 +1907,7 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
         }
     }
     
-    /* Second pass: expand macro invocations and process includes */
+    /* Second pass: expand macro invocations, times directive, and process includes */
     size_t output_size = strlen(source_text) * 4 + 1;  /* Allow for expansion */
     char *output = malloc(output_size);
     if (!output) {
@@ -1628,6 +1944,22 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
                 
                 if (is_endm_directive(line)) {
                     break;
+                }
+            }
+            continue;
+        }
+
+        /* Check for times directive */
+        int repeat_count;
+        char times_instruction[MAX_LINE_LENGTH];
+        if (parse_times_directive(line, &repeat_count, times_instruction) == 0) {
+            /* Expand times directive by repeating the instruction */
+            for (int r = 0; r < repeat_count; r++) {
+                size_t inst_len = strlen(times_instruction);
+                if (out_pos + inst_len + 1 < output_size - 1) {
+                    memcpy(output + out_pos, times_instruction, inst_len);
+                    out_pos += inst_len;
+                    output[out_pos++] = '\n';
                 }
             }
             continue;
