@@ -4,14 +4,14 @@ This document tracks features that are commonly found in x86_64 assemblers (like
 
 ## Implementation Status Summary
 
-**Last Updated**: 2026-03-23
+**Last Updated**: 2026-03-24
 
 | Category | Implemented | Remaining |
 |----------|-------------|-----------|
 | Data Directives | `resb`, `resw`, `resd`, `resq`, `equ`, `times`, `align`, `incbin` | None |
 | String/Char Support | String literals, escape sequences, character literals, UTF-8, concatenation | None |
-| Section Directives | `.text`, `.data`, `.bss`, `.rodata`, `.comm`, `.lcomm` | named sections |
-| Preprocessor | `.macro`, `.include` | `%if`, `%ifdef`, `%error` |
+| Section Directives | `.text`, `.data`, `.bss`, `.rodata`, `.comm`, `.lcomm`, named sections, `segment` | None |
+| Preprocessor | `.macro`, `.include`, `%define`, `%if/%else/%endif`, `%ifdef/%ifndef`, `%error`, `%warning` | None |
 
 ---
 
@@ -52,8 +52,8 @@ This document tracks features that are commonly found in x86_64 assemblers (like
 | `.rodata` section | **Implemented** | Treated as data section |
 | `.comm` | **Implemented** | Common symbols with optional alignment |
 | `.lcomm` | **Implemented** | Local common symbols with optional alignment |
-| `section .name` | Partial | Only basic sections supported |
-| `segment` directive | Not implemented | Alternative to section |
+| `section .name` | **Implemented** | Supports named sections and subsection prefixes |
+| `segment` directive | **Implemented** | Alias for `section` |
 
 ---
 
@@ -63,11 +63,11 @@ This document tracks features that are commonly found in x86_64 assemblers (like
 |---------|---------|--------|-------|
 | `.macro/.endm` | Multi-line macro | **Implemented** | Working |
 | `.include` | Include file | **Implemented** | Working |
-| `%define` | Single-line macro | Not implemented | Use `.macro` instead |
-| `%if/%else/%endif` | Conditional assembly | Not implemented | Not supported |
-| `%ifdef/%ifndef` | Conditional on definition | Not implemented | Not supported |
-| `%error` | User-defined error | Not implemented | Not supported |
-| `%warning` | User-defined warning | Not implemented | Not supported |
+| `%define` | Single-line macro | **Implemented** | Symbol replacement in active preprocessor branches |
+| `%if/%else/%endif` | Conditional assembly | **Implemented** | Supports numeric/defined-symbol expressions |
+| `%ifdef/%ifndef` | Conditional on definition | **Implemented** | Works with `%define` symbols and macro names |
+| `%error` | User-defined error | **Implemented** | Aborts preprocessing with user message |
+| `%warning` | User-defined warning | **Implemented** | Emits warning and continues preprocessing |
 
 ---
 
@@ -77,8 +77,8 @@ This document tracks features that are commonly found in x86_64 assemblers (like
 |---------|---------|--------|-------|
 | `rip` relative with displacement | `[rip + offset]` | **Implemented** | Working |
 | Complex addressing | `[base + index*scale + disp]` | Partial | Some forms work |
-| Absolute addressing | `[abs 0x1234]` | Not implemented | Use labels |
-| FS/GS segment overrides | `fs:[0]` | Not implemented | Not supported |
+| Absolute addressing | `[abs 0x1234]` | **Implemented** | Parsed and encoded with absolute displacement form |
+| FS/GS segment overrides | `fs:[0]` | **Implemented** | Emits FS/GS segment override prefixes |
 
 ---
 
@@ -86,11 +86,11 @@ This document tracks features that are commonly found in x86_64 assemblers (like
 
 | Feature | Purpose | Status | Notes |
 |---------|---------|--------|-------|
-| Local labels (`.label`) | Labels starting with `.` | Partial | Works but not truly local |
-| Anonymous labels | `@@`, `@F`, `@B` | Not implemented | Not supported |
-| Label arithmetic | `label1 - label2` | Partial | Limited support |
-| Weak symbols | `weak` attribute | Not implemented | Not supported |
-| Hidden symbols | `hidden` attribute | Not implemented | Not supported |
+| Local labels (`.label`) | Labels starting with `.` | **Implemented** | Scoped to nearest non-local label |
+| Anonymous labels | `@@`, `@F`, `@B` | **Implemented** | Supports forward (`@F`) and backward (`@B`) references |
+| Label arithmetic | `label1 - label2` | **Implemented** | Supports `equ` expressions and resolves to absolute constants |
+| Weak symbols | `weak` attribute | **Implemented** | Marks symbols as weak in symbol metadata |
+| Hidden symbols | `hidden` attribute | **Implemented** | Marks symbols as hidden in symbol metadata |
 
 ---
 

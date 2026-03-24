@@ -235,7 +235,10 @@ static const inst_name_t inst_table[] = {
     {".lcomm", INST_LCOMM},
     {"global", INST_GLOBAL}, {"extern", INST_EXTERN},
     {".global", INST_GLOBAL}, {".extern", INST_EXTERN},
+    {"weak", INST_WEAK}, {"hidden", INST_HIDDEN},
+    {".weak", INST_WEAK}, {".hidden", INST_HIDDEN},
     {"section", INST_SECTION}, {".section", INST_SECTION},
+    {"segment", INST_SECTION}, {".segment", INST_SECTION},
     {".text", INST_SECTION}, {".data", INST_SECTION},
     {"text", INST_SECTION}, {"data", INST_SECTION},
     {".bss", INST_SECTION}, {"bss", INST_SECTION},
@@ -525,14 +528,44 @@ static bool is_valid_scale_factor(int64_t scale) {
     return scale == 1 || scale == 2 || scale == 4 || scale == 8;
 }
 
+static mem_segment_t parse_segment_override_name(const char *name) {
+    if (!name) return MEM_SEG_DEFAULT;
+    if (strcasecmp(name, "fs") == 0) return MEM_SEG_FS;
+    if (strcasecmp(name, "gs") == 0) return MEM_SEG_GS;
+    return MEM_SEG_DEFAULT;
+}
+
 /* Parse memory operand [base+index*scale+disp] or [label] or [rip+label] */
 static int parse_memory_operand(parser_state_t *p, mem_operand_t *mem) {
     memset(mem, 0, sizeof(*mem));
     mem->scale = 1;
+    mem->segment_override = MEM_SEG_DEFAULT;
 
     if (!expect(p, TOK_LBRACKET)) {
         parser_error_context(p, "Expected '[' for memory operand");
         return -1;
+    }
+
+    /* Explicit absolute addressing form: [abs 0x1234] */
+    if (p->current.type == TOK_IDENTIFIER && strcasecmp(p->current.text, "abs") == 0) {
+        advance(p);
+
+        if (p->current.type != TOK_NUMBER) {
+            parser_error_context(p, "[abs ...] requires a numeric address");
+            return -1;
+        }
+
+        mem->is_absolute = true;
+        mem->displacement = (int32_t)p->current.value;
+        mem->has_displacement = true;
+        advance(p);
+
+        if (!expect(p, TOK_RBRACKET)) {
+            parser_error_context(p, "Expected ']' to close memory operand");
+            return -1;
+        }
+
+        return 0;
     }
 
     /* Parse components */
@@ -585,6 +618,10 @@ static int parse_memory_operand(parser_state_t *p, mem_operand_t *mem) {
                 copy_bounded(mem->label, sizeof(mem->label), p->current.text);
                 advance(p);
             }
+        } else if (p->current.type == TOK_NUMBER) {
+            mem->displacement += (int32_t)p->current.value;
+            mem->has_displacement = true;
+            advance(p);
         } else if (p->current.type == TOK_PLUS || p->current.type == TOK_MINUS) {
             int sign = 1;
             if (p->current.type == TOK_MINUS) {
@@ -688,6 +725,27 @@ static int parse_memory_operand(parser_state_t *p, mem_operand_t *mem) {
 static int parse_operand(parser_state_t *p, operand_t *op) {
     memset(op, 0, sizeof(*op));
 
+    /* Segment override form: fs:[...], gs:[...] */
+    if (p->current.type == TOK_IDENTIFIER && p->peek.type == TOK_COLON) {
+        mem_segment_t seg = parse_segment_override_name(p->current.text);
+        if (seg != MEM_SEG_DEFAULT) {
+            advance(p); /* fs/gs */
+            advance(p); /* : */
+
+            if (p->current.type != TOK_LBRACKET) {
+                parser_error_context(p, "Segment override requires a memory operand");
+                return -1;
+            }
+
+            op->type = OPERAND_MEM;
+            if (parse_memory_operand(p, &op->mem) < 0) {
+                return -1;
+            }
+            op->mem.segment_override = seg;
+            return 0;
+        }
+    }
+
     /* Immediate */
     if (p->current.type == TOK_DOLLAR) {
         advance(p);
@@ -696,10 +754,21 @@ static int parse_operand(parser_state_t *p, operand_t *op) {
             op->immediate = p->current.value;
             advance(p);
         } else if (p->current.type == TOK_IDENTIFIER) {
-            /* $label - address of label */
-            op->type = OPERAND_LABEL;
-            copy_bounded(op->label, sizeof(op->label), p->current.text);
+            char lhs[MAX_LABEL_LENGTH];
+            copy_bounded(lhs, sizeof(lhs), p->current.text);
             advance(p);
+
+            if (p->current.type == TOK_MINUS && p->peek.type == TOK_IDENTIFIER) {
+                op->type = OPERAND_LABEL_DIFF;
+                copy_bounded(op->label, sizeof(op->label), lhs);
+                advance(p); /* '-' */
+                copy_bounded(op->label_rhs, sizeof(op->label_rhs), p->current.text);
+                advance(p); /* rhs label */
+            } else {
+                /* $label - address of label */
+                op->type = OPERAND_LABEL;
+                copy_bounded(op->label, sizeof(op->label), lhs);
+            }
         } else {
             parser_error_context(p, "Expected immediate value after '$'");
             return -1;
@@ -726,10 +795,21 @@ static int parse_operand(parser_state_t *p, operand_t *op) {
             return 0;
         }
 
-        /* Label */
-        op->type = OPERAND_LABEL;
-        copy_bounded(op->label, sizeof(op->label), p->current.text);
+        /* Label or label arithmetic expression */
+        char lhs[MAX_LABEL_LENGTH];
+        copy_bounded(lhs, sizeof(lhs), p->current.text);
         advance(p);
+
+        if (p->current.type == TOK_MINUS && p->peek.type == TOK_IDENTIFIER) {
+            op->type = OPERAND_LABEL_DIFF;
+            copy_bounded(op->label, sizeof(op->label), lhs);
+            advance(p); /* '-' */
+            copy_bounded(op->label_rhs, sizeof(op->label_rhs), p->current.text);
+            advance(p); /* rhs label */
+        } else {
+            op->type = OPERAND_LABEL;
+            copy_bounded(op->label, sizeof(op->label), lhs);
+        }
         return 0;
     }
 
@@ -902,20 +982,21 @@ static int parse_instruction(parser_state_t *p, parsed_instruction_t *inst) {
             advance(p); /* symbol */
             advance(p); /* 'equ' */
             
-            /* Parse the value as a single operand */
-            if (p->current.type == TOK_NUMBER) {
-                if (inst->operand_count >= MAX_OPERANDS) {
-                    parser_error_context(p, "Too many operands");
-                    return -1;
-                }
-                inst->operands[inst->operand_count].type = OPERAND_IMM;
-                inst->operands[inst->operand_count].immediate = p->current.value;
-                inst->operand_count++;
-                advance(p);
-            } else {
-                parser_error_context(p, "equ directive requires a numeric value");
+            /* Parse equ expression as a single operand (number, label, or label diff). */
+            if (inst->operand_count >= MAX_OPERANDS) {
+                parser_error_context(p, "Too many operands");
                 return -1;
             }
+            if (parse_operand(p, &inst->operands[inst->operand_count]) < 0) {
+                return -1;
+            }
+            if (inst->operands[inst->operand_count].type != OPERAND_IMM &&
+                inst->operands[inst->operand_count].type != OPERAND_LABEL &&
+                inst->operands[inst->operand_count].type != OPERAND_LABEL_DIFF) {
+                parser_error_context(p, "equ directive requires a numeric value, label, or label subtraction");
+                return -1;
+            }
+            inst->operand_count++;
             return 0;
         }
     }
@@ -937,7 +1018,27 @@ static int parse_instruction(parser_state_t *p, parsed_instruction_t *inst) {
             return -1;
         }
 
+        char mnemonic_text[MAX_LINE_LENGTH];
+        copy_bounded(mnemonic_text, sizeof(mnemonic_text), p->current.text);
+        bool section_keyword =
+            strcasecmp(mnemonic_text, "section") == 0 ||
+            strcasecmp(mnemonic_text, ".section") == 0 ||
+            strcasecmp(mnemonic_text, "segment") == 0 ||
+            strcasecmp(mnemonic_text, ".segment") == 0;
+
         advance(p);
+
+        if (inst->type == INST_SECTION && !section_keyword) {
+            /* Normalize shorthand section forms (e.g., .text/.data/.foo). */
+            inst->operands[0].type = OPERAND_LABEL;
+            copy_bounded(inst->operands[0].label, sizeof(inst->operands[0].label), mnemonic_text);
+            inst->operand_count = 1;
+            if (p->current.type != TOK_NEWLINE && p->current.type != TOK_EOF) {
+                parser_error_context(p, "Section shorthand directives do not take operands");
+                return -1;
+            }
+            return 0;
+        }
 
         /* Handle .comm and .lcomm directives: .comm symbol, size, alignment */
         if (inst->type == INST_COMM || inst->type == INST_LCOMM) {
@@ -1705,6 +1806,280 @@ static int parse_include_filename(const char *line, char *filename, size_t filen
     return 1;
 }
 
+#define PP_MAX_DEFINES 128
+#define PP_MAX_COND_DEPTH 64
+
+typedef struct {
+    char name[MAX_LABEL_LENGTH];
+    char value[MAX_LINE_LENGTH];
+    bool defined;
+} pp_define_t;
+
+typedef struct {
+    bool parent_active;
+    bool branch_taken;
+} pp_cond_state_t;
+
+static const char *pp_skip_ws(const char *p) {
+    while (p && *p && isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+static bool pp_is_ident_start(char c) {
+    return isalpha((unsigned char)c) || c == '_';
+}
+
+static bool pp_is_ident_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+static pp_define_t *pp_lookup_define(pp_define_t *defines, int define_count, const char *name) {
+    for (int i = 0; i < define_count; i++) {
+        if (defines[i].defined && strcmp(defines[i].name, name) == 0) {
+            return &defines[i];
+        }
+    }
+    return NULL;
+}
+
+static int pp_define_set(pp_define_t *defines, int *define_count,
+                         const char *name, const char *value) {
+    pp_define_t *existing;
+
+    if (!name || !name[0]) {
+        return -1;
+    }
+
+    existing = pp_lookup_define(defines, *define_count, name);
+    if (existing) {
+        copy_bounded(existing->value, sizeof(existing->value), value ? value : "");
+        return 0;
+    }
+
+    if (*define_count >= PP_MAX_DEFINES) {
+        fprintf(stderr, "Error: Too many %%define symbols (max %d)\n", PP_MAX_DEFINES);
+        return -1;
+    }
+
+    copy_bounded(defines[*define_count].name, sizeof(defines[*define_count].name), name);
+    copy_bounded(defines[*define_count].value, sizeof(defines[*define_count].value), value ? value : "");
+    defines[*define_count].defined = true;
+    (*define_count)++;
+    return 0;
+}
+
+static int pp_parse_define_directive(const char *line, char *name, char *value) {
+    const char *p = pp_skip_ws(line);
+    int i = 0;
+
+    if (strncasecmp(p, "%define", 7) != 0) {
+        return 0;
+    }
+
+    if (p[7] != '\0' && !isspace((unsigned char)p[7])) {
+        return 0;
+    }
+
+    p = pp_skip_ws(p + 7);
+    if (!pp_is_ident_start(*p)) {
+        fprintf(stderr, "Error: %%define requires a symbol name\n");
+        return -1;
+    }
+
+    while (*p && pp_is_ident_char(*p) && i < MAX_LABEL_LENGTH - 1) {
+        name[i++] = *p++;
+    }
+    name[i] = '\0';
+
+    p = pp_skip_ws(p);
+    copy_bounded(value, MAX_LINE_LENGTH, p);
+
+    /* Trim trailing whitespace from replacement value. */
+    i = (int)strlen(value);
+    while (i > 0 && isspace((unsigned char)value[i - 1])) {
+        value[--i] = '\0';
+    }
+
+    return 1;
+}
+
+static int pp_parse_symbol_directive(const char *line, const char *directive,
+                                     char *name_out) {
+    const char *p = pp_skip_ws(line);
+    int i = 0;
+    size_t directive_len = strlen(directive);
+
+    if (strncasecmp(p, directive, directive_len) != 0) {
+        return 0;
+    }
+
+    if (p[directive_len] != '\0' && !isspace((unsigned char)p[directive_len])) {
+        return 0;
+    }
+
+    p = pp_skip_ws(p + directive_len);
+    if (!pp_is_ident_start(*p)) {
+        fprintf(stderr, "Error: %s requires a symbol name\n", directive);
+        return -1;
+    }
+
+    while (*p && pp_is_ident_char(*p) && i < MAX_LABEL_LENGTH - 1) {
+        name_out[i++] = *p++;
+    }
+    name_out[i] = '\0';
+    return 1;
+}
+
+static int pp_eval_number_or_symbol(const char *expr,
+                                    pp_define_t *defines, int define_count,
+                                    int *result) {
+    const char *p = pp_skip_ws(expr);
+    int negate = 0;
+    char token[MAX_LINE_LENGTH];
+    int i = 0;
+
+    if (!p || !*p) {
+        fprintf(stderr, "Error: %%if requires an expression\n");
+        return -1;
+    }
+
+    while (*p == '!') {
+        negate = !negate;
+        p = pp_skip_ws(p + 1);
+    }
+
+    if (!*p) {
+        fprintf(stderr, "Error: %%if requires an expression\n");
+        return -1;
+    }
+
+    while (*p && !isspace((unsigned char)*p) && i < MAX_LINE_LENGTH - 1) {
+        token[i++] = *p++;
+    }
+    token[i] = '\0';
+
+    if (!token[0]) {
+        fprintf(stderr, "Error: %%if requires an expression\n");
+        return -1;
+    }
+
+    if (pp_is_ident_start(token[0])) {
+        pp_define_t *def = pp_lookup_define(defines, define_count, token);
+        if (!def) {
+            *result = negate ? 1 : 0;
+            return 0;
+        }
+
+        if (def->value[0] == '\0') {
+            *result = negate ? 0 : 1;
+            return 0;
+        }
+
+        errno = 0;
+        char *end = NULL;
+        long long val = strtoll(def->value, &end, 0);
+        if (errno == 0 && end && *pp_skip_ws(end) == '\0') {
+            *result = negate ? (val == 0) : (val != 0);
+            return 0;
+        }
+
+        *result = negate ? 0 : 1;
+        return 0;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    long long val = strtoll(token, &end, 0);
+    if (errno != 0 || !end || *pp_skip_ws(end) != '\0') {
+        fprintf(stderr, "Error: Unsupported %%if expression '%s'\n", token);
+        return -1;
+    }
+
+    *result = negate ? (val == 0) : (val != 0);
+    return 0;
+}
+
+static int pp_parse_expr_directive(const char *line, const char *directive,
+                                   char *expr_out) {
+    const char *p = pp_skip_ws(line);
+    size_t n = strlen(directive);
+
+    if (strncasecmp(p, directive, n) != 0) {
+        return 0;
+    }
+
+    if (p[n] != '\0' && !isspace((unsigned char)p[n])) {
+        return 0;
+    }
+
+    p = pp_skip_ws(p + n);
+    copy_bounded(expr_out, MAX_LINE_LENGTH, p);
+    return 1;
+}
+
+static int pp_substitute_defines(const char *line, pp_define_t *defines, int define_count,
+                                 char *out, size_t out_size) {
+    const char *p = line;
+    size_t pos = 0;
+    bool in_single = false;
+    bool in_double = false;
+
+    if (out_size == 0) return -1;
+
+    while (*p && pos + 1 < out_size) {
+        if (!in_single && *p == '"') {
+            in_double = !in_double;
+            out[pos++] = *p++;
+            continue;
+        }
+        if (!in_double && *p == '\'') {
+            in_single = !in_single;
+            out[pos++] = *p++;
+            continue;
+        }
+
+        if (!in_single && !in_double && pp_is_ident_start(*p)) {
+            char name[MAX_LABEL_LENGTH];
+            int i = 0;
+            const char *start = p;
+            pp_define_t *def;
+
+            while (*p && pp_is_ident_char(*p) && i < MAX_LABEL_LENGTH - 1) {
+                name[i++] = *p++;
+            }
+            name[i] = '\0';
+            def = pp_lookup_define(defines, define_count, name);
+            if (def) {
+                size_t val_len = strlen(def->value);
+                if (pos + val_len + 1 >= out_size) {
+                    return -1;
+                }
+                memcpy(out + pos, def->value, val_len);
+                pos += val_len;
+                continue;
+            }
+
+            /* No define match, copy original token. */
+            size_t token_len = (size_t)(p - start);
+            if (pos + token_len + 1 >= out_size) {
+                return -1;
+            }
+            memcpy(out + pos, start, token_len);
+            pos += token_len;
+            continue;
+        }
+
+        out[pos++] = *p++;
+    }
+
+    if (*p != '\0') {
+        return -1;
+    }
+
+    out[pos] = '\0';
+    return 0;
+}
+
 static char *expand_includes_recursive(assembler_context_t *ctx, const char *source,
                                        const char *base_dir, int depth) {
     const char *p;
@@ -1834,190 +2209,421 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
     char base_dir[MAX_FILEPATH_LENGTH];
     char *expanded_source = NULL;
     const char *source_text = source;
+    pp_define_t defines[PP_MAX_DEFINES];
+    pp_cond_state_t cond_stack[PP_MAX_COND_DEPTH];
+    int define_count = 0;
+    int cond_depth = 0;
+    bool current_active = true;
+    char line[MAX_LINE_LENGTH];
+    const char *p;
 
     dirname_from_path(ctx->current_filename, base_dir);
     expanded_source = expand_includes_recursive(ctx, source, base_dir, 0);
-    if (!expanded_source) {
-        return NULL;
-    }
+    if (!expanded_source) return NULL;
     source_text = expanded_source;
-    
-    /* Initialize macro context */
+
     ctx->macro_count = 0;
     ctx->in_macro_definition = false;
     ctx->current_macro = NULL;
     ctx->macro_ctx.expansion_depth = 0;
     ctx->macro_ctx.local_label_counter = 0;
     ctx->macro_ctx.macro_name[0] = '\0';
-    
-    /* First pass: collect macro definitions */
-    const char *p = source_text;
-    char line[MAX_LINE_LENGTH];
-    
+    memset(defines, 0, sizeof(defines));
+
+    p = source_text;
     while (*p) {
-        /* Read a line */
         int i = 0;
-        while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) {
-            line[i++] = *p++;
-        }
+        while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) line[i++] = *p++;
         line[i] = '\0';
         if (*p == '\n') p++;
-        
-        /* Check for .macro directive */
-        char macro_name[MAX_LABEL_LENGTH];
-        char params[MAX_MACRO_PARAMS][MAX_LABEL_LENGTH];
-        int param_count = 0;
-        
-        if (parse_macro_directive(line, macro_name, params, &param_count) == 0) {
-            /* Start macro definition */
-            if (macro_define(ctx, macro_name) < 0) {
-                return NULL;
-            }
-            
-            /* Add parameters */
-            for (int i = 0; i < param_count; i++) {
-                macro_add_param(ctx, params[i]);
-            }
-            
-            /* Read macro body until .endm */
-            while (*p) {
-                i = 0;
-                while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) {
-                    line[i++] = *p++;
+
+        {
+            char expr[MAX_LINE_LENGTH];
+            char symbol[MAX_LABEL_LENGTH];
+            int parsed = pp_parse_expr_directive(line, "%if", expr);
+            if (parsed < 0) { free(expanded_source); return NULL; }
+            if (parsed == 1) {
+                int cond_value = 0;
+                if (cond_depth >= PP_MAX_COND_DEPTH) {
+                    fprintf(stderr, "Error: Preprocessor conditional nesting too deep (max %d)\n", PP_MAX_COND_DEPTH);
+                    free(expanded_source);
+                    return NULL;
                 }
-                line[i] = '\0';
-                if (*p == '\n') {
-                    line[i++] = '\n';
+                if (current_active && pp_eval_number_or_symbol(expr, defines, define_count, &cond_value) < 0) {
+                    free(expanded_source);
+                    return NULL;
+                }
+                cond_stack[cond_depth].parent_active = current_active;
+                cond_stack[cond_depth].branch_taken = current_active && (cond_value != 0);
+                current_active = cond_stack[cond_depth].branch_taken;
+                cond_depth++;
+                continue;
+            }
+
+            parsed = pp_parse_symbol_directive(line, "%ifdef", symbol);
+            if (parsed < 0) { free(expanded_source); return NULL; }
+            if (parsed == 1) {
+                bool defined = pp_lookup_define(defines, define_count, symbol) != NULL || is_macro_name(ctx, symbol);
+                if (cond_depth >= PP_MAX_COND_DEPTH) {
+                    fprintf(stderr, "Error: Preprocessor conditional nesting too deep (max %d)\n", PP_MAX_COND_DEPTH);
+                    free(expanded_source);
+                    return NULL;
+                }
+                cond_stack[cond_depth].parent_active = current_active;
+                cond_stack[cond_depth].branch_taken = current_active && defined;
+                current_active = cond_stack[cond_depth].branch_taken;
+                cond_depth++;
+                continue;
+            }
+
+            parsed = pp_parse_symbol_directive(line, "%ifndef", symbol);
+            if (parsed < 0) { free(expanded_source); return NULL; }
+            if (parsed == 1) {
+                bool defined = pp_lookup_define(defines, define_count, symbol) != NULL || is_macro_name(ctx, symbol);
+                if (cond_depth >= PP_MAX_COND_DEPTH) {
+                    fprintf(stderr, "Error: Preprocessor conditional nesting too deep (max %d)\n", PP_MAX_COND_DEPTH);
+                    free(expanded_source);
+                    return NULL;
+                }
+                cond_stack[cond_depth].parent_active = current_active;
+                cond_stack[cond_depth].branch_taken = current_active && !defined;
+                current_active = cond_stack[cond_depth].branch_taken;
+                cond_depth++;
+                continue;
+            }
+
+            if (strncasecmp(pp_skip_ws(line), "%else", 5) == 0) {
+                if (cond_depth <= 0) {
+                    fprintf(stderr, "Error: %%else without matching %%if\n");
+                    free(expanded_source);
+                    return NULL;
+                }
+                current_active = cond_stack[cond_depth - 1].parent_active && !cond_stack[cond_depth - 1].branch_taken;
+                cond_stack[cond_depth - 1].branch_taken = true;
+                continue;
+            }
+
+            if (strncasecmp(pp_skip_ws(line), "%endif", 6) == 0) {
+                if (cond_depth <= 0) {
+                    fprintf(stderr, "Error: %%endif without matching %%if\n");
+                    free(expanded_source);
+                    return NULL;
+                }
+                cond_depth--;
+                current_active = cond_stack[cond_depth].parent_active;
+                continue;
+            }
+
+            if (!current_active) continue;
+
+            {
+                char def_name[MAX_LABEL_LENGTH];
+                char def_value[MAX_LINE_LENGTH];
+                int def_parsed = pp_parse_define_directive(line, def_name, def_value);
+                if (def_parsed < 0) { free(expanded_source); return NULL; }
+                if (def_parsed == 1) {
+                    if (pp_define_set(defines, &define_count, def_name, def_value) < 0) {
+                        free(expanded_source);
+                        return NULL;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        {
+            char macro_name[MAX_LABEL_LENGTH];
+            char params[MAX_MACRO_PARAMS][MAX_LABEL_LENGTH];
+            int param_count = 0;
+
+            if (parse_macro_directive(line, macro_name, params, &param_count) == 0) {
+                if (macro_define(ctx, macro_name) < 0) {
+                    free(expanded_source);
+                    return NULL;
+                }
+                for (int j = 0; j < param_count; j++) macro_add_param(ctx, params[j]);
+
+                while (*p) {
+                    i = 0;
+                    while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) line[i++] = *p++;
                     line[i] = '\0';
-                    p++;
+                    if (*p == '\n') {
+                        line[i++] = '\n';
+                        line[i] = '\0';
+                        p++;
+                    }
+                    if (is_endm_directive(line)) {
+                        macro_end_definition(ctx);
+                        break;
+                    }
+                    if (i > 0 && line[i - 1] == '\n') line[i - 1] = '\0';
+                    macro_add_body_line(ctx, line);
                 }
-                
-                /* Check for .endm */
-                if (is_endm_directive(line)) {
-                    macro_end_definition(ctx);
-                    break;
-                }
-                
-                /* Add line to macro body (remove trailing newline) */
-                if (i > 0 && line[i-1] == '\n') {
-                    line[i-1] = '\0';
-                }
-                macro_add_body_line(ctx, line);
             }
         }
     }
-    
-    /* Second pass: expand macro invocations, times directive, and process includes */
-    size_t output_size = strlen(source_text) * 4 + 1;  /* Allow for expansion */
-    char *output = malloc(output_size);
+
+    if (cond_depth != 0) {
+        fprintf(stderr, "Error: Unterminated preprocessor conditional block\n");
+        free(expanded_source);
+        return NULL;
+    }
+
+    size_t output_capacity = strlen(source_text) * 4 + 1;
+    char *output = malloc(output_capacity);
     if (!output) {
         free(expanded_source);
         return NULL;
     }
-    
-    size_t out_pos = 0;
+    output[0] = '\0';
+    size_t output_len = 0;
+
+    define_count = 0;
+    memset(defines, 0, sizeof(defines));
+    cond_depth = 0;
+    current_active = true;
     p = source_text;
-    
+
     while (*p) {
-        /* Read a line */
         int i = 0;
-        const char *line_start = p;
-        while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) {
-            line[i++] = *p++;
-        }
+        while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) line[i++] = *p++;
         line[i] = '\0';
         if (*p == '\n') p++;
-        
-        /* Skip macro definitions (don't include in output) */
-        char test_name[MAX_LABEL_LENGTH];
-        char test_params[MAX_MACRO_PARAMS][MAX_LABEL_LENGTH];
-        int test_count = 0;
-        if (parse_macro_directive(line, test_name, test_params, &test_count) == 0) {
-            /* Skip until .endm */
-            while (*p) {
-                i = 0;
-                while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) {
-                    line[i++] = *p++;
+
+        {
+            char expr[MAX_LINE_LENGTH];
+            char symbol[MAX_LABEL_LENGTH];
+            int parsed = pp_parse_expr_directive(line, "%if", expr);
+            if (parsed < 0) { free(output); free(expanded_source); return NULL; }
+            if (parsed == 1) {
+                int cond_value = 0;
+                if (cond_depth >= PP_MAX_COND_DEPTH) {
+                    fprintf(stderr, "Error: Preprocessor conditional nesting too deep (max %d)\n", PP_MAX_COND_DEPTH);
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
                 }
-                line[i] = '\0';
-                if (*p == '\n') p++;
-                
-                if (is_endm_directive(line)) {
-                    break;
+                if (current_active && pp_eval_number_or_symbol(expr, defines, define_count, &cond_value) < 0) {
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+                cond_stack[cond_depth].parent_active = current_active;
+                cond_stack[cond_depth].branch_taken = current_active && (cond_value != 0);
+                current_active = cond_stack[cond_depth].branch_taken;
+                cond_depth++;
+                continue;
+            }
+
+            parsed = pp_parse_symbol_directive(line, "%ifdef", symbol);
+            if (parsed < 0) { free(output); free(expanded_source); return NULL; }
+            if (parsed == 1) {
+                bool defined = pp_lookup_define(defines, define_count, symbol) != NULL || is_macro_name(ctx, symbol);
+                if (cond_depth >= PP_MAX_COND_DEPTH) {
+                    fprintf(stderr, "Error: Preprocessor conditional nesting too deep (max %d)\n", PP_MAX_COND_DEPTH);
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+                cond_stack[cond_depth].parent_active = current_active;
+                cond_stack[cond_depth].branch_taken = current_active && defined;
+                current_active = cond_stack[cond_depth].branch_taken;
+                cond_depth++;
+                continue;
+            }
+
+            parsed = pp_parse_symbol_directive(line, "%ifndef", symbol);
+            if (parsed < 0) { free(output); free(expanded_source); return NULL; }
+            if (parsed == 1) {
+                bool defined = pp_lookup_define(defines, define_count, symbol) != NULL || is_macro_name(ctx, symbol);
+                if (cond_depth >= PP_MAX_COND_DEPTH) {
+                    fprintf(stderr, "Error: Preprocessor conditional nesting too deep (max %d)\n", PP_MAX_COND_DEPTH);
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+                cond_stack[cond_depth].parent_active = current_active;
+                cond_stack[cond_depth].branch_taken = current_active && !defined;
+                current_active = cond_stack[cond_depth].branch_taken;
+                cond_depth++;
+                continue;
+            }
+
+            if (strncasecmp(pp_skip_ws(line), "%else", 5) == 0) {
+                if (cond_depth <= 0) {
+                    fprintf(stderr, "Error: %%else without matching %%if\n");
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+                current_active = cond_stack[cond_depth - 1].parent_active && !cond_stack[cond_depth - 1].branch_taken;
+                cond_stack[cond_depth - 1].branch_taken = true;
+                continue;
+            }
+
+            if (strncasecmp(pp_skip_ws(line), "%endif", 6) == 0) {
+                if (cond_depth <= 0) {
+                    fprintf(stderr, "Error: %%endif without matching %%if\n");
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+                cond_depth--;
+                current_active = cond_stack[cond_depth].parent_active;
+                continue;
+            }
+
+            {
+                char msg[MAX_LINE_LENGTH];
+                int err_parse = pp_parse_expr_directive(line, "%error", msg);
+                if (err_parse < 0) { free(output); free(expanded_source); return NULL; }
+                if (err_parse == 1 && current_active) {
+                    fprintf(stderr, "Error: %s\n", pp_skip_ws(msg));
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+
+                int warn_parse = pp_parse_expr_directive(line, "%warning", msg);
+                if (warn_parse < 0) { free(output); free(expanded_source); return NULL; }
+                if (warn_parse == 1 && current_active) {
+                    fprintf(stderr, "Warning: %s\n", pp_skip_ws(msg));
+                    continue;
                 }
             }
-            continue;
+
+            {
+                char def_name[MAX_LABEL_LENGTH];
+                char def_value[MAX_LINE_LENGTH];
+                int def_parsed = pp_parse_define_directive(line, def_name, def_value);
+                if (def_parsed < 0) { free(output); free(expanded_source); return NULL; }
+                if (def_parsed == 1 && current_active) {
+                    if (pp_define_set(defines, &define_count, def_name, def_value) < 0) {
+                        free(output);
+                        free(expanded_source);
+                        return NULL;
+                    }
+                    continue;
+                }
+            }
         }
 
-        /* Check for times directive */
-        int repeat_count;
-        char times_instruction[MAX_LINE_LENGTH];
-        if (parse_times_directive(line, &repeat_count, times_instruction) == 0) {
-            /* Expand times directive by repeating the instruction */
-            for (int r = 0; r < repeat_count; r++) {
-                size_t inst_len = strlen(times_instruction);
-                if (out_pos + inst_len + 1 < output_size - 1) {
-                    memcpy(output + out_pos, times_instruction, inst_len);
-                    out_pos += inst_len;
-                    output[out_pos++] = '\n';
+        if (!current_active) continue;
+
+        {
+            char test_name[MAX_LABEL_LENGTH];
+            char test_params[MAX_MACRO_PARAMS][MAX_LABEL_LENGTH];
+            int test_count = 0;
+
+            if (parse_macro_directive(line, test_name, test_params, &test_count) == 0) {
+                while (*p) {
+                    i = 0;
+                    while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) line[i++] = *p++;
+                    line[i] = '\0';
+                    if (*p == '\n') p++;
+                    if (is_endm_directive(line)) break;
                 }
+                continue;
             }
-            continue;
         }
-        
-        /* Check for macro invocation */
-        char macro_name[MAX_LABEL_LENGTH];
-        char args[MAX_MACRO_PARAMS][MAX_LINE_LENGTH];
-        int arg_count = 0;
-        
-        if (parse_macro_invocation(ctx, line, macro_name, args, &arg_count)) {
-            /* Expand macro */
-            const char *arg_ptrs[MAX_MACRO_PARAMS];
-            for (int j = 0; j < arg_count; j++) {
-                arg_ptrs[j] = args[j];
+
+        {
+            char substituted_line[MAX_LINE_LENGTH * 4];
+            if (pp_substitute_defines(line, defines, define_count,
+                                      substituted_line, sizeof(substituted_line)) < 0) {
+                fprintf(stderr, "Error: Expanded line exceeds preprocessor buffer capacity\n");
+                free(output);
+                free(expanded_source);
+                return NULL;
             }
-            
-            int expanded_lines = 0;
-            char *expanded = expand_macro(ctx, macro_name, arg_ptrs, arg_count, &expanded_lines);
-            
-            if (expanded) {
-                size_t exp_len = strlen(expanded);
-                if (out_pos + exp_len < output_size - 1) {
-                    memcpy(output + out_pos, expanded, exp_len);
-                    out_pos += exp_len;
+
+            int repeat_count;
+            char times_instruction[MAX_LINE_LENGTH];
+            if (parse_times_directive(substituted_line, &repeat_count, times_instruction) == 0) {
+                for (int r = 0; r < repeat_count; r++) {
+                    if (append_text(&output, &output_capacity, &output_len,
+                                    times_instruction, strlen(times_instruction)) < 0 ||
+                        append_text(&output, &output_capacity, &output_len, "\n", 1) < 0) {
+                        fprintf(stderr, "Error: Preprocessor output exceeded internal buffer capacity\n");
+                        free(output);
+                        free(expanded_source);
+                        return NULL;
+                    }
+                }
+                continue;
+            }
+
+            char macro_name[MAX_LABEL_LENGTH];
+            char args[MAX_MACRO_PARAMS][MAX_LINE_LENGTH];
+            int arg_count = 0;
+
+            if (parse_macro_invocation(ctx, substituted_line, macro_name, args, &arg_count)) {
+                const char *arg_ptrs[MAX_MACRO_PARAMS];
+                char expanded_substituted[MAX_LINE_LENGTH * 8];
+                for (int j = 0; j < arg_count; j++) arg_ptrs[j] = args[j];
+
+                int expanded_lines = 0;
+                char *expanded = expand_macro(ctx, macro_name, arg_ptrs, arg_count, &expanded_lines);
+                (void)expanded_lines;
+                if (!expanded) {
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+
+                if (pp_substitute_defines(expanded, defines, define_count,
+                                          expanded_substituted, sizeof(expanded_substituted)) < 0) {
+                    fprintf(stderr, "Error: Expanded macro output exceeded internal buffer capacity\n");
+                    free(expanded);
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+
+                if (append_text(&output, &output_capacity, &output_len,
+                                expanded_substituted, strlen(expanded_substituted)) < 0) {
+                    fprintf(stderr, "Error: Preprocessor output exceeded internal buffer capacity\n");
+                    free(expanded);
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
                 }
                 free(expanded);
+                continue;
             }
-        } else {
-            /* Copy line as-is */
-            size_t line_len = p - line_start;
-            if (out_pos + line_len < output_size - 1) {
-                memcpy(output + out_pos, line_start, line_len);
-                out_pos += line_len;
+
+            if (append_text(&output, &output_capacity, &output_len,
+                            substituted_line, strlen(substituted_line)) < 0 ||
+                append_text(&output, &output_capacity, &output_len, "\n", 1) < 0) {
+                fprintf(stderr, "Error: Preprocessor output exceeded internal buffer capacity\n");
+                free(output);
+                free(expanded_source);
+                return NULL;
             }
         }
     }
-    
-    output[out_pos] = '\0';
+
+    if (cond_depth != 0) {
+        fprintf(stderr, "Error: Unterminated preprocessor conditional block\n");
+        free(output);
+        free(expanded_source);
+        return NULL;
+    }
+
     free(expanded_source);
     return output;
 }
 
-/* ============================================================================
- * INCLUDE FILE SUPPORT IMPLEMENTATION
- * ============================================================================ */
-
 /* Read entire file contents into a malloc'd buffer */
 char *read_file_contents(const char *filename) {
     if (!filename) return NULL;
-    
+
     FILE *f = fopen(filename, "r");
     if (!f) {
         fprintf(stderr, "Error: Cannot open include file '%s': %s\n", filename, strerror(errno));
         return NULL;
     }
-    
-    /* Get file size */
+
     if (fseek(f, 0, SEEK_END) != 0) {
         fclose(f);
         return NULL;
@@ -2031,27 +2637,23 @@ char *read_file_contents(const char *filename) {
         fclose(f);
         return NULL;
     }
-    
-    /* Allocate buffer with extra space for null terminator */
+
     char *content = malloc(size + 2);
     if (!content) {
         fclose(f);
         return NULL;
     }
-    
-    /* Read file */
+
     size_t read = fread(content, 1, size, f);
     fclose(f);
-    
+
     if (read != (size_t)size) {
         free(content);
         return NULL;
     }
-    
-    /* Ensure null termination and trailing newline */
+
     content[size] = '\n';
     content[size + 1] = '\0';
-    
     return content;
 }
 

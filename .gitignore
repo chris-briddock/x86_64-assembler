@@ -12,6 +12,12 @@
 *.so
 *.dylib
 
+# Coverage artifacts (gcov/gcc --coverage)
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
 # Debug and crash artifacts
 *.core
 core

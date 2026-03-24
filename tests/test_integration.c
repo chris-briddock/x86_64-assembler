@@ -166,6 +166,15 @@ static int assemble_and_run(const char *source) {
     return result;
 }
 
+static const symbol_t *find_symbol_by_name(assembler_context_t *ctx, const char *name) {
+    for (int i = 0; i < ctx->symbol_count; i++) {
+        if (strcmp(ctx->symbols[i].name, name) == 0) {
+            return &ctx->symbols[i];
+        }
+    }
+    return NULL;
+}
+
 /* Test: Simple exit program */
 int test_integration_exit(void) {
     const char *source = 
@@ -256,6 +265,55 @@ int test_integration_loop(void) {
     
     int exit_code = assemble_and_run(source);
     ASSERT_EQ(5, exit_code);
+    return 0;
+}
+
+/* Test: Local labels should be scoped to the nearest non-local label. */
+int test_integration_local_labels_scoped(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    jmp .done\n"
+        ".fail:\n"
+        "    mov rdi, $99\n"
+        "    jmp .exit\n"
+        ".done:\n"
+        "    mov rdi, $21\n"
+        ".exit:\n"
+        "    mov rax, $60\n"
+        "    syscall\n"
+        "helper:\n"
+        "    jmp .done\n"
+        ".fail:\n"
+        "    mov rax, $1\n"
+        ".done:\n"
+        "    ret\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(21, exit_code);
+    return 0;
+}
+
+/* Test: Anonymous labels should resolve with @B/@F references. */
+int test_integration_anonymous_labels(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rcx, $2\n"
+        "@@:\n"
+        "    dec rcx\n"
+        "    jnz @B\n"
+        "    jmp @F\n"
+        "    mov rdi, $1\n"
+        "@@:\n"
+        "    mov rdi, $7\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(7, exit_code);
     return 0;
 }
 
@@ -359,6 +417,61 @@ int test_integration_data(void) {
 
     int exit_code = assemble_and_run(source);
     ASSERT_EQ(72, exit_code);
+    return 0;
+}
+
+/* Test: Named section variants should map to data/text behavior */
+int test_integration_named_sections(void) {
+    const char *source =
+        "section .data.custom\n"
+        "value: dq $91\n"
+        "section .text.hot\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rdi, [value]\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(91, exit_code);
+    return 0;
+}
+
+/* Test: segment alias should behave the same as section */
+int test_integration_segment_alias(void) {
+    const char *source =
+        "segment .data\n"
+        "value: dq $66\n"
+        "segment .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rdi, [value]\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(66, exit_code);
+    return 0;
+}
+
+/* Test: Preprocessor directives should participate in assembly flow */
+int test_integration_preprocessor_conditionals(void) {
+    const char *source =
+        "%define EXIT_CODE 23\n"
+        "%if EXIT_CODE\n"
+        "%warning selecting defined exit path\n"
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, EXIT_CODE\n"
+        "    syscall\n"
+        "%else\n"
+        "%error unexpected inactive branch\n"
+        "%endif\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(23, exit_code);
     return 0;
 }
 
@@ -644,6 +757,55 @@ int test_integration_sse_all_xmm_registers_runtime(void) {
 
     int exit_code = assemble_and_run(source);
     ASSERT_EQ(255, exit_code);
+    return 0;
+}
+
+/* Test: Label subtraction in equ should resolve to absolute immediate constant. */
+int test_integration_label_arithmetic_equ(void) {
+    const char *source =
+        "section .text\n"
+        "start:\n"
+        "    nop\n"
+        "end:\n"
+        "DELTA equ end - start\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, DELTA\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(1, exit_code);
+    return 0;
+}
+
+/* Test: weak/hidden directives should mark symbol attributes in the table. */
+int test_integration_weak_hidden_attributes(void) {
+    const char *source =
+        "section .text\n"
+        "bar:\n"
+        "    nop\n"
+        "hidden bar\n"
+        "weak foo\n"
+        "foo:\n"
+        "    nop\n"
+        ".hidden foo\n";
+
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(0, asm_assemble(ctx, source));
+
+    const symbol_t *foo = find_symbol_by_name(ctx, "foo");
+    const symbol_t *bar = find_symbol_by_name(ctx, "bar");
+    ASSERT_NOT_NULL(foo);
+    ASSERT_NOT_NULL(bar);
+
+    ASSERT_TRUE(foo->is_weak);
+    ASSERT_TRUE(foo->is_hidden);
+    ASSERT_FALSE(bar->is_weak);
+    ASSERT_TRUE(bar->is_hidden);
+
+    asm_free(ctx);
     return 0;
 }
 
@@ -1836,11 +1998,18 @@ TEST_SUITE(integration) {
     TEST(integration_registers);
     TEST(integration_conditional);
     TEST(integration_loop);
+    TEST(integration_local_labels_scoped);
+    TEST(integration_anonymous_labels);
     TEST(integration_pushpop);
     TEST(integration_callret);
     TEST(integration_enter_legacy_signext);
     TEST(integration_8bit);
     TEST(integration_data);
+    TEST(integration_label_arithmetic_equ);
+    TEST(integration_weak_hidden_attributes);
+    TEST(integration_named_sections);
+    TEST(integration_segment_alias);
+    TEST(integration_preprocessor_conditionals);
     TEST(integration_empty);
     TEST(integration_invalid);
     TEST(integration_enter_invalid_operands);

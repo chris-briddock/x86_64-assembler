@@ -225,6 +225,17 @@ double:
 
 - `.include` support for quoted relative/absolute paths (with nested includes)
 - Include/diagnostic/regression hardening around common parser/encoder edge cases
+- Named section prefixes (for example: `.text.hot`, `.data.runtime`) and `segment` alias support
+- Preprocessor directives `%define`, `%if/%else/%endif`, `%ifdef/%ifndef`, `%error`, `%warning`
+- Label arithmetic in `equ` expressions (`name equ label1 - label2`)
+- Symbol attribute directives `weak`/`.weak` and `hidden`/`.hidden`
+
+### New Feature Examples
+
+- `examples/sections_named_segment.asm` demonstrates named sections and `segment`
+- `examples/preprocessor_features.asm` demonstrates new preprocessor directives
+- `examples/label_arithmetic_equ.asm` demonstrates label subtraction in `equ` constants
+- `examples/weak_hidden_symbols.asm` demonstrates symbol attribute directives
 
 ## CI/CD
 

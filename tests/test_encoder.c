@@ -19,6 +19,7 @@ extern int encode_lea(assembler_context_t *ctx, const parsed_instruction_t *inst
 extern int encode_bit_manip(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_shld_shrd(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_bit_scan(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *inst);
 
 /* Test helper: Create minimal context for encoding */
 static void setup_test_context(assembler_context_t *ctx) {
@@ -4322,6 +4323,48 @@ int test_rip_relative_with_index_rejected(void) {
     return 0;
 }
 
+/* Test: FS segment override prefix should precede encoded memory instruction */
+int test_encode_instruction_fs_segment_prefix(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {0};
+    inst.type = INST_MOV;
+    inst.operand_count = 2;
+    inst.operands[0] = make_reg_operand(RAX, REG_SIZE_64);
+    inst.operands[1].type = OPERAND_MEM;
+    inst.operands[1].mem.segment_override = MEM_SEG_FS;
+    inst.operands[1].mem.has_displacement = true;
+    inst.operands[1].mem.displacement = 0;
+
+    ASSERT_EQ(0, encode_instruction(&ctx, &inst));
+    ASSERT_EQ_HEX(0x64, ctx.output[0]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: GS segment override prefix should precede encoded memory instruction */
+int test_encode_instruction_gs_segment_prefix(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {0};
+    inst.type = INST_MOV;
+    inst.operand_count = 2;
+    inst.operands[0] = make_reg_operand(RAX, REG_SIZE_64);
+    inst.operands[1].type = OPERAND_MEM;
+    inst.operands[1].mem.segment_override = MEM_SEG_GS;
+    inst.operands[1].mem.has_displacement = true;
+    inst.operands[1].mem.displacement = 0;
+
+    ASSERT_EQ(0, encode_instruction(&ctx, &inst));
+    ASSERT_EQ_HEX(0x65, ctx.output[0]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
 /* Test: LEA with 16-bit destination should emit operand-size prefix */
 int test_lea_ax_rbx_rcx_scale2_disp8(void) {
     assembler_context_t ctx;
@@ -4572,6 +4615,8 @@ TEST_SUITE(encoder) {
     TEST(invalid_scale_factor6_rejected);
     TEST(invalid_scale_factor7_rejected);
     TEST(rip_relative_with_index_rejected);
+    TEST(encode_instruction_fs_segment_prefix);
+    TEST(encode_instruction_gs_segment_prefix);
     TEST(lea_ax_rbx_rcx_scale2_disp8);
     TEST(lea_ecx_r8_r9_scale4_disp8);
     TEST(lea_8bit_destination_rejected);

@@ -12,6 +12,7 @@ supported by this assembler.
 5. [Sections](#sections)
 6. [Labels and Symbols](#labels-and-symbols)
 7. [Data Directives](#data-directives)
+8. [Preprocessor and Macro Directives](#preprocessor-and-macro-directives)
 
 ## Basic Syntax
 
@@ -78,6 +79,15 @@ High 8 bits: `ah`, `bh`, `ch`, `dh`
 - 64-bit operations requiring REX prefix
 
 Use AL/BL/CL/DL or the low byte of R8-R15 (R8B-R15B) instead for compatibility.
+
+### XMM Registers
+
+SSE/SSE2 instructions in this assembler use `xmm0` through `xmm15`.
+
+```asm
+movaps xmm0, xmm1
+pxor xmm15, xmm15
+```
 
 ## Instructions
 
@@ -379,6 +389,23 @@ lea rax, [rip + label]     ; Address of label relative to IP
 mov rbx, [rip + data_var]  ; Load from data section
 ```
 
+### Absolute Addressing
+
+Use `abs` to force absolute displacement form:
+
+```asm
+mov rax, [abs 0x1234]
+```
+
+### Segment Override Addressing
+
+Use `fs:` or `gs:` with memory operands:
+
+```asm
+mov rax, fs:[0]
+mov rbx, gs:[8]
+```
+
 ## Sections
 
 ### TEXT Section
@@ -422,6 +449,24 @@ pi:     dq $3.14159   ; Read-only constant
 msg:    db "Hello"    ; Read-only string
 ```
 
+### Named Sections and `segment` Alias
+
+Named section prefixes are supported and mapped by base section semantics.
+
+```asm
+section .data.runtime
+value: dq $17
+
+segment .text.hot
+global _start
+_start:
+    mov rdi, [value]
+    mov rax, $60
+    syscall
+```
+
+Supported forms include `.text.*`, `.data.*`, `.bss.*`, and `.rodata.*`.
+
 ## Labels and Symbols
 
 ### Defining Labels
@@ -452,6 +497,47 @@ len: equ $5            ; Constant definition
 section .text
 mov rdx, $len          ; Use constant
 ```
+
+### Local and Anonymous Labels
+
+The assembler supports scoped local labels and anonymous forward/backward labels.
+
+```asm
+entry:
+    jmp .loop
+.loop:
+    jmp @F
+@@:
+    jmp @B
+```
+
+- Local labels (starting with `.`) are scoped to the nearest non-local label.
+- Anonymous labels use `@@` as definition with `@F` (forward) and `@B` (backward) references.
+
+### Label Arithmetic in `equ`
+
+`equ` supports label subtraction expressions resolved to absolute constants.
+
+```asm
+start:
+    nop
+end:
+DELTA equ end - start
+mov rdi, DELTA
+```
+
+### Symbol Attribute Directives
+
+Use symbol attribute directives to mark label metadata.
+
+```asm
+weak plugin_entry          ; Mark symbol as weak
+.hidden internal_helper    ; Mark symbol as hidden
+```
+
+- `weak` / `.weak`: marks one or more symbols as weak.
+- `hidden` / `.hidden`: marks one or more symbols as hidden.
+- Both directives accept comma-separated label operands.
 
 ## Data Directives
 
@@ -485,6 +571,87 @@ dq $123456789ABCDEF0   ; 64-bit value
 ```asm
 buffer_size: equ $1024    ; Constant, no storage
 ```
+
+### RESB / RESW / RESD / RESQ - Reserve Uninitialized Space
+
+```asm
+buffer: resb 64      ; 64 bytes
+words:  resw 10      ; 10 words (20 bytes)
+dwords: resd 5       ; 5 dwords (20 bytes)
+qwords: resq 4       ; 4 qwords (32 bytes)
+```
+
+### TIMES - Repeat Directive
+
+```asm
+times 5 nop
+times 3 push rax
+```
+
+### ALIGN - Alignment Directive
+
+```asm
+align 16
+```
+
+In `.text`, alignment emits NOP padding. In data sections, it emits zero padding.
+
+### INCBIN - Include Binary Payload
+
+```asm
+incbin "test_data.bin"
+```
+
+### .COMM / .LCOMM - Common Symbols
+
+```asm
+.comm shared_buf, 256, 16
+.lcomm local_buf, 128, 8
+```
+
+`.comm` declares global common symbols, while `.lcomm` declares file-local common symbols.
+
+## Preprocessor and Macro Directives
+
+### Macros
+
+```asm
+.macro exit_with_code code
+    mov rax, $60
+    mov rdi, \code
+    syscall
+.endm
+```
+
+### Include Files
+
+```asm
+.include "other_file.asm"
+```
+
+### Preprocessor Conditionals and Definitions
+
+```asm
+%define EXIT_CODE 23
+
+%if EXIT_CODE
+    mov rdi, EXIT_CODE
+%else
+    %error EXIT_CODE disabled unexpectedly
+%endif
+
+%ifdef EXIT_CODE
+    %warning EXIT_CODE is defined
+%endif
+```
+
+Supported directives:
+
+- `%define`
+- `%if`, `%else`, `%endif`
+- `%ifdef`, `%ifndef`
+- `%error`
+- `%warning`
 
 ## Complete Example
 

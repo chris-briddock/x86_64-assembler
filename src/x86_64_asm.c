@@ -51,6 +51,500 @@ extern int encode_bit_scan(assembler_context_t *ctx, const parsed_instruction_t 
 
 extern int emit_byte(assembler_context_t *ctx, uint8_t byte);
 
+int add_symbol(assembler_context_t *ctx, const char *name, uint64_t address,
+               bool is_global, bool is_external, int section);
+int find_symbol_address(assembler_context_t *ctx, const char *name, uint64_t *addr);
+
+static bool section_name_matches(const char *section_name, const char *base_name) {
+    const char *name = section_name;
+    size_t i;
+
+    if (!section_name || !base_name) {
+        return false;
+    }
+
+    if (*name == '.') {
+        name++;
+    }
+
+    for (i = 0; base_name[i] != '\0'; i++) {
+        if (name[i] == '\0') {
+            return false;
+        }
+        if (tolower((unsigned char)name[i]) != tolower((unsigned char)base_name[i])) {
+            return false;
+        }
+    }
+
+    return name[i] == '\0' || name[i] == '.';
+}
+
+static int classify_section_name(const char *section_name) {
+    if (section_name_matches(section_name, "data") ||
+        section_name_matches(section_name, "bss") ||
+        section_name_matches(section_name, "rodata")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static const char *section_name_from_instruction(const parsed_instruction_t *inst) {
+    if (!inst || inst->operand_count <= 0) {
+        return NULL;
+    }
+
+    if (inst->operands[0].type == OPERAND_LABEL) {
+        return inst->operands[0].label;
+    }
+
+    if (inst->operands[0].type == OPERAND_STRING) {
+        return inst->operands[0].string;
+    }
+
+    return NULL;
+}
+
+static void apply_section_directive(assembler_context_t *ctx, const parsed_instruction_t *inst) {
+    const char *section_name = section_name_from_instruction(inst);
+    if (!section_name) {
+        return;
+    }
+
+    ctx->current_section = classify_section_name(section_name);
+}
+
+static void copy_bounded_text(char *dst, size_t dst_size, const char *src) {
+    size_t n = 0;
+
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    while (src[n] != '\0' && n + 1 < dst_size) {
+        n++;
+    }
+
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+typedef struct {
+    int scope_id;
+    char local_name[MAX_LABEL_LENGTH];
+    char scoped_name[MAX_LABEL_LENGTH];
+} local_label_alias_t;
+
+typedef struct {
+    int instruction_index;
+    char scoped_name[MAX_LABEL_LENGTH];
+} anonymous_label_def_t;
+
+static bool is_local_label_name(const char *name) {
+    return name && name[0] == '.' && name[1] != '\0';
+}
+
+static bool is_anonymous_label_definition(const char *name) {
+    return name && strcmp(name, "@@") == 0;
+}
+
+static bool is_anonymous_backward_ref(const char *name) {
+    return name && strcasecmp(name, "@B") == 0;
+}
+
+static bool is_anonymous_forward_ref(const char *name) {
+    return name && strcasecmp(name, "@F") == 0;
+}
+
+static int build_scoped_local_label(char *dst, size_t dst_size,
+                                    int scope_id, const char *local_name) {
+    int written;
+
+    if (!dst || dst_size == 0 || !local_name || local_name[0] != '.') {
+        return -1;
+    }
+
+    written = snprintf(dst, dst_size, "__loc_%d_%s", scope_id, local_name + 1);
+    if (written < 0 || (size_t)written >= dst_size) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int lookup_local_alias(local_label_alias_t *aliases, int alias_count,
+                              int scope_id, const char *local_name,
+                              char *out, size_t out_size) {
+    for (int i = 0; i < alias_count; i++) {
+        if (aliases[i].scope_id == scope_id &&
+            strcmp(aliases[i].local_name, local_name) == 0) {
+            strncpy(out, aliases[i].scoped_name, out_size - 1);
+            out[out_size - 1] = '\0';
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int get_or_create_local_alias(local_label_alias_t *aliases, int *alias_count,
+                                     int scope_id, const char *local_name,
+                                     char *out, size_t out_size) {
+    if (lookup_local_alias(aliases, *alias_count, scope_id, local_name, out, out_size) == 0) {
+        return 0;
+    }
+
+    if (*alias_count >= MAX_SYMBOLS) {
+        fprintf(stderr, "Error: Too many local label aliases\n");
+        return -1;
+    }
+
+    local_label_alias_t *entry = &aliases[*alias_count];
+    entry->scope_id = scope_id;
+    strncpy(entry->local_name, local_name, sizeof(entry->local_name) - 1);
+    entry->local_name[sizeof(entry->local_name) - 1] = '\0';
+
+    if (build_scoped_local_label(entry->scoped_name, sizeof(entry->scoped_name),
+                                 scope_id, local_name) < 0) {
+        fprintf(stderr, "Error: Local label name too long: '%s'\n", local_name);
+        return -1;
+    }
+
+    strncpy(out, entry->scoped_name, out_size - 1);
+    out[out_size - 1] = '\0';
+
+    (*alias_count)++;
+    return 0;
+}
+
+static int lookup_anonymous_ref(const anonymous_label_def_t *defs, int def_count,
+                                int instruction_index, bool forward,
+                                char *out, size_t out_size) {
+    int chosen = -1;
+
+    if (forward) {
+        for (int i = 0; i < def_count; i++) {
+            if (defs[i].instruction_index > instruction_index) {
+                chosen = i;
+                break;
+            }
+        }
+    } else {
+        for (int i = 0; i < def_count; i++) {
+            if (defs[i].instruction_index < instruction_index) {
+                chosen = i;
+            }
+        }
+    }
+
+    if (chosen < 0) {
+        return -1;
+    }
+
+    strncpy(out, defs[chosen].scoped_name, out_size - 1);
+    out[out_size - 1] = '\0';
+    return 0;
+}
+
+static int normalize_label_reference(char *label,
+                                     int scope_id,
+                                     int instruction_index,
+                                     local_label_alias_t *local_aliases,
+                                     int *local_alias_count,
+                                     const anonymous_label_def_t *anon_defs,
+                                     int anon_def_count,
+                                     int source_line) {
+    char replacement[MAX_LABEL_LENGTH];
+
+    if (!label || label[0] == '\0') {
+        return 0;
+    }
+
+    if (is_local_label_name(label)) {
+        if (get_or_create_local_alias(local_aliases, local_alias_count,
+                                      scope_id, label,
+                                      replacement, sizeof(replacement)) < 0) {
+            return -1;
+        }
+        strncpy(label, replacement, MAX_LABEL_LENGTH - 1);
+        label[MAX_LABEL_LENGTH - 1] = '\0';
+        return 0;
+    }
+
+    if (is_anonymous_forward_ref(label)) {
+        if (lookup_anonymous_ref(anon_defs, anon_def_count, instruction_index,
+                                 true, replacement, sizeof(replacement)) < 0) {
+            fprintf(stderr, "Error at line %d: @F has no matching forward @@ label\n", source_line);
+            return -1;
+        }
+        strncpy(label, replacement, MAX_LABEL_LENGTH - 1);
+        label[MAX_LABEL_LENGTH - 1] = '\0';
+        return 0;
+    }
+
+    if (is_anonymous_backward_ref(label)) {
+        if (lookup_anonymous_ref(anon_defs, anon_def_count, instruction_index,
+                                 false, replacement, sizeof(replacement)) < 0) {
+            fprintf(stderr, "Error at line %d: @B has no matching backward @@ label\n", source_line);
+            return -1;
+        }
+        strncpy(label, replacement, MAX_LABEL_LENGTH - 1);
+        label[MAX_LABEL_LENGTH - 1] = '\0';
+        return 0;
+    }
+
+    return 0;
+}
+
+static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
+    local_label_alias_t local_aliases[MAX_SYMBOLS];
+    anonymous_label_def_t anon_defs[MAX_SYMBOLS];
+    int local_alias_count = 0;
+    int anon_def_count = 0;
+    int scope_id = 0;
+    int anonymous_counter = 0;
+
+    memset(local_aliases, 0, sizeof(local_aliases));
+    memset(anon_defs, 0, sizeof(anon_defs));
+
+    /* Pass 1: rewrite label definitions and collect anonymous label sites. */
+    for (int i = 0; i < count; i++) {
+        parsed_instruction_t *inst = &insts[i];
+
+        if (!inst->has_label) {
+            continue;
+        }
+
+        if (is_anonymous_label_definition(inst->label)) {
+            char scoped_name[MAX_LABEL_LENGTH];
+            int written;
+
+            if (anon_def_count >= MAX_SYMBOLS) {
+                fprintf(stderr, "Error: Too many anonymous labels\n");
+                return -1;
+            }
+
+            written = snprintf(scoped_name, sizeof(scoped_name), "__anon_%d", anonymous_counter++);
+            if (written < 0 || (size_t)written >= sizeof(scoped_name)) {
+                fprintf(stderr, "Error: Anonymous label name overflow\n");
+                return -1;
+            }
+
+                copy_bounded_text(anon_defs[anon_def_count].scoped_name,
+                          sizeof(anon_defs[anon_def_count].scoped_name),
+                          scoped_name);
+            anon_defs[anon_def_count].instruction_index = i;
+            anon_def_count++;
+
+                copy_bounded_text(inst->label, sizeof(inst->label), scoped_name);
+            continue;
+        }
+
+        if (is_local_label_name(inst->label)) {
+            char scoped_name[MAX_LABEL_LENGTH];
+
+            if (lookup_local_alias(local_aliases, local_alias_count,
+                                   scope_id, inst->label,
+                                   scoped_name, sizeof(scoped_name)) == 0) {
+                fprintf(stderr, "Error at line %d: Redefined local label '%s' in the same scope\n",
+                        inst->line_number, inst->label);
+                return -1;
+            }
+
+            if (get_or_create_local_alias(local_aliases, &local_alias_count,
+                                          scope_id, inst->label,
+                                          scoped_name, sizeof(scoped_name)) < 0) {
+                return -1;
+            }
+
+            copy_bounded_text(inst->label, sizeof(inst->label), scoped_name);
+            continue;
+        }
+
+        if (inst->type != INST_EQU) {
+            scope_id++;
+        }
+    }
+
+    /* Pass 2: rewrite local and anonymous references in operands. */
+    scope_id = 0;
+    for (int i = 0; i < count; i++) {
+        parsed_instruction_t *inst = &insts[i];
+
+        if (inst->has_label &&
+            inst->type != INST_EQU &&
+            !is_local_label_name(inst->label) &&
+            strncmp(inst->label, "__loc_", 6) != 0 &&
+            strncmp(inst->label, "__anon_", 7) != 0) {
+            scope_id++;
+        }
+
+        for (int op_idx = 0; op_idx < inst->operand_count; op_idx++) {
+            operand_t *op = &inst->operands[op_idx];
+
+            if (op->type == OPERAND_LABEL) {
+                if (normalize_label_reference(op->label, scope_id, i,
+                                              local_aliases, &local_alias_count,
+                                              anon_defs, anon_def_count,
+                                              inst->line_number) < 0) {
+                    return -1;
+                }
+                continue;
+            }
+
+            if (op->type == OPERAND_LABEL_DIFF) {
+                if (normalize_label_reference(op->label, scope_id, i,
+                                              local_aliases, &local_alias_count,
+                                              anon_defs, anon_def_count,
+                                              inst->line_number) < 0) {
+                    return -1;
+                }
+                if (normalize_label_reference(op->label_rhs, scope_id, i,
+                                              local_aliases, &local_alias_count,
+                                              anon_defs, anon_def_count,
+                                              inst->line_number) < 0) {
+                    return -1;
+                }
+                continue;
+            }
+
+            if (op->type == OPERAND_MEM && op->mem.label[0] != '\0') {
+                if (normalize_label_reference(op->mem.label, scope_id, i,
+                                              local_aliases, &local_alias_count,
+                                              anon_defs, anon_def_count,
+                                              inst->line_number) < 0) {
+                    return -1;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int upsert_constant_symbol(assembler_context_t *ctx, const char *name, int64_t value) {
+    hash_entry_t *existing = symbol_hash_lookup(ctx, name);
+    if (existing) {
+        if (existing->is_external) {
+            fprintf(stderr, "Error: Cannot redefine external symbol '%s' as equ constant\n", name);
+            return -1;
+        }
+        if (symbol_hash_update(ctx, name, (uint64_t)value, existing->is_global, false, -1) < 0) {
+            return -1;
+        }
+        for (int i = 0; i < ctx->symbol_count; i++) {
+            if (strcmp(ctx->symbols[i].name, name) == 0) {
+                ctx->symbols[i].address = (uint64_t)value;
+                ctx->symbols[i].is_resolved = true;
+                ctx->symbols[i].is_external = false;
+                ctx->symbols[i].section = -1;
+                return 0;
+            }
+        }
+    }
+
+    return add_symbol(ctx, name, (uint64_t)value, false, false, -1);
+}
+
+static int resolve_equ_symbol_values(assembler_context_t *ctx,
+                                     parsed_instruction_t *insts,
+                                     int count) {
+    for (int i = 0; i < count; i++) {
+        parsed_instruction_t *inst = &insts[i];
+        int64_t value = 0;
+        uint64_t lhs_addr = 0;
+        uint64_t rhs_addr = 0;
+
+        if (inst->type != INST_EQU || !inst->has_label || inst->operand_count < 1) {
+            continue;
+        }
+
+        if (inst->operands[0].type == OPERAND_IMM) {
+            value = inst->operands[0].immediate;
+        } else if (inst->operands[0].type == OPERAND_LABEL) {
+            if (find_symbol_address(ctx, inst->operands[0].label, &lhs_addr) < 0) {
+                fprintf(stderr, "Error: Undefined symbol '%s' in equ at line %d\n",
+                        inst->operands[0].label, inst->line_number);
+                return -1;
+            }
+            value = (int64_t)lhs_addr;
+        } else if (inst->operands[0].type == OPERAND_LABEL_DIFF) {
+            if (find_symbol_address(ctx, inst->operands[0].label, &lhs_addr) < 0) {
+                fprintf(stderr, "Error: Undefined symbol '%s' in equ at line %d\n",
+                        inst->operands[0].label, inst->line_number);
+                return -1;
+            }
+            if (find_symbol_address(ctx, inst->operands[0].label_rhs, &rhs_addr) < 0) {
+                fprintf(stderr, "Error: Undefined symbol '%s' in equ at line %d\n",
+                        inst->operands[0].label_rhs, inst->line_number);
+                return -1;
+            }
+            value = (int64_t)lhs_addr - (int64_t)rhs_addr;
+        } else {
+            fprintf(stderr, "Error: Unsupported equ expression at line %d\n", inst->line_number);
+            return -1;
+        }
+
+        if (upsert_constant_symbol(ctx, inst->label, value) < 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void rewrite_constant_label_operands(assembler_context_t *ctx,
+                                            parsed_instruction_t *inst) {
+    for (int i = 0; i < inst->operand_count; i++) {
+        operand_t *op = &inst->operands[i];
+        hash_entry_t *entry;
+
+        if (op->type != OPERAND_LABEL) {
+            continue;
+        }
+
+        entry = get_symbol_info(ctx, op->label);
+        if (!entry || !entry->is_resolved || entry->section != -1) {
+            continue;
+        }
+
+        op->type = OPERAND_IMM;
+        op->immediate = (int64_t)entry->address;
+    }
+}
+
+static symbol_t *find_symbol_entry(assembler_context_t *ctx, const char *name) {
+    for (int i = 0; i < ctx->symbol_count; i++) {
+        if (strcmp(ctx->symbols[i].name, name) == 0) {
+            return &ctx->symbols[i];
+        }
+    }
+    return NULL;
+}
+
+static int apply_symbol_attributes(assembler_context_t *ctx,
+                                   char attrs[][MAX_LABEL_LENGTH],
+                                   int attr_count,
+                                   bool mark_weak,
+                                   bool mark_hidden,
+                                   const char *directive_name) {
+    for (int i = 0; i < attr_count; i++) {
+        symbol_t *sym = find_symbol_entry(ctx, attrs[i]);
+        if (!sym) {
+            fprintf(stderr, "Error: %s references undefined symbol '%s'\n",
+                    directive_name, attrs[i]);
+            return -1;
+        }
+        if (mark_weak) sym->is_weak = true;
+        if (mark_hidden) sym->is_hidden = true;
+    }
+    return 0;
+}
+
 /* ============================================================================
  * HASH TABLE FOR SYMBOL LOOKUP
  * ============================================================================ */
@@ -217,6 +711,8 @@ int add_symbol(assembler_context_t *ctx, const char *name, uint64_t address,
     sym->is_resolved = true;
     sym->is_global = is_global;
     sym->is_external = is_external;
+    sym->is_weak = false;
+    sym->is_hidden = false;
     sym->is_function = false;
     sym->section = section;
 
@@ -359,6 +855,29 @@ int resolve_fixups(assembler_context_t *ctx) {
  * ============================================================================ */
 
 int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *inst) {
+    mem_segment_t segment_override = MEM_SEG_DEFAULT;
+
+    for (int i = 0; i < inst->operand_count; i++) {
+        const operand_t *op = &inst->operands[i];
+        if (op->type != OPERAND_MEM || op->mem.segment_override == MEM_SEG_DEFAULT) {
+            continue;
+        }
+
+        if (segment_override != MEM_SEG_DEFAULT && segment_override != op->mem.segment_override) {
+            fprintf(stderr, "Error: Conflicting segment overrides on memory operands at line %d\n",
+                    inst->line_number);
+            return -1;
+        }
+
+        segment_override = op->mem.segment_override;
+    }
+
+    if (segment_override == MEM_SEG_FS) {
+        if (emit_byte(ctx, 0x64) < 0) return -1;
+    } else if (segment_override == MEM_SEG_GS) {
+        if (emit_byte(ctx, 0x65) < 0) return -1;
+    }
+
     switch (inst->type) {
         case INST_MOV:
         case INST_MOVZX:
@@ -586,19 +1105,7 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
 
         case INST_SECTION:
             /* Section directive - change current section */
-            if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                const char *section_name = inst->operands[0].label;
-                if (strcmp(section_name, ".data") == 0 ||
-                    strcmp(section_name, "data") == 0 ||
-                    strcmp(section_name, ".bss") == 0 ||
-                    strcmp(section_name, "bss") == 0 ||
-                    strcmp(section_name, ".rodata") == 0 ||
-                    strcmp(section_name, "rodata") == 0) {
-                    ctx->current_section = 1;  /* Data section */
-                } else {
-                    ctx->current_section = 0;  /* Text section */
-                }
-            }
+            apply_section_directive(ctx, inst);
             return 0;
 
         case INST_ALIGN:
@@ -680,6 +1187,11 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
         case INST_COMM:
         case INST_LCOMM:
             /* Common symbol declaration - reserve uninitialized space in BSS */
+
+        case INST_WEAK:
+        case INST_HIDDEN:
+            /* Symbol attribute directives do not emit bytes. */
+            return 0;
             if (inst->operand_count >= 2 &&
                 inst->operands[0].type == OPERAND_LABEL &&
                 inst->operands[1].type == OPERAND_IMM) {
@@ -960,10 +1472,19 @@ static int estimate_instruction_size(const parsed_instruction_t *inst) {
 
 int asm_assemble(assembler_context_t *ctx, const char *source) {
     int count = 0;
+    char weak_attrs[MAX_SYMBOLS][MAX_LABEL_LENGTH];
+    char hidden_attrs[MAX_SYMBOLS][MAX_LABEL_LENGTH];
+    int weak_attr_count = 0;
+    int hidden_attr_count = 0;
     /* Use context-aware parsing to enable macro support */
     parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
     if (!insts) {
         fprintf(stderr, "Error: Parsing failed\n");
+        return -1;
+    }
+
+    if (canonicalize_symbol_labels(insts, count) < 0) {
+        free_instructions(insts);
         return -1;
     }
 
@@ -981,19 +1502,7 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
 
         /* Handle section directives */
         if (inst->type == INST_SECTION) {
-            if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                const char *section_name = inst->operands[0].label;
-                if (strcmp(section_name, ".data") == 0 ||
-                    strcmp(section_name, "data") == 0 ||
-                    strcmp(section_name, ".bss") == 0 ||
-                    strcmp(section_name, "bss") == 0 ||
-                    strcmp(section_name, ".rodata") == 0 ||
-                    strcmp(section_name, "rodata") == 0) {
-                    ctx->current_section = 1;
-                } else {
-                    ctx->current_section = 0;
-                }
-            }
+            apply_section_directive(ctx, inst);
             continue;
         }
 
@@ -1006,6 +1515,7 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                           (inst->type == INST_DD) ? 4 : 8;
                 text_size += size * inst->operand_count;
             } else if (inst->type != INST_GLOBAL && inst->type != INST_EXTERN &&
+                       inst->type != INST_WEAK && inst->type != INST_HIDDEN &&
                        inst->type != INST_NOP) {
                 text_size += estimate_instruction_size(inst);
             }
@@ -1025,19 +1535,7 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
 
         /* Handle section directives */
         if (inst->type == INST_SECTION) {
-            if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                const char *section_name = inst->operands[0].label;
-                if (strcmp(section_name, ".data") == 0 ||
-                    strcmp(section_name, "data") == 0 ||
-                    strcmp(section_name, ".bss") == 0 ||
-                    strcmp(section_name, "bss") == 0 ||
-                    strcmp(section_name, ".rodata") == 0 ||
-                    strcmp(section_name, "rodata") == 0) {
-                    ctx->current_section = 1;
-                } else {
-                    ctx->current_section = 0;
-                }
-            }
+            apply_section_directive(ctx, inst);
             continue;
         }
 
@@ -1094,23 +1592,7 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                 }
             }
         } else if (inst->type == INST_EQU) {
-            /* equ doesn't take up space - define symbol if not already done */
-            if (inst->has_label && inst->operand_count >= 1 &&
-                inst->operands[0].type == OPERAND_IMM) {
-                /* Check if symbol already exists */
-                bool exists = false;
-                for (int j = 0; j < ctx->symbol_count; j++) {
-                    if (strcmp(ctx->symbols[j].name, inst->label) == 0) {
-                        exists = true;
-                        break;
-                    }
-                }
-                if (!exists) {
-                    /* equ defines an absolute constant, not an address */
-                    add_symbol(ctx, inst->label, (uint64_t)inst->operands[0].immediate,
-                              false, false, -1);  /* section -1 indicates constant */
-                }
-            }
+            /* equ does not consume bytes; values are resolved after labels are known. */
         } else if (inst->type == INST_ALIGN) {
             /* Align directive - calculate padding bytes */
             if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_IMM) {
@@ -1163,11 +1645,17 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                 }
             }
         } else if (inst->type != INST_GLOBAL && inst->type != INST_EXTERN &&
+                   inst->type != INST_WEAK && inst->type != INST_HIDDEN &&
                    inst->type != INST_NOP && inst->type != INST_TIMES) {
             if (ctx->current_section == 0) {
                 ctx->current_address += estimate_instruction_size(inst);
             }
         }
+    }
+
+    if (resolve_equ_symbol_values(ctx, insts, count) < 0) {
+        free_instructions(insts);
+        return -1;
     }
 
     /* Second pass: generate text section code */
@@ -1181,17 +1669,38 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
 
         /* Handle section directives */
         if (inst->type == INST_SECTION) {
-            if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                const char *section_name = inst->operands[0].label;
-                if (strcmp(section_name, ".data") == 0 ||
-                    strcmp(section_name, "data") == 0 ||
-                    strcmp(section_name, ".bss") == 0 ||
-                    strcmp(section_name, "bss") == 0 ||
-                    strcmp(section_name, ".rodata") == 0 ||
-                    strcmp(section_name, "rodata") == 0) {
-                    ctx->current_section = 1;
+            apply_section_directive(ctx, inst);
+            continue;
+        }
+
+        if (inst->type == INST_WEAK || inst->type == INST_HIDDEN) {
+            for (int j = 0; j < inst->operand_count; j++) {
+                if (inst->operands[j].type != OPERAND_LABEL) {
+                    fprintf(stderr, "Error: %s requires label operands at line %d\n",
+                            inst->type == INST_WEAK ? "weak" : "hidden",
+                            inst->line_number);
+                    free_instructions(insts);
+                    return -1;
+                }
+
+                if (inst->type == INST_WEAK) {
+                    if (weak_attr_count >= MAX_SYMBOLS) {
+                        fprintf(stderr, "Error: Too many weak symbol attributes\n");
+                        free_instructions(insts);
+                        return -1;
+                    }
+                    strncpy(weak_attrs[weak_attr_count], inst->operands[j].label, MAX_LABEL_LENGTH - 1);
+                    weak_attrs[weak_attr_count][MAX_LABEL_LENGTH - 1] = '\0';
+                    weak_attr_count++;
                 } else {
-                    ctx->current_section = 0;
+                    if (hidden_attr_count >= MAX_SYMBOLS) {
+                        fprintf(stderr, "Error: Too many hidden symbol attributes\n");
+                        free_instructions(insts);
+                        return -1;
+                    }
+                    strncpy(hidden_attrs[hidden_attr_count], inst->operands[j].label, MAX_LABEL_LENGTH - 1);
+                    hidden_attrs[hidden_attr_count][MAX_LABEL_LENGTH - 1] = '\0';
+                    hidden_attr_count++;
                 }
             }
             continue;
@@ -1218,6 +1727,8 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
 
         /* Record address for this instruction */
         inst->address = ctx->current_address;
+
+        rewrite_constant_label_operands(ctx, inst);
 
         /* Handle pseudo-instructions */
         if (inst->type == INST_GLOBAL) {
@@ -1279,6 +1790,12 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         }
     }
 
+    if (apply_symbol_attributes(ctx, weak_attrs, weak_attr_count, true, false, "weak") < 0 ||
+        apply_symbol_attributes(ctx, hidden_attrs, hidden_attr_count, false, true, "hidden") < 0) {
+        free_instructions(insts);
+        return -1;
+    }
+
     /* Third pass: generate data section */
     ctx->current_section = 0;
     ctx->data_size = 0;
@@ -1290,19 +1807,7 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
 
         /* Handle section directives */
         if (inst->type == INST_SECTION) {
-            if (inst->operand_count > 0 && inst->operands[0].type == OPERAND_LABEL) {
-                const char *section_name = inst->operands[0].label;
-                if (strcmp(section_name, ".data") == 0 ||
-                    strcmp(section_name, "data") == 0 ||
-                    strcmp(section_name, ".bss") == 0 ||
-                    strcmp(section_name, "bss") == 0 ||
-                    strcmp(section_name, ".rodata") == 0 ||
-                    strcmp(section_name, "rodata") == 0) {
-                    ctx->current_section = 1;
-                } else {
-                    ctx->current_section = 0;
-                }
-            }
+            apply_section_directive(ctx, inst);
             continue;
         }
 
@@ -1325,6 +1830,8 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         }
 
         /* Encode data directive */
+        rewrite_constant_label_operands(ctx, inst);
+
         if (inst->type == INST_DB || inst->type == INST_DW ||
             inst->type == INST_DD || inst->type == INST_DQ) {
             for (int j = 0; j < inst->operand_count; j++) {
@@ -2231,15 +2738,17 @@ int asm_write_debug_map(assembler_context_t *ctx, const char *filename) {
 
 void asm_dump_symbols(assembler_context_t *ctx) {
     printf("Symbol Table:\n");
-    printf("%-30s %-16s %s %s %s\n", "Name", "Address", "Global", "Extern", "Section");
-    printf("%-30s %-16s %s %s %s\n", "----", "-------", "------", "------", "-------");
+    printf("%-30s %-16s %s %s %s %s %s\n", "Name", "Address", "Global", "Extern", "Weak", "Hidden", "Section");
+    printf("%-30s %-16s %s %s %s %s %s\n", "----", "-------", "------", "------", "----", "------", "-------");
 
     for (int i = 0; i < ctx->symbol_count; i++) {
-        printf("%-30s 0x%016lx %s      %s      %s\n",
+        printf("%-30s 0x%016lx %s      %s      %s    %s      %s\n",
                ctx->symbols[i].name,
                ctx->symbols[i].address,
                ctx->symbols[i].is_global ? "G" : " ",
                ctx->symbols[i].is_external ? "E" : " ",
+               ctx->symbols[i].is_weak ? "W" : " ",
+               ctx->symbols[i].is_hidden ? "H" : " ",
                ctx->symbols[i].section == 0 ? "text" : "data");
     }
 }

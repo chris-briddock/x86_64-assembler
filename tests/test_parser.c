@@ -78,6 +78,44 @@ int test_parse_label_ref(void) {
     return 0;
 }
 
+/* Test: Parse local and anonymous label syntax */
+int test_parse_local_and_anonymous_labels(void) {
+    int count = 0;
+    const char *source =
+        "entry:\n"
+        "    jmp .loop\n"
+        ".loop:\n"
+        "    jmp @F\n"
+        "@@:\n"
+        "    jmp @B\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(6, count);
+
+    ASSERT_TRUE(insts[0].has_label);
+    ASSERT_EQ_STR("entry", insts[0].label);
+
+    ASSERT_EQ(INST_JMP, insts[1].type);
+    ASSERT_EQ(OPERAND_LABEL, insts[1].operands[0].type);
+    ASSERT_EQ_STR(".loop", insts[1].operands[0].label);
+
+    ASSERT_TRUE(insts[2].has_label);
+    ASSERT_EQ_STR(".loop", insts[2].label);
+
+    ASSERT_EQ(INST_JMP, insts[3].type);
+    ASSERT_EQ_STR("@F", insts[3].operands[0].label);
+
+    ASSERT_TRUE(insts[4].has_label);
+    ASSERT_EQ_STR("@@", insts[4].label);
+
+    ASSERT_EQ(INST_JMP, insts[5].type);
+    ASSERT_EQ_STR("@B", insts[5].operands[0].label);
+
+    free_instructions(insts);
+    return 0;
+}
+
 /* Test: Parse multiple instructions */
 int test_parse_multiple(void) {
     int count = 0;
@@ -241,12 +279,50 @@ int test_parse_section(void) {
         "section .text\n";
     
     parsed_instruction_t *insts = parse_source(source, &count);
-    /* Section directives currently generate placeholder instructions */
-    /* Just verify it parses without crashing */
     ASSERT_NOT_NULL(insts);
-    ASSERT_TRUE(count >= 0);
+    ASSERT_EQ(2, count);
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_SECTION, insts[1].type);
+    ASSERT_EQ(1, insts[0].operand_count);
+    ASSERT_EQ(1, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_LABEL, insts[0].operands[0].type);
+    ASSERT_EQ(OPERAND_LABEL, insts[1].operands[0].type);
+    ASSERT_EQ_STR(".data", insts[0].operands[0].label);
+    ASSERT_EQ_STR(".text", insts[1].operands[0].label);
     
-    if (insts) free_instructions(insts);
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse named section directives and segment alias */
+int test_parse_named_sections_and_segment_alias(void) {
+    int count = 0;
+    const char *source =
+        "section .text.startup\n"
+        "segment .data.rel.ro\n"
+        ".bss\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(3, count);
+
+    ASSERT_EQ(INST_SECTION, insts[0].type);
+    ASSERT_EQ(INST_SECTION, insts[1].type);
+    ASSERT_EQ(INST_SECTION, insts[2].type);
+
+    ASSERT_EQ(1, insts[0].operand_count);
+    ASSERT_EQ(1, insts[1].operand_count);
+    ASSERT_EQ(1, insts[2].operand_count);
+
+    ASSERT_EQ(OPERAND_LABEL, insts[0].operands[0].type);
+    ASSERT_EQ(OPERAND_LABEL, insts[1].operands[0].type);
+    ASSERT_EQ(OPERAND_LABEL, insts[2].operands[0].type);
+
+    ASSERT_EQ_STR(".text.startup", insts[0].operands[0].label);
+    ASSERT_EQ_STR(".data.rel.ro", insts[1].operands[0].label);
+    ASSERT_EQ_STR(".bss", insts[2].operands[0].label);
+
+    free_instructions(insts);
     return 0;
 }
 
@@ -556,6 +632,50 @@ int test_parse_rip_relative_legal(void) {
     return 0;
 }
 
+/* Test: Parse explicit absolute memory addressing */
+int test_parse_absolute_memory_addressing(void) {
+    int count = 0;
+    const char *source = "mov rax, [abs 0x1234]\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(OPERAND_MEM, insts[0].operands[1].type);
+    ASSERT_TRUE(insts[0].operands[1].mem.is_absolute);
+    ASSERT_TRUE(insts[0].operands[1].mem.has_displacement);
+    ASSERT_EQ(0x1234, insts[0].operands[1].mem.displacement);
+    ASSERT_FALSE(insts[0].operands[1].mem.is_rip_relative);
+
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse FS/GS segment override memory operands */
+int test_parse_segment_override_memory(void) {
+    int count = 0;
+    const char *source =
+        "mov rax, fs:[0]\n"
+        "mov rbx, gs:[8]\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);
+
+    ASSERT_EQ(OPERAND_MEM, insts[0].operands[1].type);
+    ASSERT_EQ(MEM_SEG_FS, insts[0].operands[1].mem.segment_override);
+    ASSERT_TRUE(insts[0].operands[1].mem.has_displacement);
+    ASSERT_EQ(0, insts[0].operands[1].mem.displacement);
+
+    ASSERT_EQ(OPERAND_MEM, insts[1].operands[1].type);
+    ASSERT_EQ(MEM_SEG_GS, insts[1].operands[1].mem.segment_override);
+    ASSERT_TRUE(insts[1].operands[1].mem.has_displacement);
+    ASSERT_EQ(8, insts[1].operands[1].mem.displacement);
+
+    free_instructions(insts);
+    return 0;
+}
+
 /* Test: Macro definition and lookup */
 int test_macro_definition(void) {
     assembler_context_t *ctx = asm_init();
@@ -636,7 +756,7 @@ int test_macro_multiple_params(void) {
     ASSERT_EQ(INST_ADD, insts[1].type);
     ASSERT_EQ(RAX, insts[1].operands[0].reg);
     ASSERT_EQ(RCX, insts[1].operands[1].reg);
-    
+
     free_instructions(insts);
     asm_free(ctx);
     return 0;
@@ -715,6 +835,133 @@ int test_macro_multiple_invocations(void) {
     ASSERT_EQ(RCX, insts[2].operands[0].reg);
     
     free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %define should substitute symbols in active lines */
+int test_preprocessor_define_substitution(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%define EXIT_CODE 42\n"
+        "mov rdi, EXIT_CODE\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[1].type);
+    ASSERT_EQ(42, insts[0].operands[1].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %if/%else/%endif should include only active branch */
+int test_preprocessor_if_else(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%define ENABLE_PATH 1\n"
+        "%if ENABLE_PATH\n"
+        "mov rax, 1\n"
+        "%else\n"
+        "mov rax, 2\n"
+        "%endif\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(1, insts[0].operands[1].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %ifdef/%ifndef should evaluate based on %define symbols */
+int test_preprocessor_ifdef_ifndef(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%define ENABLED 1\n"
+        "%ifdef ENABLED\n"
+        "mov rax, 7\n"
+        "%endif\n"
+        "%ifndef DISABLED\n"
+        "mov rbx, 8\n"
+        "%endif\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(INST_MOV, insts[1].type);
+    ASSERT_EQ(7, insts[0].operands[1].immediate);
+    ASSERT_EQ(8, insts[1].operands[1].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %warning should emit warning and continue preprocessing */
+int test_preprocessor_warning_directive(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%warning this is a warning\n"
+        "mov rax, 3\n";
+    char *captured_err;
+    int count = 0;
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Warning: this is a warning");
+
+    free(captured_err);
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %error should fail preprocessing */
+int test_preprocessor_error_directive(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%error hard stop\n"
+        "mov rax, 1\n";
+    char *captured_err;
+    int count = 0;
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Error: hard stop");
+    ASSERT_STR_CONTAINS(captured_err, "Macro preprocessing failed");
+
+    free(captured_err);
     asm_free(ctx);
     return 0;
 }
@@ -808,6 +1055,53 @@ int test_parse_resb(void) {
     ASSERT_EQ(OPERAND_IMM, insts[0].operands[0].type);
     ASSERT_EQ(64, insts[0].operands[0].immediate);
     
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse equ with label subtraction expression */
+int test_parse_equ_label_subtraction(void) {
+    int count = 0;
+    const char *source = "DELTA equ end - start\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_EQU, insts[0].type);
+    ASSERT_TRUE(insts[0].has_label);
+    ASSERT_EQ_STR("DELTA", insts[0].label);
+    ASSERT_EQ(1, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_LABEL_DIFF, insts[0].operands[0].type);
+    ASSERT_EQ_STR("end", insts[0].operands[0].label);
+    ASSERT_EQ_STR("start", insts[0].operands[0].label_rhs);
+
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse weak/hidden symbol attribute directives */
+int test_parse_weak_hidden_directives(void) {
+    int count = 0;
+    const char *source =
+        "weak foo, bar\n"
+        ".hidden foo\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);
+
+    ASSERT_EQ(INST_WEAK, insts[0].type);
+    ASSERT_EQ(2, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_LABEL, insts[0].operands[0].type);
+    ASSERT_EQ_STR("foo", insts[0].operands[0].label);
+    ASSERT_EQ(OPERAND_LABEL, insts[0].operands[1].type);
+    ASSERT_EQ_STR("bar", insts[0].operands[1].label);
+
+    ASSERT_EQ(INST_HIDDEN, insts[1].type);
+    ASSERT_EQ(1, insts[1].operand_count);
+    ASSERT_EQ(OPERAND_LABEL, insts[1].operands[0].type);
+    ASSERT_EQ_STR("foo", insts[1].operands[0].label);
+
     free_instructions(insts);
     return 0;
 }
@@ -1337,6 +1631,7 @@ TEST_SUITE(parser) {
     TEST(parse_immediate);
     TEST(parse_hex_immediate);
     TEST(parse_label_ref);
+    TEST(parse_local_and_anonymous_labels);
     TEST(parse_multiple);
     TEST(parse_labeled_instruction);
     TEST(parse_label_column);
@@ -1346,6 +1641,7 @@ TEST_SUITE(parser) {
     TEST(parse_memory_ext_base_index);
     TEST(parse_registers);
     TEST(parse_section);
+    TEST(parse_named_sections_and_segment_alias);
     TEST(parse_empty);
     TEST(parse_comments);
     TEST(parse_instruction_with_comment);
@@ -1362,21 +1658,30 @@ TEST_SUITE(parser) {
     TEST(parse_memory_invalid_scale7);
     TEST(parse_rip_relative_with_index_invalid);
     TEST(parse_rip_relative_legal);
+    TEST(parse_absolute_memory_addressing);
+    TEST(parse_segment_override_memory);
     TEST(macro_definition);
     TEST(macro_expansion);
     TEST(macro_multiple_params);
     TEST(macro_dollar_syntax);
     TEST(macro_no_params);
     TEST(macro_multiple_invocations);
+    TEST(preprocessor_define_substitution);
+    TEST(preprocessor_if_else);
+    TEST(preprocessor_ifdef_ifndef);
+    TEST(preprocessor_warning_directive);
+    TEST(preprocessor_error_directive);
 
     /* New directive tests */
     TEST(parse_times_directive);
     TEST(parse_times_large_count);
     TEST(parse_equ_directive);
     TEST(parse_equ_hex);
+    TEST(parse_equ_label_subtraction);
     TEST(parse_resb);
     TEST(parse_resw);
     TEST(parse_resd);
+    TEST(parse_weak_hidden_directives);
     TEST(parse_resq);
     TEST(parse_db_string);
     TEST(parse_db_string_escapes);

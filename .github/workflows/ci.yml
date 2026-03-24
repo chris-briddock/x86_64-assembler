@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Install dependencies
       run: |
@@ -27,14 +27,14 @@ jobs:
     - name: Run integration tests
       run: make test-integration
 
-    - name: Test example programs
-      run: |
-        for f in examples/*.asm; do
-          echo "Testing $f..."
-          ./bin/x86_64-asm "$f" -o test_out
-          chmod +x test_out
-          ./test_out
-          echo "Exit code: $?"
-          echo
-        done
-      continue-on-error: true
+    - name: Generate coverage report
+      run: make coverage
+
+    - name: Upload coverage artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          coverage/gcov.txt
+          *.gcov
+        if-no-files-found: error

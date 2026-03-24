@@ -98,8 +98,15 @@ typedef enum {
     OPERAND_IMM,           /* Immediate: $42, $0x1234 */
     OPERAND_MEM,           /* Memory: [rax], [rbx+4] */
     OPERAND_LABEL,         /* Label reference */
+    OPERAND_LABEL_DIFF,    /* Label arithmetic: label1 - label2 */
     OPERAND_STRING         /* String literal */
 } operand_type_t;
+
+typedef enum {
+    MEM_SEG_DEFAULT = 0,
+    MEM_SEG_FS,
+    MEM_SEG_GS
+} mem_segment_t;
 
 /* Memory operand structure */
 typedef struct {
@@ -110,7 +117,9 @@ typedef struct {
     bool has_base;
     bool has_index;
     bool has_displacement;
+    bool is_absolute;      /* Absolute addressing, e.g. [abs 0x1234] */
     bool is_rip_relative;  /* RIP-relative addressing [label] or [rip + label] */
+    mem_segment_t segment_override;
     char label[MAX_LABEL_LENGTH];  /* Label for RIP-relative addressing */
 } mem_operand_t;
 
@@ -122,6 +131,7 @@ typedef struct {
     int64_t immediate;
     mem_operand_t mem;
     char label[MAX_LABEL_LENGTH];
+    char label_rhs[MAX_LABEL_LENGTH];
     char string[MAX_LINE_LENGTH];
 } operand_t;
 
@@ -242,7 +252,7 @@ typedef enum {
     INST_INCBIN,                                /* Include binary file */
     INST_COMM,                                  /* Common symbol declaration */
     INST_LCOMM,                                 /* Local common symbol declaration */
-    INST_GLOBAL, INST_EXTERN, INST_SECTION,
+    INST_GLOBAL, INST_EXTERN, INST_WEAK, INST_HIDDEN, INST_SECTION,
 
     INST_UNKNOWN = -1
 } instruction_type_t;
@@ -269,6 +279,8 @@ typedef struct {
     bool is_resolved;
     bool is_external;
     bool is_global;
+    bool is_weak;
+    bool is_hidden;
     bool is_function;
     int section;  /* 0 = text, 1 = data */
 } symbol_t;
