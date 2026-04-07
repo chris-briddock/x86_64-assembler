@@ -4,11 +4,12 @@
  */
 
 #include "test_framework.h"
-#include "../src/x86_64_asm.h"
+#include "x86_64_asm/x86_64_asm.h"
 #include <string.h>
 
 /* External encoder functions from x86_64_controlflow.c */
 extern int encode_jcc(assembler_context_t *ctx, const parsed_instruction_t *inst);
+extern int encode_jmp(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_cwd_cdq_cqo(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_cbw_cwde_cdqe(assembler_context_t *ctx, const parsed_instruction_t *inst);
 extern int encode_enter(assembler_context_t *ctx, const parsed_instruction_t *inst);
@@ -53,7 +54,7 @@ static operand_t make_imm_operand(int64_t value) {
 
 
 /* Test: MOV r64, imm64 encoding */
-int test_mov_r64_imm64(void) {
+static int test_mov_r64_imm64(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -86,7 +87,7 @@ int test_mov_r64_imm64(void) {
 }
 
 /* Test: MOV r32, imm32 encoding */
-int test_mov_r32_imm32(void) {
+static int test_mov_r32_imm32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -112,8 +113,63 @@ int test_mov_r32_imm32(void) {
     return 0;
 }
 
+/* Test: MOV r64, positive imm32 canonical form (B8+rd imm32 zero-extend) */
+static int test_mov_r64_imm32_canonical(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_MOV,
+        .operand_count = 2,
+        .operands = {
+            make_reg_operand(RAX, REG_SIZE_64),
+            make_imm_operand(0x12345678)
+        }
+    };
+
+    /* mov rax, 0x12345678 -> B8 78 56 34 12 */
+    ASSERT_EQ(0, encode_mov(&ctx, &inst));
+    ASSERT_EQ(5, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0xB8, ctx.output[0]);
+    ASSERT_EQ_HEX(0x78, ctx.output[1]);
+    ASSERT_EQ_HEX(0x56, ctx.output[2]);
+    ASSERT_EQ_HEX(0x34, ctx.output[3]);
+    ASSERT_EQ_HEX(0x12, ctx.output[4]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: MOV r8, positive imm32 canonical form (REX.B + B8+rd imm32) */
+static int test_mov_r64_rex_imm32_canonical(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = INST_MOV,
+        .operand_count = 2,
+        .operands = {
+            make_reg_operand(R8, REG_SIZE_64),
+            make_imm_operand(1)
+        }
+    };
+
+    /* mov r8, 1 -> 41 B8 01 00 00 00 */
+    ASSERT_EQ(0, encode_mov(&ctx, &inst));
+    ASSERT_EQ(6, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x41, ctx.output[0]);
+    ASSERT_EQ_HEX(0xB8, ctx.output[1]);
+    ASSERT_EQ_HEX(0x01, ctx.output[2]);
+    ASSERT_EQ_HEX(0x00, ctx.output[3]);
+    ASSERT_EQ_HEX(0x00, ctx.output[4]);
+    ASSERT_EQ_HEX(0x00, ctx.output[5]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
 /* Test: MOV r8, imm8 encoding (AH) */
-int test_mov_r8h_imm8(void) {
+static int test_mov_r8h_imm8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -137,7 +193,7 @@ int test_mov_r8h_imm8(void) {
 }
 
 /* Test: MOV r8, imm8 encoding (AL) */
-int test_mov_r8l_imm8(void) {
+static int test_mov_r8l_imm8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -161,7 +217,7 @@ int test_mov_r8l_imm8(void) {
 }
 
 /* Test: PUSH r64 encoding */
-int test_push_r64(void) {
+static int test_push_r64(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -182,7 +238,7 @@ int test_push_r64(void) {
 }
 
 /* Test: PUSH r64 with REX prefix (R8-R15) */
-int test_push_r64_rex(void) {
+static int test_push_r64_rex(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -204,10 +260,10 @@ int test_push_r64_rex(void) {
 }
 
 /* Test: RET encoding */
-int test_ret(void) {
+static int test_ret(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
-    
+
     parsed_instruction_t inst = {
         .type = INST_RET,
         .operand_count = 0
@@ -222,7 +278,7 @@ int test_ret(void) {
 }
 
 /* Test: NOP encoding */
-int test_nop(void) {
+static int test_nop(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -240,7 +296,7 @@ int test_nop(void) {
 }
 
 /* Test: MOV r64, r64 encoding */
-int test_mov_r64_r64(void) {
+static int test_mov_r64_r64(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -264,8 +320,155 @@ int test_mov_r64_r64(void) {
     return 0;
 }
 
+/* Test: MOV r64, [base+disp32_max] should encode 32-bit positive displacement */
+static int test_mov_r64_mem_disp32_max(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    operand_t mem_op = {0};
+    mem_op.type = OPERAND_MEM;
+    mem_op.mem.base = RBX;
+    mem_op.mem.has_base = true;
+    mem_op.mem.has_displacement = true;
+    mem_op.mem.displacement = 2147483647;
+
+    parsed_instruction_t inst = {
+        .type = INST_MOV,
+        .operand_count = 2,
+        .operands = {
+            make_reg_operand(RAX, REG_SIZE_64),
+            mem_op
+        }
+    };
+
+    /* mov rax, [rbx+0x7fffffff] = 48 8B 83 FF FF FF 7F */
+    ASSERT_EQ(0, encode_mov(&ctx, &inst));
+    ASSERT_EQ(7, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x48, ctx.output[0]);
+    ASSERT_EQ_HEX(0x8B, ctx.output[1]);
+    ASSERT_EQ_HEX(0x83, ctx.output[2]);
+    ASSERT_EQ_HEX(0xFF, ctx.output[3]);
+    ASSERT_EQ_HEX(0xFF, ctx.output[4]);
+    ASSERT_EQ_HEX(0xFF, ctx.output[5]);
+    ASSERT_EQ_HEX(0x7F, ctx.output[6]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: MOV r64, [base+disp32_min] should encode 32-bit negative displacement */
+static int test_mov_r64_mem_disp32_min(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    operand_t mem_op = {0};
+    mem_op.type = OPERAND_MEM;
+    mem_op.mem.base = RBX;
+    mem_op.mem.has_base = true;
+    mem_op.mem.has_displacement = true;
+    mem_op.mem.displacement = -2147483648LL;
+
+    parsed_instruction_t inst = {
+        .type = INST_MOV,
+        .operand_count = 2,
+        .operands = {
+            make_reg_operand(RAX, REG_SIZE_64),
+            mem_op
+        }
+    };
+
+    /* mov rax, [rbx-0x80000000] = 48 8B 83 00 00 00 80 */
+    ASSERT_EQ(0, encode_mov(&ctx, &inst));
+    ASSERT_EQ(7, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x48, ctx.output[0]);
+    ASSERT_EQ_HEX(0x8B, ctx.output[1]);
+    ASSERT_EQ_HEX(0x83, ctx.output[2]);
+    ASSERT_EQ_HEX(0x00, ctx.output[3]);
+    ASSERT_EQ_HEX(0x00, ctx.output[4]);
+    ASSERT_EQ_HEX(0x00, ctx.output[5]);
+    ASSERT_EQ_HEX(0x80, ctx.output[6]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: MOV r64, [label] uses absolute disp32 (ModRM+SIB) to match NASM defaults */
+static int test_mov_r64_mem_label_absolute(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+    ctx.base_address = 0x1000;
+
+    operand_t mem_op = {0};
+    mem_op.type = OPERAND_MEM;
+    strncpy(mem_op.mem.label, "arr", sizeof(mem_op.mem.label) - 1);
+    mem_op.mem.label[sizeof(mem_op.mem.label) - 1] = '\0';
+
+    parsed_instruction_t inst = {
+        .type = INST_MOV,
+        .operand_count = 2,
+        .operands = {
+            make_reg_operand(RAX, REG_SIZE_64),
+            mem_op
+        }
+    };
+
+    ASSERT_EQ(0, symbol_hash_insert(&ctx, "arr", 0x2000, false, false, 0));
+    ASSERT_EQ(0, encode_mov(&ctx, &inst));
+    ASSERT_EQ(0, resolve_fixups(&ctx));
+
+    /* mov rax, [disp32] => 48 8B 04 25 00 20 00 00 */
+    ASSERT_EQ(8, ctx.current_address - 0x1000);
+    ASSERT_EQ_HEX(0x48, ctx.output[0]);
+    ASSERT_EQ_HEX(0x8B, ctx.output[1]);
+    ASSERT_EQ_HEX(0x04, ctx.output[2]);
+    ASSERT_EQ_HEX(0x25, ctx.output[3]);
+    ASSERT_EQ_HEX(0x00, ctx.output[4]);
+    ASSERT_EQ_HEX(0x20, ctx.output[5]);
+    ASSERT_EQ_HEX(0x00, ctx.output[6]);
+    ASSERT_EQ_HEX(0x00, ctx.output[7]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: MOV r64, [label+disp] preserves addend during fixup resolution */
+static int test_mov_r64_mem_label_disp_addend(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+    ctx.base_address = 0x1000;
+
+    operand_t mem_op = {0};
+    mem_op.type = OPERAND_MEM;
+    strncpy(mem_op.mem.label, "arr", sizeof(mem_op.mem.label) - 1);
+    mem_op.mem.label[sizeof(mem_op.mem.label) - 1] = '\0';
+    mem_op.mem.has_displacement = true;
+    mem_op.mem.displacement = 8;
+
+    parsed_instruction_t inst = {
+        .type = INST_MOV,
+        .operand_count = 2,
+        .operands = {
+            make_reg_operand(RAX, REG_SIZE_64),
+            mem_op
+        }
+    };
+
+    ASSERT_EQ(0, symbol_hash_insert(&ctx, "arr", 0x2000, false, false, 0));
+    ASSERT_EQ(0, encode_mov(&ctx, &inst));
+    ASSERT_EQ(0, resolve_fixups(&ctx));
+
+    /* mov rax, [arr+8] => 48 8B 04 25 08 20 00 00 */
+    ASSERT_EQ_HEX(0x08, ctx.output[4]);
+    ASSERT_EQ_HEX(0x20, ctx.output[5]);
+    ASSERT_EQ_HEX(0x00, ctx.output[6]);
+    ASSERT_EQ_HEX(0x00, ctx.output[7]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
 /* Test: JNZ encoding (should be same as JNE) */
-int test_jnz_encoding(void) {
+static int test_jnz_encoding(void) {
     assembler_context_t ctx_jne, ctx_jnz;
     setup_test_context(&ctx_jne);
     setup_test_context(&ctx_jnz);
@@ -311,8 +514,59 @@ int test_jnz_encoding(void) {
     return 0;
 }
 
+/* Test: JNZ uses short encoding when target is resolved and within rel8 range */
+static int test_jnz_short_encoding(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    ctx.current_address = 0x1010;
+    ASSERT_EQ(0, symbol_hash_insert(&ctx, "near", 0x100A, false, false, 0));
+
+    parsed_instruction_t inst = {
+        .type = INST_JNZ,
+        .operand_count = 1,
+        .operands = {
+            {.type = OPERAND_LABEL, .label = "near"}
+        }
+    };
+
+    ASSERT_EQ(0, encode_jcc(&ctx, &inst));
+    ASSERT_EQ(2, ctx.current_address - 0x1010);
+    ASSERT_EQ_HEX(0x75, ctx.output[0]);
+    ASSERT_EQ_HEX(0xF8, ctx.output[1]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: JMP uses short encoding when target is resolved and within rel8 range */
+static int test_jmp_short_encoding(void) {
+    assembler_context_t ctx;
+    setup_test_context(&ctx);
+
+    ctx.current_address = 0x1010;
+    ASSERT_EQ(0, symbol_hash_insert(&ctx, "near", 0x100A, false, false, 0));
+
+    parsed_instruction_t inst = {
+        .type = INST_JMP,
+        .operand_count = 1,
+        .operands = {
+            {.type = OPERAND_LABEL, .label = "near"}
+        }
+    };
+
+    ASSERT_EQ(0, encode_jmp(&ctx, &inst));
+    ASSERT_EQ(2, ctx.current_address - 0x1010);
+    ASSERT_EQ_HEX(0xEB, ctx.output[0]);
+    ASSERT_EQ_HEX(0xF8, ctx.output[1]);
+
+    free(ctx.text_section);
+    return 0;
+}
+
+
 /* Test: CMOVNE rbx, rax encoding */
-int test_cmovne_rbx_rax(void) {
+static int test_cmovne_rbx_rax(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -338,7 +592,7 @@ int test_cmovne_rbx_rax(void) {
 }
 
 /* Test: CMOVG r8, r9 encoding with extended registers */
-int test_cmovg_r8_r9(void) {
+static int test_cmovg_r8_r9(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -364,7 +618,7 @@ int test_cmovg_r8_r9(void) {
 }
 
 /* Test: CDQ encoding through instruction dispatcher */
-int test_encode_instruction_cdq(void) {
+static int test_encode_instruction_cdq(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -383,7 +637,7 @@ int test_encode_instruction_cdq(void) {
 }
 
 /* Test: CQO keeps 64-bit form (REX.W + 99) */
-int test_encode_cqo_bytes(void) {
+static int test_encode_cqo_bytes(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -403,7 +657,7 @@ int test_encode_cqo_bytes(void) {
 }
 
 /* Test: BSWAP eax encoding */
-int test_bswap_eax(void) {
+static int test_bswap_eax(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -426,7 +680,7 @@ int test_bswap_eax(void) {
 }
 
 /* Test: BSWAP r8 encoding via central dispatcher */
-int test_encode_instruction_bswap_r8(void) {
+static int test_encode_instruction_bswap_r8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -451,7 +705,7 @@ int test_encode_instruction_bswap_r8(void) {
 }
 
 /* Test: ENTER encoding through dedicated encoder */
-int test_encode_enter_bytes(void) {
+static int test_encode_enter_bytes(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -478,7 +732,7 @@ int test_encode_enter_bytes(void) {
 }
 
 /* Test: ENTER out-of-range frame-size emits standardized constraint diagnostic */
-int test_encode_enter_invalid_size_diagnostic(void) {
+static int test_encode_enter_invalid_size_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -507,7 +761,7 @@ int test_encode_enter_invalid_size_diagnostic(void) {
 }
 
 /* Test: CBW/CWDE/CWD encodings through instruction dispatcher */
-int test_encode_instruction_signext_legacy(void) {
+static int test_encode_instruction_signext_legacy(void) {
     assembler_context_t ctx;
 
     setup_test_context(&ctx);
@@ -537,7 +791,7 @@ int test_encode_instruction_signext_legacy(void) {
 }
 
 /* Test: INT imm8 encoding through instruction dispatcher */
-int test_encode_instruction_int_imm8(void) {
+static int test_encode_instruction_int_imm8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -560,7 +814,7 @@ int test_encode_instruction_int_imm8(void) {
 }
 
 /* Test: INT with non-immediate operand emits standardized diagnostic */
-int test_encode_instruction_int_non_immediate_diagnostic(void) {
+static int test_encode_instruction_int_non_immediate_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -588,7 +842,7 @@ int test_encode_instruction_int_non_immediate_diagnostic(void) {
 }
 
 /* Test: SETE with non-8-bit register emits standardized diagnostic */
-int test_encode_instruction_sete_non8bit_diagnostic(void) {
+static int test_encode_instruction_sete_non8bit_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -616,7 +870,7 @@ int test_encode_instruction_sete_non8bit_diagnostic(void) {
 }
 
 /* Test: CMOV destination must be a register diagnostic */
-int test_encode_instruction_cmov_dst_not_register_diagnostic(void) {
+static int test_encode_instruction_cmov_dst_not_register_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -650,7 +904,7 @@ int test_encode_instruction_cmov_dst_not_register_diagnostic(void) {
 }
 
 /* Test: BSWAP with 8-bit register emits standardized diagnostic */
-int test_encode_instruction_bswap_invalid_size_diagnostic(void) {
+static int test_encode_instruction_bswap_invalid_size_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -678,7 +932,7 @@ int test_encode_instruction_bswap_invalid_size_diagnostic(void) {
 }
 
 /* Test: XCHG with wrong operand count emits standardized diagnostic */
-int test_encode_instruction_xchg_operand_count_diagnostic(void) {
+static int test_encode_instruction_xchg_operand_count_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -706,7 +960,7 @@ int test_encode_instruction_xchg_operand_count_diagnostic(void) {
 }
 
 /* Test: IMUL destination must be register diagnostic */
-int test_encode_instruction_imul_dst_not_register_diagnostic(void) {
+static int test_encode_instruction_imul_dst_not_register_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     operand_t mem_dst = {0};
@@ -740,7 +994,7 @@ int test_encode_instruction_imul_dst_not_register_diagnostic(void) {
 }
 
 /* Test: DIV with wrong operand count emits standardized diagnostic */
-int test_encode_instruction_div_operand_count_diagnostic(void) {
+static int test_encode_instruction_div_operand_count_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -769,7 +1023,7 @@ int test_encode_instruction_div_operand_count_diagnostic(void) {
 }
 
 /* Test: SHL with invalid count operand emits standardized diagnostic */
-int test_encode_instruction_shift_invalid_count_diagnostic(void) {
+static int test_encode_instruction_shift_invalid_count_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -798,7 +1052,7 @@ int test_encode_instruction_shift_invalid_count_diagnostic(void) {
 }
 
 /* Test: BT with wrong operand count emits standardized diagnostic */
-int test_encode_instruction_bt_operand_count_diagnostic(void) {
+static int test_encode_instruction_bt_operand_count_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -826,7 +1080,7 @@ int test_encode_instruction_bt_operand_count_diagnostic(void) {
 }
 
 /* Test: BTS with invalid bit index source emits standardized diagnostic */
-int test_encode_instruction_bts_invalid_bit_index_diagnostic(void) {
+static int test_encode_instruction_bts_invalid_bit_index_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -855,7 +1109,7 @@ int test_encode_instruction_bts_invalid_bit_index_diagnostic(void) {
 }
 
 /* Test: SHLD with non-register source emits standardized diagnostic */
-int test_encode_instruction_shld_src_not_register_diagnostic(void) {
+static int test_encode_instruction_shld_src_not_register_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -885,7 +1139,7 @@ int test_encode_instruction_shld_src_not_register_diagnostic(void) {
 }
 
 /* Test: BSF destination must be register diagnostic */
-int test_encode_instruction_bsf_dst_not_register_diagnostic(void) {
+static int test_encode_instruction_bsf_dst_not_register_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     operand_t mem_dst = {0};
@@ -919,7 +1173,7 @@ int test_encode_instruction_bsf_dst_not_register_diagnostic(void) {
 }
 
 /* Test: jump fixup saturation emits standardized diagnostic */
-int test_encode_instruction_jmp_fixup_capacity_diagnostic(void) {
+static int test_encode_instruction_jmp_fixup_capacity_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -949,7 +1203,7 @@ int test_encode_instruction_jmp_fixup_capacity_diagnostic(void) {
 }
 
 /* Test: NOT wrong operand count emits standardized diagnostic */
-int test_encode_not_operand_count_diagnostic(void) {
+static int test_encode_not_operand_count_diagnostic(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -987,7 +1241,7 @@ static operand_t make_xmm_operand(reg_t xmm_reg) {
 }
 
 /* Test: MOVAPS xmm0, xmm1 (register to register) */
-int test_movaps_xmm0_xmm1(void) {
+static int test_movaps_xmm0_xmm1(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1012,7 +1266,7 @@ int test_movaps_xmm0_xmm1(void) {
 }
 
 /* Test: MOVAPS xmm8, xmm9 (requires REX prefix) */
-int test_movaps_xmm8_xmm9(void) {
+static int test_movaps_xmm8_xmm9(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1038,7 +1292,7 @@ int test_movaps_xmm8_xmm9(void) {
 }
 
 /* Test: MOVUPS xmm0, [rax] (load from memory) */
-int test_movups_xmm0_mem(void) {
+static int test_movups_xmm0_mem(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1068,7 +1322,7 @@ int test_movups_xmm0_mem(void) {
 }
 
 /* Test: MOVAPS [rbx], xmm15 (store to memory with REX) */
-int test_movaps_mem_xmm15(void) {
+static int test_movaps_mem_xmm15(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1099,7 +1353,7 @@ int test_movaps_mem_xmm15(void) {
 }
 
 /* Test: MOVSS xmm1, xmm2 (scalar single) */
-int test_movss_xmm1_xmm2(void) {
+static int test_movss_xmm1_xmm2(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1125,7 +1379,7 @@ int test_movss_xmm1_xmm2(void) {
 }
 
 /* Test: MOVAPD xmm8, [r9+rdx*4+0x20] (complex addressing with REX) */
-int test_movapd_xmm8_complex_addr(void) {
+static int test_movapd_xmm8_complex_addr(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1162,7 +1416,7 @@ int test_movapd_xmm8_complex_addr(void) {
 }
 
 /* Test: ADDSS xmm0, xmm1 */
-int test_addss_xmm0_xmm1(void) {
+static int test_addss_xmm0_xmm1(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1188,7 +1442,7 @@ int test_addss_xmm0_xmm1(void) {
 }
 
 /* Test: MULSD xmm8, xmm9 (with REX prefix) */
-int test_mulsd_xmm8_xmm9(void) {
+static int test_mulsd_xmm8_xmm9(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1215,7 +1469,7 @@ int test_mulsd_xmm8_xmm9(void) {
 }
 
 /* Test: DIVPS xmm4, [rsi] */
-int test_divps_xmm4_mem(void) {
+static int test_divps_xmm4_mem(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1245,7 +1499,7 @@ int test_divps_xmm4_mem(void) {
 }
 
 /* Test: MOVUPS xmm2, [rsp+16] should emit SIB form for RSP base */
-int test_movups_xmm2_rsp_disp8(void) {
+static int test_movups_xmm2_rsp_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1279,7 +1533,7 @@ int test_movups_xmm2_rsp_disp8(void) {
 }
 
 /* Test: MOVAPS xmm9, [r12+r13*8+0x40] should use REX.R/X/B + SIB + disp8 */
-int test_movaps_xmm9_r12_r13_scale8_disp32(void) {
+static int test_movaps_xmm9_r12_r13_scale8_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1318,7 +1572,7 @@ int test_movaps_xmm9_r12_r13_scale8_disp32(void) {
 }
 
 /* Test: MOVAPS xmm10, [r12+r13*2+0x20] should use scale=2 in SIB with REX.R/X/B */
-int test_movaps_xmm10_r12_r13_scale2_disp8(void) {
+static int test_movaps_xmm10_r12_r13_scale2_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1357,7 +1611,7 @@ int test_movaps_xmm10_r12_r13_scale2_disp8(void) {
 }
 
 /* Test: MOVUPS xmm3, [r8+r15*2] should use SIB without displacement */
-int test_movups_xmm3_r8_r15_scale2_no_disp(void) {
+static int test_movups_xmm3_r8_r15_scale2_no_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1393,7 +1647,7 @@ int test_movups_xmm3_r8_r15_scale2_no_disp(void) {
 }
 
 /* Test: MOVAPS xmm5, [rbx+rcx*4+0x10] should encode scale=4 SIB form */
-int test_movaps_xmm5_rbx_rcx_scale4_disp8(void) {
+static int test_movaps_xmm5_rbx_rcx_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1431,7 +1685,7 @@ int test_movaps_xmm5_rbx_rcx_scale4_disp8(void) {
 }
 
 /* Test: MOVUPS xmm6, [rbx+rcx*1+0x18] should encode explicit scale=1 SIB form */
-int test_movups_xmm6_rbx_rcx_scale1_disp8(void) {
+static int test_movups_xmm6_rbx_rcx_scale1_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1469,7 +1723,7 @@ int test_movups_xmm6_rbx_rcx_scale1_disp8(void) {
 }
 
 /* Test: ADDPS xmm11, [r10+r12*8+0x20] should encode scale=8 with REX.R/X/B */
-int test_addps_xmm11_r10_r12_scale8_disp8(void) {
+static int test_addps_xmm11_r10_r12_scale8_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1508,7 +1762,7 @@ int test_addps_xmm11_r10_r12_scale8_disp8(void) {
 }
 
 /* Test: MOVUPS xmm1, [rip+8] uses RIP-relative addressing form */
-int test_movups_xmm1_rip_disp32(void) {
+static int test_movups_xmm1_rip_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1539,7 +1793,7 @@ int test_movups_xmm1_rip_disp32(void) {
 }
 
 /* Test: MOVSD [rbp], xmm1 (scalar double store, [rbp] disp8=0 form) */
-int test_movsd_mem_xmm1_rbp(void) {
+static int test_movsd_mem_xmm1_rbp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -1572,7 +1826,7 @@ int test_movsd_mem_xmm1_rbp(void) {
 }
 
 /* Test: SSE move should reject memory-to-memory form */
-int test_sse_mov_mem_to_mem_without_xmm_rejected(void) {
+static int test_sse_mov_mem_to_mem_without_xmm_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1606,7 +1860,7 @@ int test_sse_mov_mem_to_mem_without_xmm_rejected(void) {
 }
 
 /* Test: SSE move should reject when no XMM operand is present */
-int test_sse_mov_without_xmm_rejected(void) {
+static int test_sse_mov_without_xmm_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1633,7 +1887,7 @@ int test_sse_mov_without_xmm_rejected(void) {
 }
 
 /* Test: SSE arithmetic should reject non-XMM destination */
-int test_sse_arith_dst_not_xmm_rejected(void) {
+static int test_sse_arith_dst_not_xmm_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1660,7 +1914,7 @@ int test_sse_arith_dst_not_xmm_rejected(void) {
 }
 
 /* Test: SSE arithmetic should reject immediate source */
-int test_sse_arith_imm_src_rejected(void) {
+static int test_sse_arith_imm_src_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1687,7 +1941,7 @@ int test_sse_arith_imm_src_rejected(void) {
 }
 
 /* Test: SSE move with memory destination rejects non-XMM source */
-int test_sse_mov_mem_dst_imm_src_rejected(void) {
+static int test_sse_mov_mem_dst_imm_src_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1721,7 +1975,7 @@ int test_sse_mov_mem_dst_imm_src_rejected(void) {
 }
 
 /* Test: SSE move with XMM destination rejects immediate source */
-int test_sse_mov_xmm_dst_imm_src_rejected(void) {
+static int test_sse_mov_xmm_dst_imm_src_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1748,7 +2002,7 @@ int test_sse_mov_xmm_dst_imm_src_rejected(void) {
 }
 
 /* Test: SSE move should reject XMM register with non-XMM size metadata */
-int test_sse_mov_xmm_size_mismatch_rejected(void) {
+static int test_sse_mov_xmm_size_mismatch_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1775,7 +2029,7 @@ int test_sse_mov_xmm_size_mismatch_rejected(void) {
 }
 
 /* Test: SSE arithmetic should reject XMM source with non-XMM size metadata */
-int test_sse_arith_xmm_src_size_mismatch_rejected(void) {
+static int test_sse_arith_xmm_src_size_mismatch_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1802,7 +2056,7 @@ int test_sse_arith_xmm_src_size_mismatch_rejected(void) {
 }
 
 /* Test: BT instruction with immediate bit index */
-int test_bt_rax_imm(void) {
+static int test_bt_rax_imm(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -1830,7 +2084,7 @@ int test_bt_rax_imm(void) {
 }
 
 /* Test: BTS instruction with CL register */
-int test_bts_rbx_cl(void) {
+static int test_bts_rbx_cl(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -1857,7 +2111,7 @@ int test_bts_rbx_cl(void) {
 }
 
 /* Test: BTR instruction with high register (R15) */
-int test_btr_r15_imm(void) {
+static int test_btr_r15_imm(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -1885,7 +2139,7 @@ int test_btr_r15_imm(void) {
 }
 
 /* Test: SHLD with immediate count */
-int test_shld_rax_rbx_imm(void) {
+static int test_shld_rax_rbx_imm(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -1914,7 +2168,7 @@ int test_shld_rax_rbx_imm(void) {
 }
 
 /* Test: BSF instruction */
-int test_bsf_rcx_rdx(void) {
+static int test_bsf_rcx_rdx(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
     
@@ -1941,7 +2195,7 @@ int test_bsf_rcx_rdx(void) {
 }
 
 /* Test: REX conflict with high 8-bit register should fail */
-int test_r8h_rex_conflict(void) {
+static int test_r8h_rex_conflict(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -1973,7 +2227,7 @@ int test_r8h_rex_conflict(void) {
 }
 
 /* Test: ADD with AH and R8B should fail due to high-8/REX conflict */
-int test_add_high8_rex_conflict(void) {
+static int test_add_high8_rex_conflict(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -2003,7 +2257,7 @@ int test_add_high8_rex_conflict(void) {
 }
 
 /* Test: SUB with AH and R8B should fail due to high-8/REX conflict */
-int test_sub_high8_rex_conflict(void) {
+static int test_sub_high8_rex_conflict(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -2033,7 +2287,7 @@ int test_sub_high8_rex_conflict(void) {
 }
 
 /* Test: CMP with AH and R8B should fail due to high-8/REX conflict */
-int test_cmp_high8_rex_conflict(void) {
+static int test_cmp_high8_rex_conflict(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -2062,10 +2316,95 @@ int test_cmp_high8_rex_conflict(void) {
     return 0;
 }
 
+static int assert_high8_rex_conflict_case(instruction_type_t type,
+                                          operand_t op1,
+                                          operand_t op2,
+                                          int line_number) {
+    assembler_context_t ctx;
+    char *captured_err;
+    setup_test_context(&ctx);
+
+    parsed_instruction_t inst = {
+        .type = type,
+        .operand_count = 2,
+        .operands = { op1, op2 },
+        .line_number = line_number
+    };
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    ASSERT_EQ(-1, encode_instruction(&ctx, &inst));
+    captured_err = test_capture_stderr_end();
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Error at line");
+    ASSERT_STR_CONTAINS(captured_err, "[Constraint]");
+    ASSERT_STR_CONTAINS(captured_err, "Cannot use AH/BH/CH/DH");
+    ASSERT_STR_CONTAINS(captured_err, "SPL/BPL/SIL/DIL");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+
+    free(captured_err);
+    free(ctx.text_section);
+    return 0;
+}
+
+/* Test: broad AH/BH/CH/DH + REX conflict matrix across 8-bit-capable families */
+static int test_high8_rex_conflict_matrix(void) {
+    operand_t mem_r8 = {0};
+    mem_r8.type = OPERAND_MEM;
+    mem_r8.mem.base = R8;
+    mem_r8.mem.has_base = true;
+    mem_r8.mem.scale = 1;
+
+    struct {
+        instruction_type_t type;
+        operand_t op1;
+        operand_t op2;
+        int line;
+    } cases[] = {
+        { INST_MOV, make_reg_operand(AH, REG_SIZE_8H), make_reg_operand(R8, REG_SIZE_8), 201 },
+        { INST_MOV, make_reg_operand(BH, REG_SIZE_8H), make_reg_operand(SPL, REG_SIZE_8), 202 },
+
+        { INST_ADD, make_reg_operand(AH, REG_SIZE_8H), make_reg_operand(R9, REG_SIZE_8), 203 },
+        { INST_SUB, make_reg_operand(BH, REG_SIZE_8H), make_reg_operand(SIL, REG_SIZE_8), 204 },
+        { INST_XOR, make_reg_operand(CH, REG_SIZE_8H), make_reg_operand(R10, REG_SIZE_8), 205 },
+        { INST_OR,  make_reg_operand(DH, REG_SIZE_8H), make_reg_operand(DIL, REG_SIZE_8), 206 },
+        { INST_AND, make_reg_operand(AH, REG_SIZE_8H), make_reg_operand(BPL, REG_SIZE_8), 207 },
+        { INST_CMP, make_reg_operand(BH, REG_SIZE_8H), make_reg_operand(R11, REG_SIZE_8), 208 },
+        { INST_ADC, make_reg_operand(CH, REG_SIZE_8H), make_reg_operand(R12, REG_SIZE_8), 209 },
+        { INST_SBB, make_reg_operand(DH, REG_SIZE_8H), make_reg_operand(R13, REG_SIZE_8), 210 },
+
+        { INST_ADD, make_reg_operand(R8, REG_SIZE_8), make_reg_operand(AH, REG_SIZE_8H), 211 },
+        { INST_XOR, make_reg_operand(SPL, REG_SIZE_8), make_reg_operand(BH, REG_SIZE_8H), 212 },
+        { INST_OR,  make_reg_operand(R14, REG_SIZE_8), make_reg_operand(CH, REG_SIZE_8H), 213 },
+        { INST_AND, make_reg_operand(DIL, REG_SIZE_8), make_reg_operand(DH, REG_SIZE_8H), 214 },
+
+        { INST_XCHG, make_reg_operand(AH, REG_SIZE_8H), make_reg_operand(R15, REG_SIZE_8), 215 },
+        { INST_XCHG, make_reg_operand(BH, REG_SIZE_8H), make_reg_operand(SPL, REG_SIZE_8), 216 },
+        { INST_XCHG, make_reg_operand(R8, REG_SIZE_8), make_reg_operand(CH, REG_SIZE_8H), 217 },
+        { INST_XCHG, make_reg_operand(DIL, REG_SIZE_8), make_reg_operand(DH, REG_SIZE_8H), 218 },
+
+        { INST_TEST, make_reg_operand(AH, REG_SIZE_8H), make_reg_operand(R8, REG_SIZE_8), 219 },
+        { INST_TEST, make_reg_operand(BH, REG_SIZE_8H), make_reg_operand(SIL, REG_SIZE_8), 220 },
+        { INST_TEST, make_reg_operand(CH, REG_SIZE_8H), mem_r8, 221 },
+        { INST_TEST, make_reg_operand(R9, REG_SIZE_8), make_reg_operand(DH, REG_SIZE_8H), 222 }
+    };
+
+    size_t case_count = sizeof(cases) / sizeof(cases[0]);
+    for (size_t i = 0; i < case_count; i++) {
+        ASSERT_EQ(0, assert_high8_rex_conflict_case(
+            cases[i].type,
+            cases[i].op1,
+            cases[i].op2,
+            cases[i].line
+        ));
+    }
+
+    return 0;
+}
+
 /* Packed Integer Instruction Tests */
 
 /* Test: MOVDQA xmm0, xmm1 - packed 128-bit aligned move */
-int test_movdqa_xmm0_xmm1(void) {
+static int test_movdqa_xmm0_xmm1(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2092,7 +2431,7 @@ int test_movdqa_xmm0_xmm1(void) {
 }
 
 /* Test: MOVDQU xmm8, [rbx] - packed 128-bit unaligned move with memory */
-int test_movdqu_xmm8_mem(void) {
+static int test_movdqu_xmm8_mem(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2125,7 +2464,7 @@ int test_movdqu_xmm8_mem(void) {
 }
 
 /* Test: PADDB xmm1, xmm2 - packed add bytes */
-int test_paddb_xmm1_xmm2(void) {
+static int test_paddb_xmm1_xmm2(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2152,7 +2491,7 @@ int test_paddb_xmm1_xmm2(void) {
 }
 
 /* Test: PADDW xmm0, [rax] - packed add words with memory */
-int test_paddw_xmm0_mem(void) {
+static int test_paddw_xmm0_mem(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2184,7 +2523,7 @@ int test_paddw_xmm0_mem(void) {
 }
 
 /* Test: PSUBQ xmm9, xmm10 - packed subtract qword with extended registers */
-int test_psubq_xmm9_xmm10(void) {
+static int test_psubq_xmm9_xmm10(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2212,7 +2551,7 @@ int test_psubq_xmm9_xmm10(void) {
 }
 
 /* Test: PSUBD xmm6, [rbp+16] - packed subtract dword with memory source */
-int test_psubd_xmm6_mem_disp(void) {
+static int test_psubd_xmm6_mem_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2247,7 +2586,7 @@ int test_psubd_xmm6_mem_disp(void) {
 }
 
 /* Test: PSUBD xmm2, [r9+r10*4+0x20] should encode packed SSE with scale=4 and REX.X/B */
-int test_psubd_xmm2_r9_r10_scale4_disp8(void) {
+static int test_psubd_xmm2_r9_r10_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2287,7 +2626,7 @@ int test_psubd_xmm2_r9_r10_scale4_disp8(void) {
 }
 
 /* Test: PADDQ xmm5, [r13+r14*2+0x10] should encode scale=2 with packed arithmetic */
-int test_paddq_xmm5_r13_r14_scale2_disp8(void) {
+static int test_paddq_xmm5_r13_r14_scale2_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2327,7 +2666,7 @@ int test_paddq_xmm5_r13_r14_scale2_disp8(void) {
 }
 
 /* Test: PADDD xmm1, [rbx+rcx*4+0x14] should encode packed arithmetic scale=4 */
-int test_paddd_xmm1_rbx_rcx_scale4_disp8(void) {
+static int test_paddd_xmm1_rbx_rcx_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2366,7 +2705,7 @@ int test_paddd_xmm1_rbx_rcx_scale4_disp8(void) {
 }
 
 /* Test: PSUBQ xmm3, [r8+r9*8+0x20] should encode packed arithmetic scale=8 */
-int test_psubq_xmm3_r8_r9_scale8_disp8(void) {
+static int test_psubq_xmm3_r8_r9_scale8_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2406,7 +2745,7 @@ int test_psubq_xmm3_r8_r9_scale8_disp8(void) {
 }
 
 /* Test: PSUBW xmm2, [r13+r14*2-0x20] should encode packed arithmetic with negative disp8 */
-int test_psubw_xmm2_r13_r14_scale2_neg_disp8(void) {
+static int test_psubw_xmm2_r13_r14_scale2_neg_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2446,7 +2785,7 @@ int test_psubw_xmm2_r13_r14_scale2_neg_disp8(void) {
 }
 
 /* Test: PADDB xmm14, [rbx+rsi*2] should encode packed arithmetic no-disp SIB form */
-int test_paddb_xmm14_rbx_rsi_scale2_no_disp(void) {
+static int test_paddb_xmm14_rbx_rsi_scale2_no_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2483,7 +2822,7 @@ int test_paddb_xmm14_rbx_rsi_scale2_no_disp(void) {
 }
 
 /* Test: PCMPEQD xmm7, xmm15 - packed compare equal dword with extended registers */
-int test_pcmpeqd_xmm7_xmm15(void) {
+static int test_pcmpeqd_xmm7_xmm15(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2510,7 +2849,7 @@ int test_pcmpeqd_xmm7_xmm15(void) {
 }
 
 /* Test: PCMPGTB xmm3, [rcx+8] - packed compare greater-than byte with displacement */
-int test_pcmpgtb_xmm3_mem_disp(void) {
+static int test_pcmpgtb_xmm3_mem_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2545,7 +2884,7 @@ int test_pcmpgtb_xmm3_mem_disp(void) {
 }
 
 /* Test: PCMPEQW xmm4, [r11+r12*4+0x20] should encode packed compare scale=4 with REX.X/B */
-int test_pcmpeqw_xmm4_r11_r12_scale4_disp8(void) {
+static int test_pcmpeqw_xmm4_r11_r12_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2585,7 +2924,7 @@ int test_pcmpeqw_xmm4_r11_r12_scale4_disp8(void) {
 }
 
 /* Test: PCMPGTD xmm9, [r12+r13*4+0x18] should encode packed compare scale=4 */
-int test_pcmpgtd_xmm9_r12_r13_scale4_disp8(void) {
+static int test_pcmpgtd_xmm9_r12_r13_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2625,7 +2964,7 @@ int test_pcmpgtd_xmm9_r12_r13_scale4_disp8(void) {
 }
 
 /* Test: PCMPEQB xmm11, [r8+r10*8+disp32] should encode packed compare with disp32 SIB */
-int test_pcmpeqb_xmm11_r8_r10_scale8_disp32(void) {
+static int test_pcmpeqb_xmm11_r8_r10_scale8_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2668,7 +3007,7 @@ int test_pcmpeqb_xmm11_r8_r10_scale8_disp32(void) {
 }
 
 /* Test: PCMPGTW xmm0, [rdi+rbp*4-8] should encode packed compare with negative disp8 SIB */
-int test_pcmpgtw_xmm0_rdi_rbp_scale4_neg_disp8(void) {
+static int test_pcmpgtw_xmm0_rdi_rbp_scale4_neg_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2707,7 +3046,7 @@ int test_pcmpgtw_xmm0_rdi_rbp_scale4_neg_disp8(void) {
 }
 
 /* Test: PCMPEQQ xmm1, xmm2 - packed compare equal qword (0F 38 opcode map) */
-int test_pcmpeqq_xmm1_xmm2(void) {
+static int test_pcmpeqq_xmm1_xmm2(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2735,7 +3074,7 @@ int test_pcmpeqq_xmm1_xmm2(void) {
 }
 
 /* Test: PCMPGTQ xmm8, [r9+0x10] - packed compare greater-than qword (0F 38 opcode map + REX) */
-int test_pcmpgtq_xmm8_mem_disp(void) {
+static int test_pcmpgtq_xmm8_mem_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2772,7 +3111,7 @@ int test_pcmpgtq_xmm8_mem_disp(void) {
 }
 
 /* Test: PCMPEQQ xmm14, [r10+r11*2-0x40] should encode 0F 38 compare with negative disp8 SIB */
-int test_pcmpeqq_xmm14_r10_r11_scale2_neg_disp8(void) {
+static int test_pcmpeqq_xmm14_r10_r11_scale2_neg_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2813,7 +3152,7 @@ int test_pcmpeqq_xmm14_r10_r11_scale2_neg_disp8(void) {
 }
 
 /* Test: PCMPGTQ xmm6, [rbx+r12*8+disp32] should encode 0F 38 compare disp32 SIB */
-int test_pcmpgtq_xmm6_rbx_r12_scale8_disp32(void) {
+static int test_pcmpgtq_xmm6_rbx_r12_scale8_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2857,7 +3196,7 @@ int test_pcmpgtq_xmm6_rbx_r12_scale8_disp32(void) {
 }
 
 /* Test: PCMPGTQ xmm10, [rip+0x40] should encode 0F 38 compare RIP-relative form */
-int test_pcmpgtq_xmm10_rip_disp32(void) {
+static int test_pcmpgtq_xmm10_rip_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2890,7 +3229,7 @@ int test_pcmpgtq_xmm10_rip_disp32(void) {
 }
 
 /* Test: PCMPGTD xmm9, [rip+0x24] should encode packed compare RIP-relative form */
-int test_pcmpgtd_xmm9_rip_disp32(void) {
+static int test_pcmpgtd_xmm9_rip_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2927,7 +3266,7 @@ int test_pcmpgtd_xmm9_rip_disp32(void) {
 }
 
 /* Test: PAND xmm4, xmm5 - packed logical AND */
-int test_pand_xmm4_xmm5(void) {
+static int test_pand_xmm4_xmm5(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2954,7 +3293,7 @@ int test_pand_xmm4_xmm5(void) {
 }
 
 /* Test: POR xmm2, [rdx] - packed logical OR with memory */
-int test_por_xmm2_mem(void) {
+static int test_por_xmm2_mem(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -2986,7 +3325,7 @@ int test_por_xmm2_mem(void) {
 }
 
 /* Test: PANDN xmm3, xmm4 - packed logical AND NOT */
-int test_pandn_xmm3_xmm4(void) {
+static int test_pandn_xmm3_xmm4(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3013,7 +3352,7 @@ int test_pandn_xmm3_xmm4(void) {
 }
 
 /* Test: PXOR xmm12, [r9+8] - packed xor with memory source and REX */
-int test_pxor_xmm12_mem_disp(void) {
+static int test_pxor_xmm12_mem_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3049,7 +3388,7 @@ int test_pxor_xmm12_mem_disp(void) {
 }
 
 /* Test: PAND xmm10, [r8+r9*4+0x10] should encode packed logic scale=4 with REX.R/X/B */
-int test_pand_xmm10_r8_r9_scale4_disp8(void) {
+static int test_pand_xmm10_r8_r9_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3089,7 +3428,7 @@ int test_pand_xmm10_r8_r9_scale4_disp8(void) {
 }
 
 /* Test: PXOR xmm7, [rbx+rdx*1+8] should encode explicit scale=1 packed logic form */
-int test_pxor_xmm7_rbx_rdx_scale1_disp8(void) {
+static int test_pxor_xmm7_rbx_rdx_scale1_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3128,7 +3467,7 @@ int test_pxor_xmm7_rbx_rdx_scale1_disp8(void) {
 }
 
 /* Test: PANDN xmm6, [r10+r11*4+0x28] should encode packed logic scale=4 */
-int test_pandn_xmm6_r10_r11_scale4_disp8(void) {
+static int test_pandn_xmm6_r10_r11_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3168,7 +3507,7 @@ int test_pandn_xmm6_r10_r11_scale4_disp8(void) {
 }
 
 /* Test: PXOR xmm1, [r12+r15*4] should encode packed logic SIB with no displacement */
-int test_pxor_xmm1_r12_r15_scale4_no_disp(void) {
+static int test_pxor_xmm1_r12_r15_scale4_no_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3205,7 +3544,7 @@ int test_pxor_xmm1_r12_r15_scale4_no_disp(void) {
 }
 
 /* Test: POR xmm13, [rbp+rsi*2] should force disp8=0 packed logic SIB form */
-int test_por_xmm13_rbp_rsi_scale2_implicit_zero_disp8(void) {
+static int test_por_xmm13_rbp_rsi_scale2_implicit_zero_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3248,7 +3587,7 @@ int test_por_xmm13_rbp_rsi_scale2_implicit_zero_disp8(void) {
 }
 
 /* Test: PAND xmm15, [r9+r12*8+disp32] should encode packed logic high-register disp32 SIB */
-int test_pand_xmm15_r9_r12_scale8_disp32(void) {
+static int test_pand_xmm15_r9_r12_scale8_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3291,7 +3630,7 @@ int test_pand_xmm15_r9_r12_scale8_disp32(void) {
 }
 
 /* Test: POR xmm10, [rip+0x30] should encode packed logical RIP-relative form */
-int test_por_xmm10_rip_disp32(void) {
+static int test_por_xmm10_rip_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3328,7 +3667,7 @@ int test_por_xmm10_rip_disp32(void) {
 }
 
 /* Test: PADDB with XMM size mismatch rejected */
-int test_paddb_xmm_size_mismatch_rejected(void) {
+static int test_paddb_xmm_size_mismatch_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -3355,7 +3694,7 @@ int test_paddb_xmm_size_mismatch_rejected(void) {
 }
 
 /* Test: PAND with non-XMM destination rejected */
-int test_pand_non_xmm_rejected(void) {
+static int test_pand_non_xmm_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -3382,7 +3721,7 @@ int test_pand_non_xmm_rejected(void) {
 }
 
 /* Test: PCMPEQD with immediate source rejected */
-int test_pcmpeqd_imm_src_rejected(void) {
+static int test_pcmpeqd_imm_src_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -3409,7 +3748,7 @@ int test_pcmpeqd_imm_src_rejected(void) {
 }
 
 /* Test: PSUBD with immediate source rejected (packed arithmetic family) */
-int test_psubd_imm_src_rejected(void) {
+static int test_psubd_imm_src_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -3436,7 +3775,7 @@ int test_psubd_imm_src_rejected(void) {
 }
 
 /* Test: PXOR with XMM source using wrong size metadata rejected (packed logic family) */
-int test_pxor_xmm_src_size_mismatch_rejected(void) {
+static int test_pxor_xmm_src_size_mismatch_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -3463,7 +3802,7 @@ int test_pxor_xmm_src_size_mismatch_rejected(void) {
 }
 
 /* Test: PCMPGTQ with non-XMM destination rejected (packed compare family) */
-int test_pcmpgtq_non_xmm_dst_rejected(void) {
+static int test_pcmpgtq_non_xmm_dst_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -3490,7 +3829,7 @@ int test_pcmpgtq_non_xmm_dst_rejected(void) {
 }
 
 /* Test: MOV rax, [rbx+rcx*1+0x10] should encode explicit scale=1 SIB form */
-int test_mov_rax_rbx_rcx_scale1_disp8(void) {
+static int test_mov_rax_rbx_rcx_scale1_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3528,7 +3867,7 @@ int test_mov_rax_rbx_rcx_scale1_disp8(void) {
 }
 
 /* Test: MOV [r10+r11*2-0x20], r12 should encode scale=2 SIB with negative disp8 */
-int test_mov_mem_r12_r10_r11_scale2_neg_disp8(void) {
+static int test_mov_mem_r12_r10_r11_scale2_neg_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3566,7 +3905,7 @@ int test_mov_mem_r12_r10_r11_scale2_neg_disp8(void) {
 }
 
 /* Test: ADD [r8+r9*4+disp32], imm8 should encode scale=4 SIB with disp32 */
-int test_add_mem_r8_r9_scale4_disp32_imm8(void) {
+static int test_add_mem_r8_r9_scale4_disp32_imm8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3608,7 +3947,7 @@ int test_add_mem_r8_r9_scale4_disp32_imm8(void) {
 }
 
 /* Test: SUB [rbx+rsi*8-8], imm8 should encode scale=8 SIB with negative disp8 */
-int test_sub_mem_rbx_rsi_scale8_neg_disp8_imm8(void) {
+static int test_sub_mem_rbx_rsi_scale8_neg_disp8_imm8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3647,7 +3986,7 @@ int test_sub_mem_rbx_rsi_scale8_neg_disp8_imm8(void) {
 }
 
 /* Test: LEA r15, [r12+r13*8+0x40] should encode scale=8 with high-register SIB */
-int test_lea_r15_r12_r13_scale8_disp8(void) {
+static int test_lea_r15_r12_r13_scale8_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3685,7 +4024,7 @@ int test_lea_r15_r12_r13_scale8_disp8(void) {
 }
 
 /* Test: LEA rcx, [rax+rdx*2] should encode scale=2 no-displacement SIB */
-int test_lea_rcx_rax_rdx_scale2_no_disp(void) {
+static int test_lea_rcx_rax_rdx_scale2_no_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3720,7 +4059,7 @@ int test_lea_rcx_rax_rdx_scale2_no_disp(void) {
 }
 
 /* Test: MOVDQA xmm0, [rbx+rcx*1-0x10] should encode packed move scale=1 with negative disp8 */
-int test_movdqa_xmm0_rbx_rcx_scale1_neg_disp8(void) {
+static int test_movdqa_xmm0_rbx_rcx_scale1_neg_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3759,7 +4098,7 @@ int test_movdqa_xmm0_rbx_rcx_scale1_neg_disp8(void) {
 }
 
 /* Test: MOVDQA xmm12, [r9+r10*4+0x20] should encode packed move scale=4 with high registers */
-int test_movdqa_xmm12_r9_r10_scale4_disp8(void) {
+static int test_movdqa_xmm12_r9_r10_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3799,7 +4138,7 @@ int test_movdqa_xmm12_r9_r10_scale4_disp8(void) {
 }
 
 /* Test: MOV rdx, [r8+r9*8] should encode scale=8 SIB no-displacement form */
-int test_mov_rdx_r8_r9_scale8_no_disp(void) {
+static int test_mov_rdx_r8_r9_scale8_no_disp(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3834,7 +4173,7 @@ int test_mov_rdx_r8_r9_scale8_no_disp(void) {
 }
 
 /* Test: MOV [rbp+rsi*4+0], rax should encode scale=4 with explicit disp32 zero */
-int test_mov_mem_rax_rbp_rsi_scale4_zero_disp32(void) {
+static int test_mov_mem_rax_rbp_rsi_scale4_zero_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3875,7 +4214,7 @@ int test_mov_mem_rax_rbp_rsi_scale4_zero_disp32(void) {
 }
 
 /* Test: ADD [rbx+rcx*1], imm8 should encode scale=1 no-displacement SIB form */
-int test_add_mem_rbx_rcx_scale1_no_disp_imm8(void) {
+static int test_add_mem_rbx_rcx_scale1_no_disp_imm8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3911,7 +4250,7 @@ int test_add_mem_rbx_rcx_scale1_no_disp_imm8(void) {
 }
 
 /* Test: SUB [r12+r13*2+disp32], imm8 should encode scale=2 high-register disp32 form */
-int test_sub_mem_r12_r13_scale2_disp32_imm8(void) {
+static int test_sub_mem_r12_r13_scale2_disp32_imm8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3953,7 +4292,7 @@ int test_sub_mem_r12_r13_scale2_disp32_imm8(void) {
 }
 
 /* Test: LEA rbx, [rdi+rsi*1-0x10] should encode scale=1 with negative disp8 */
-int test_lea_rbx_rdi_rsi_scale1_neg_disp8(void) {
+static int test_lea_rbx_rdi_rsi_scale1_neg_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -3991,7 +4330,7 @@ int test_lea_rbx_rdi_rsi_scale1_neg_disp8(void) {
 }
 
 /* Test: LEA r10, [r8+r11*4+0x20] should encode scale=4 high-register SIB form */
-int test_lea_r10_r8_r11_scale4_disp8(void) {
+static int test_lea_r10_r8_r11_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -4029,7 +4368,7 @@ int test_lea_r10_r8_r11_scale4_disp8(void) {
 }
 
 /* Test: MOVDQA xmm3, [r13+r14*2+0x10] should encode scale=2 packed move form */
-int test_movdqa_xmm3_r13_r14_scale2_disp8(void) {
+static int test_movdqa_xmm3_r13_r14_scale2_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -4069,7 +4408,7 @@ int test_movdqa_xmm3_r13_r14_scale2_disp8(void) {
 }
 
 /* Test: MOVDQA xmm9, [rbx+r12*8+disp32] should encode scale=8 packed move with disp32 */
-int test_movdqa_xmm9_rbx_r12_scale8_disp32(void) {
+static int test_movdqa_xmm9_rbx_r12_scale8_disp32(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -4112,7 +4451,7 @@ int test_movdqa_xmm9_rbx_r12_scale8_disp32(void) {
 }
 
 /* Test: Memory operand with invalid positive scale should be rejected by encoder */
-int test_invalid_scale_factor_rejected(void) {
+static int test_invalid_scale_factor_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -4147,7 +4486,7 @@ int test_invalid_scale_factor_rejected(void) {
 }
 
 /* Test: Memory operand with negative scale should be rejected by encoder */
-int test_negative_scale_factor_rejected(void) {
+static int test_negative_scale_factor_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -4182,7 +4521,7 @@ int test_negative_scale_factor_rejected(void) {
 }
 
 /* Test: Memory operand with invalid scale 5 should be rejected by encoder */
-int test_invalid_scale_factor5_rejected(void) {
+static int test_invalid_scale_factor5_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -4217,7 +4556,7 @@ int test_invalid_scale_factor5_rejected(void) {
 }
 
 /* Test: Memory operand with invalid scale 6 should be rejected by encoder */
-int test_invalid_scale_factor6_rejected(void) {
+static int test_invalid_scale_factor6_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -4252,7 +4591,7 @@ int test_invalid_scale_factor6_rejected(void) {
 }
 
 /* Test: Memory operand with invalid scale 7 should be rejected by encoder */
-int test_invalid_scale_factor7_rejected(void) {
+static int test_invalid_scale_factor7_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -4287,7 +4626,7 @@ int test_invalid_scale_factor7_rejected(void) {
 }
 
 /* Test: RIP-relative memory must reject additional base/index registers */
-int test_rip_relative_with_index_rejected(void) {
+static int test_rip_relative_with_index_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -4324,7 +4663,7 @@ int test_rip_relative_with_index_rejected(void) {
 }
 
 /* Test: FS segment override prefix should precede encoded memory instruction */
-int test_encode_instruction_fs_segment_prefix(void) {
+static int test_encode_instruction_fs_segment_prefix(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -4345,7 +4684,7 @@ int test_encode_instruction_fs_segment_prefix(void) {
 }
 
 /* Test: GS segment override prefix should precede encoded memory instruction */
-int test_encode_instruction_gs_segment_prefix(void) {
+static int test_encode_instruction_gs_segment_prefix(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -4366,7 +4705,7 @@ int test_encode_instruction_gs_segment_prefix(void) {
 }
 
 /* Test: LEA with 16-bit destination should emit operand-size prefix */
-int test_lea_ax_rbx_rcx_scale2_disp8(void) {
+static int test_lea_ax_rbx_rcx_scale2_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -4404,7 +4743,7 @@ int test_lea_ax_rbx_rcx_scale2_disp8(void) {
 }
 
 /* Test: LEA with 32-bit destination should encode without REX.W */
-int test_lea_ecx_r8_r9_scale4_disp8(void) {
+static int test_lea_ecx_r8_r9_scale4_disp8(void) {
     assembler_context_t ctx;
     setup_test_context(&ctx);
 
@@ -4442,7 +4781,7 @@ int test_lea_ecx_r8_r9_scale4_disp8(void) {
 }
 
 /* Test: LEA with 8-bit destination should be rejected */
-int test_lea_8bit_destination_rejected(void) {
+static int test_lea_8bit_destination_rejected(void) {
     assembler_context_t ctx;
     char *captured_err;
     setup_test_context(&ctx);
@@ -4480,6 +4819,8 @@ int test_lea_8bit_destination_rejected(void) {
 TEST_SUITE(encoder) {
     TEST(mov_r64_imm64);
     TEST(mov_r32_imm32);
+    TEST(mov_r64_imm32_canonical);
+    TEST(mov_r64_rex_imm32_canonical);
     TEST(mov_r8h_imm8);
     TEST(mov_r8l_imm8);
     TEST(push_r64);
@@ -4487,7 +4828,13 @@ TEST_SUITE(encoder) {
     TEST(ret);
     TEST(nop);
     TEST(mov_r64_r64);
+    TEST(mov_r64_mem_disp32_max);
+    TEST(mov_r64_mem_disp32_min);
+    TEST(mov_r64_mem_label_absolute);
+    TEST(mov_r64_mem_label_disp_addend);
     TEST(jnz_encoding);
+    TEST(jnz_short_encoding);
+    TEST(jmp_short_encoding);
     TEST(cmovne_rbx_rax);
     TEST(cmovg_r8_r9);
     TEST(encode_instruction_cdq);
@@ -4516,6 +4863,7 @@ TEST_SUITE(encoder) {
     TEST(add_high8_rex_conflict);
     TEST(sub_high8_rex_conflict);
     TEST(cmp_high8_rex_conflict);
+    TEST(high8_rex_conflict_matrix);
     /* Bit Manipulation Tests */
     TEST(bt_rax_imm);
     TEST(bts_rbx_cl);

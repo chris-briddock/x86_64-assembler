@@ -16,16 +16,10 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y gcc make
+        sudo apt-get install -y gcc clang make nasm binutils
 
-    - name: Build assembler
-      run: make all
-
-    - name: Run unit tests
-      run: make test-unit
-
-    - name: Run integration tests
-      run: make test-integration
+    - name: Run production gate
+      run: make ci
 
     - name: Generate coverage report
       run: make coverage

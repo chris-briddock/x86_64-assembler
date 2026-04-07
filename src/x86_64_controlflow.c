@@ -2,7 +2,7 @@
  * x86_64 Control Flow Encoding - Jumps, Calls, Returns
  */
 
-#include "x86_64_asm.h"
+#include "x86_64_asm/x86_64_asm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,12 +46,22 @@ static void controlflow_diagf(const parsed_instruction_t *inst,
     controlflow_diag_emit(inst, category, message, suggestion);
 }
 
+static bool controlflow_is_high_8bit_reg(const operand_t *op) {
+    return op && op->type == OPERAND_REG && op->reg_size == REG_SIZE_8H;
+}
+
+static bool controlflow_high8_rex_conflict(const operand_t *op1, const operand_t *op2) {
+    bool has_high8 = controlflow_is_high_8bit_reg(op1) || controlflow_is_high_8bit_reg(op2);
+    bool rex_required = (op1 && needs_rex(op1)) || (op2 && needs_rex(op2));
+    return has_high8 && rex_required;
+}
+
 /* Add a fixup for forward reference */
-static int add_fixup(assembler_context_t *ctx,
-                     const parsed_instruction_t *inst,
-                     const char *label,
-                     int size,
-                     instruction_type_t inst_type) {
+static int add_controlflow_fixup(assembler_context_t *ctx,
+                                 const parsed_instruction_t *inst,
+                                 const char *label,
+                                 int size,
+                                 instruction_type_t inst_type) {
     if (ctx->fixup_count >= MAX_SYMBOLS) {
         controlflow_diag_emit(
             inst,
@@ -89,8 +99,22 @@ int encode_jmp(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 
     /* jmp label - relative jump (always use fixup for correctness) */
     if (op->type == OPERAND_LABEL) {
+        hash_entry_t *sym = get_symbol_info(ctx, op->label);
+
+        if (sym && sym->is_resolved &&
+            (ctx->enable_forward_short_branches || sym->address < ctx->current_address)) {
+            int64_t rel = (int64_t)sym->address - (int64_t)(ctx->current_address + 2);
+
+            if (rel >= INT8_MIN && rel <= INT8_MAX) {
+                /* Short jump: EB cb */
+                if (emit_byte(ctx, 0xEB) < 0) return -1;
+                if (emit_byte(ctx, (uint8_t)(int8_t)rel) < 0) return -1;
+                return 0;
+            }
+        }
+
         if (emit_byte(ctx, 0xE9) < 0) return -1;
-        if (add_fixup(ctx, inst, op->label, 4, INST_JMP) < 0) return -1;
+        if (add_controlflow_fixup(ctx, inst, op->label, 4, INST_JMP) < 0) return -1;
         if (emit_le32(ctx, 0) < 0) return -1; /* Placeholder */
         return 0;
     }
@@ -175,14 +199,30 @@ int encode_jcc(assembler_context_t *ctx, const parsed_instruction_t *inst) {
             return -1;
     }
 
-    /* Always use fixups for control flow to ensure correct addresses.
+    {
+        hash_entry_t *sym = get_symbol_info(ctx, op->label);
+
+        if (sym && sym->is_resolved &&
+            (ctx->enable_forward_short_branches || sym->address < ctx->current_address)) {
+            int64_t rel8 = (int64_t)sym->address - (int64_t)(ctx->current_address + 2);
+
+            if (rel8 >= INT8_MIN && rel8 <= INT8_MAX) {
+                /* Short conditional jump: 70+cc cb */
+                if (emit_byte(ctx, 0x70 + cc) < 0) return -1;
+                if (emit_byte(ctx, (uint8_t)(int8_t)rel8) < 0) return -1;
+                return 0;
+            }
+        }
+    }
+
+    /* Use near+jump fixup fallback for unresolved/long-range labels.
      * Symbol addresses from first pass may be wrong due to estimation.
      * Fixups are resolved in third pass when all addresses are final. */
 
     /* Near jump: 0F 80+cc cd */
     if (emit_byte(ctx, 0x0F) < 0) return -1;
     if (emit_byte(ctx, 0x80 + cc) < 0) return -1;
-    if (add_fixup(ctx, inst, op->label, 4, inst->type) < 0) return -1;
+    if (add_controlflow_fixup(ctx, inst, op->label, 4, inst->type) < 0) return -1;
     if (emit_le32(ctx, 0) < 0) return -1; /* Placeholder */
 
     return 0;
@@ -226,7 +266,7 @@ int encode_call_ret(assembler_context_t *ctx, const parsed_instruction_t *inst) 
         /* call label - relative call (always use fixup for correctness) */
         if (op->type == OPERAND_LABEL) {
             if (emit_byte(ctx, 0xE8) < 0) return -1;
-            if (add_fixup(ctx, inst, op->label, 4, INST_CALL) < 0) return -1;
+            if (add_controlflow_fixup(ctx, inst, op->label, 4, INST_CALL) < 0) return -1;
             if (emit_le32(ctx, 0) < 0) return -1;
             return 0;
         }
@@ -353,14 +393,6 @@ int encode_cwd_cdq_cqo(assembler_context_t *ctx, const parsed_instruction_t *ins
             );
             return -1;
     }
-}
-
-/* CWD/CWDE/CDQE encoding */
-int encode_cwd(assembler_context_t *ctx, const parsed_instruction_t *inst) {
-    (void)inst;
-    /* CDQ: 99 (implicitly 32-bit in 32-bit mode, but we need REX.W for 64-bit) */
-    if (emit_byte(ctx, 0x99) < 0) return -1;
-    return 0;
 }
 
 int encode_cbw_cwde_cdqe(assembler_context_t *ctx, const parsed_instruction_t *inst) {
@@ -706,6 +738,16 @@ int encode_xchg(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     const operand_t *op1 = &inst->operands[0];
     const operand_t *op2 = &inst->operands[1];
 
+    if (controlflow_high8_rex_conflict(op1, op2)) {
+        controlflow_diag_emit(
+            inst,
+            "Constraint",
+            "Cannot use AH/BH/CH/DH with registers R8-R15 or SPL/BPL/SIL/DIL",
+            "Use AL/BL/CL/DL or the low byte of R8-R15 instead."
+        );
+        return -1;
+    }
+
     /* XCHG rax, reg and XCHG reg, rax - special short form */
     if ((op1->type == OPERAND_REG && op1->reg == 0 && op2->type == OPERAND_REG) ||
         (op2->type == OPERAND_REG && op2->reg == 0 && op1->type == OPERAND_REG)) {
@@ -909,6 +951,16 @@ int encode_test(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 
     const operand_t *op1 = &inst->operands[0];
     const operand_t *op2 = &inst->operands[1];
+
+    if (controlflow_high8_rex_conflict(op1, op2)) {
+        controlflow_diag_emit(
+            inst,
+            "Constraint",
+            "Cannot use AH/BH/CH/DH with registers R8-R15 or SPL/BPL/SIL/DIL",
+            "Use AL/BL/CL/DL or the low byte of R8-R15 instead."
+        );
+        return -1;
+    }
 
     /* TEST r/m64, imm32 - sign-extended immediate */
     if ((op1->type == OPERAND_REG || op1->type == OPERAND_MEM) && op2->type == OPERAND_IMM) {
@@ -1160,7 +1212,7 @@ int encode_bit_manip(assembler_context_t *ctx, const parsed_instruction_t *inst)
         if (emit_rex(ctx, is_64bit, op2, op1, NULL) < 0) return -1;
         if (emit_byte(ctx, 0x0F) < 0) return -1;
         if (emit_byte(ctx, opcode2) < 0) return -1;
-        if (emit_modrm_sib(ctx, op2->reg, op1, size) < 0) return -1;
+        if (emit_modrm_sib(ctx, (uint8_t)op2->reg, op1, size) < 0) return -1;
     }
 
     return 0;
@@ -1229,7 +1281,7 @@ int encode_shld_shrd(assembler_context_t *ctx, const parsed_instruction_t *inst)
     if (emit_rex(ctx, is_64bit, src, dst, NULL) < 0) return -1;
     if (emit_byte(ctx, 0x0F) < 0) return -1;
     if (emit_byte(ctx, opcode2) < 0) return -1;
-    if (emit_modrm_sib(ctx, src->reg, dst, size) < 0) return -1;
+    if (emit_modrm_sib(ctx, (uint8_t)src->reg, dst, size) < 0) return -1;
 
     /* Immediate byte if not using CL */
     if (use_imm) {
@@ -1278,7 +1330,7 @@ int encode_bit_scan(assembler_context_t *ctx, const parsed_instruction_t *inst) 
     if (emit_rex(ctx, is_64bit, dst, src, NULL) < 0) return -1;
     if (emit_byte(ctx, 0x0F) < 0) return -1;
     if (emit_byte(ctx, opcode2) < 0) return -1;
-    if (emit_modrm_sib(ctx, dst->reg, src, size) < 0) return -1;
+    if (emit_modrm_sib(ctx, (uint8_t)dst->reg, src, size) < 0) return -1;
 
     return 0;
 }

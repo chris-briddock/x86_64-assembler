@@ -80,7 +80,30 @@ int test_final_status(void) {
     return g_test_state.failed > 0 ? 1 : 0;
 }
 
+void test_run_case(const char *test_name, int (*test_fn)(void)) {
+    int test_result;
+
+    g_test_state.current_test = test_name;
+    g_test_state.total++;
+    g_test_state.suite_total++;
+
+    printf("  TEST: %s ... ", test_name);
+    test_result = test_fn();
+
+    if (test_result == 0) {
+        g_test_state.passed++;
+        g_test_state.suite_passed++;
+        printf("PASS\n");
+    } else {
+        g_test_state.failed++;
+        g_test_state.suite_failed++;
+        printf("FAIL\n");
+    }
+}
+
 int test_capture_stderr_begin(void) {
+    int capture_fd;
+
     if (g_stderr_capture_file != NULL || g_stderr_saved_fd != -1) {
         return -1;
     }
@@ -90,15 +113,24 @@ int test_capture_stderr_begin(void) {
         return -1;
     }
 
-    g_stderr_saved_fd = dup(fileno(stderr));
+    g_stderr_saved_fd = dup(STDERR_FILENO);
     if (g_stderr_saved_fd < 0) {
         fclose(g_stderr_capture_file);
         g_stderr_capture_file = NULL;
         return -1;
     }
 
+    capture_fd = fileno(g_stderr_capture_file);
+    if (capture_fd < 0) {
+        close(g_stderr_saved_fd);
+        g_stderr_saved_fd = -1;
+        fclose(g_stderr_capture_file);
+        g_stderr_capture_file = NULL;
+        return -1;
+    }
+
     fflush(stderr);
-    if (dup2(fileno(g_stderr_capture_file), fileno(stderr)) < 0) {
+    if (dup2(capture_fd, STDERR_FILENO) < 0) {
         close(g_stderr_saved_fd);
         g_stderr_saved_fd = -1;
         fclose(g_stderr_capture_file);
@@ -118,7 +150,7 @@ char *test_capture_stderr_end(void) {
     }
 
     fflush(stderr);
-    if (dup2(g_stderr_saved_fd, fileno(stderr)) < 0) {
+    if (dup2(g_stderr_saved_fd, STDERR_FILENO) < 0) {
         close(g_stderr_saved_fd);
         g_stderr_saved_fd = -1;
         fclose(g_stderr_capture_file);
