@@ -72,6 +72,8 @@ Lower 8 bits: `al`, `bl`, `cl`, `dl`, `sil`, `dil`, `bpl`, `spl`, `r8b-r15b`
 
 High 8 bits: `ah`, `bh`, `ch`, `dh`
 
+### Architectural Constraints
+
 **Note on High 8-bit Registers:** Due to x86_64 architecture constraints, AH/BH/CH/DH cannot be used with:
 
 - R8-R15 registers
@@ -79,6 +81,8 @@ High 8 bits: `ah`, `bh`, `ch`, `dh`
 - 64-bit operations requiring REX prefix
 
 Use AL/BL/CL/DL or the low byte of R8-R15 (R8B-R15B) instead for compatibility.
+
+This limitation is defined by x86_64 REX prefix encoding rules in Intel and AMD architecture manuals, not by assembler implementation choice.
 
 ### XMM Registers
 

@@ -7,14 +7,8 @@
 #include "../src/x86_64_asm.h"
 #include <string.h>
 
-/* External parser functions from x86_64_asm.c */
-extern parsed_instruction_t *parse_source(const char *source, int *count);
-extern parsed_instruction_t *parse_source_with_context(assembler_context_t *ctx, const char *source, int *count);
-extern void free_instructions(parsed_instruction_t *insts);
-extern char *preprocess_macros(assembler_context_t *ctx, const char *source);
-
 /* Test: Parse simple mov instruction */
-int test_parse_mov(void) {
+static int test_parse_mov(void) {
     int count = 0;
     const char *source = "mov rax, rbx\n";
     
@@ -33,7 +27,7 @@ int test_parse_mov(void) {
 }
 
 /* Test: Parse immediate value */
-int test_parse_immediate(void) {
+static int test_parse_immediate(void) {
     int count = 0;
     const char *source = "mov rax, $42\n";
     
@@ -48,7 +42,7 @@ int test_parse_immediate(void) {
 }
 
 /* Test: Parse hex immediate */
-int test_parse_hex_immediate(void) {
+static int test_parse_hex_immediate(void) {
     int count = 0;
     const char *source = "mov rax, $0xDEADBEEF\n";
     
@@ -63,7 +57,7 @@ int test_parse_hex_immediate(void) {
 }
 
 /* Test: Parse label reference */
-int test_parse_label_ref(void) {
+static int test_parse_label_ref(void) {
     int count = 0;
     const char *source = "jmp loop\n";
     
@@ -79,7 +73,7 @@ int test_parse_label_ref(void) {
 }
 
 /* Test: Parse local and anonymous label syntax */
-int test_parse_local_and_anonymous_labels(void) {
+static int test_parse_local_and_anonymous_labels(void) {
     int count = 0;
     const char *source =
         "entry:\n"
@@ -117,7 +111,7 @@ int test_parse_local_and_anonymous_labels(void) {
 }
 
 /* Test: Parse multiple instructions */
-int test_parse_multiple(void) {
+static int test_parse_multiple(void) {
     int count = 0;
     const char *source = 
         "mov rax, $1\n"
@@ -136,7 +130,7 @@ int test_parse_multiple(void) {
 }
 
 /* Test: Parse instruction with label */
-int test_parse_labeled_instruction(void) {
+static int test_parse_labeled_instruction(void) {
     int count = 0;
     const char *source = "loop:\n  dec rcx\n";
     
@@ -156,7 +150,7 @@ int test_parse_labeled_instruction(void) {
 }
 
 /* Test: Label column should reflect source indentation */
-int test_parse_label_column(void) {
+static int test_parse_label_column(void) {
     int count = 0;
     const char *source = "    helper:\nret\n";
 
@@ -172,7 +166,7 @@ int test_parse_label_column(void) {
 }
 
 /* Test: Parse memory operand */
-int test_parse_memory(void) {
+static int test_parse_memory(void) {
     int count = 0;
     const char *source = "mov rax, [rbx]\n";
     
@@ -188,7 +182,7 @@ int test_parse_memory(void) {
 }
 
 /* Test: Parse memory with displacement */
-int test_parse_memory_disp(void) {
+static int test_parse_memory_disp(void) {
     int count = 0;
     const char *source = "mov rax, [rsp + 8]\n";
     
@@ -205,8 +199,56 @@ int test_parse_memory_disp(void) {
     return 0;
 }
 
+/* Test: Parse memory operands with int32 displacement boundaries */
+static int test_parse_memory_displacement_extremes(void) {
+    int count = 0;
+    const char *source =
+        "mov rax, [rbx + 2147483647]\n"
+        "mov rcx, [rdx - 2147483648]\n";
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);
+
+    ASSERT_EQ(OPERAND_MEM, insts[0].operands[1].type);
+    ASSERT_TRUE(insts[0].operands[1].mem.has_displacement);
+    ASSERT_EQ(2147483647, insts[0].operands[1].mem.displacement);
+
+    ASSERT_EQ(OPERAND_MEM, insts[1].operands[1].type);
+    ASSERT_TRUE(insts[1].operands[1].mem.has_displacement);
+    ASSERT_EQ(-2147483648LL, insts[1].operands[1].mem.displacement);
+
+    free_instructions(insts);
+    return 0;
+}
+
+/* Test: Parse near-maximum label length without truncation */
+static int test_parse_label_max_length(void) {
+    int count = 0;
+    char label[MAX_LABEL_LENGTH];
+    char source[600];
+
+    memset(label, 'a', MAX_LABEL_LENGTH - 1);
+    label[MAX_LABEL_LENGTH - 1] = '\0';
+
+    source[0] = '\0';
+    strcat(source, label);
+    strcat(source, ":\n");
+    strcat(source, "    nop\n");
+
+    parsed_instruction_t *insts = parse_source(source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(2, count);
+    ASSERT_TRUE(insts[0].has_label);
+    ASSERT_EQ_STR(label, insts[0].label);
+    ASSERT_EQ(INST_NOP, insts[1].type);
+
+    free_instructions(insts);
+    return 0;
+}
+
 /* Test: Parse indexed memory with scale factor 2 and displacement */
-int test_parse_memory_index_scale2(void) {
+static int test_parse_memory_index_scale2(void) {
     int count = 0;
     const char *source = "mov rax, [r12 + r13 * 2 + 16]\n";
 
@@ -227,7 +269,7 @@ int test_parse_memory_index_scale2(void) {
 }
 
 /* Test: Parse extended-register base+index memory operand with implicit scale 1 */
-int test_parse_memory_ext_base_index(void) {
+static int test_parse_memory_ext_base_index(void) {
     int count = 0;
     const char *source = "mov rax, [r8 + r15]\n";
 
@@ -246,7 +288,7 @@ int test_parse_memory_ext_base_index(void) {
 }
 
 /* Test: Parse all registers */
-int test_parse_registers(void) {
+static int test_parse_registers(void) {
     int count = 0;
     const char *source = 
         "mov rax, rbx\n"
@@ -272,7 +314,7 @@ int test_parse_registers(void) {
 }
 
 /* Test: Parse section directive */
-int test_parse_section(void) {
+static int test_parse_section(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -295,7 +337,7 @@ int test_parse_section(void) {
 }
 
 /* Test: Parse named section directives and segment alias */
-int test_parse_named_sections_and_segment_alias(void) {
+static int test_parse_named_sections_and_segment_alias(void) {
     int count = 0;
     const char *source =
         "section .text.startup\n"
@@ -327,7 +369,7 @@ int test_parse_named_sections_and_segment_alias(void) {
 }
 
 /* Test: Parse empty source */
-int test_parse_empty(void) {
+static int test_parse_empty(void) {
     int count = 0;
     const char *source = "";
     
@@ -339,7 +381,7 @@ int test_parse_empty(void) {
 }
 
 /* Test: Parse comment-only source */
-int test_parse_comments(void) {
+static int test_parse_comments(void) {
     int count = 0;
     const char *source = 
         "; This is a comment\n"
@@ -353,7 +395,7 @@ int test_parse_comments(void) {
 }
 
 /* Test: Parse instruction with comment */
-int test_parse_instruction_with_comment(void) {
+static int test_parse_instruction_with_comment(void) {
     int count = 0;
     const char *source = "mov rax, rbx  ; This is a comment\n";
     
@@ -367,7 +409,7 @@ int test_parse_instruction_with_comment(void) {
 }
 
 /* Test: Parse push/pop */
-int test_parse_push_pop(void) {
+static int test_parse_push_pop(void) {
     int count = 0;
     const char *source = 
         "push rax\n"
@@ -386,7 +428,7 @@ int test_parse_push_pop(void) {
 }
 
 /* Test: Parse call and ret */
-int test_parse_call_ret(void) {
+static int test_parse_call_ret(void) {
     int count = 0;
     const char *source =
         "call function\n"
@@ -405,7 +447,7 @@ int test_parse_call_ret(void) {
 }
 
 /* Test: Parse int immediate instruction */
-int test_parse_int(void) {
+static int test_parse_int(void) {
     int count = 0;
     const char *source = "int $0x80\n";
 
@@ -422,7 +464,7 @@ int test_parse_int(void) {
 }
 
 /* Test: Parse enter/cbw/cwd/cwde mnemonics */
-int test_parse_enter_and_legacy_signext(void) {
+static int test_parse_enter_and_legacy_signext(void) {
     int count = 0;
     const char *source =
         "enter 16, 0\n"
@@ -450,7 +492,7 @@ int test_parse_enter_and_legacy_signext(void) {
 }
 
 /* Regression test: Unknown instruction should fail parsing */
-int test_parse_unknown_instruction(void) {
+static int test_parse_unknown_instruction(void) {
     int count = 0;
     char *captured_err;
     const char *source =
@@ -477,8 +519,71 @@ int test_parse_unknown_instruction(void) {
     return 0;
 }
 
+/* Regression test: Unknown mnemonic typo should provide did-you-mean guidance */
+static int test_parse_unknown_instruction_did_you_mean(void) {
+    int count = 0;
+    char *captured_err;
+    const char *source = "ad rax, rbx\n";
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source(source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Unknown instruction 'ad'");
+    ASSERT_STR_CONTAINS(captured_err, "Did you mean 'add'");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Regression test: malformed memory operand should include concrete syntax guidance */
+static int test_parse_memory_operand_suggestion(void) {
+    int count = 0;
+    char *captured_err;
+    const char *source = "mov rax, [rbx + ]\n";
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source(source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Expected register or number after +/- in memory operand");
+    ASSERT_STR_CONTAINS(captured_err, "After '+' or '-', use a register, numeric displacement, or label");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Regression test: segment override without memory operand should suggest valid form */
+static int test_parse_segment_override_requires_memory(void) {
+    int count = 0;
+    char *captured_err;
+    const char *source = "mov rax, fs:rax\n";
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source(source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Segment override requires a memory operand");
+    ASSERT_STR_CONTAINS(captured_err, "fs:[rax]");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+
+    free(captured_err);
+    return 0;
+}
+
 /* Test: Parser should reject SSE move memory destination with non-XMM source */
-int test_parse_sse_move_mem_dst_imm_src_invalid(void) {
+static int test_parse_sse_move_mem_dst_imm_src_invalid(void) {
     int count = 0;
     char *captured_err;
     const char *source = "movups [rax], $1\n";
@@ -497,7 +602,7 @@ int test_parse_sse_move_mem_dst_imm_src_invalid(void) {
 }
 
 /* Test: Parser should reject SSE arithmetic with non-XMM destination */
-int test_parse_sse_arith_non_xmm_dst_invalid(void) {
+static int test_parse_sse_arith_non_xmm_dst_invalid(void) {
     int count = 0;
     char *captured_err;
     const char *source = "addss rax, xmm1\n";
@@ -516,7 +621,7 @@ int test_parse_sse_arith_non_xmm_dst_invalid(void) {
 }
 
 /* Test: Parser should reject SSE arithmetic with immediate source */
-int test_parse_sse_arith_imm_src_invalid(void) {
+static int test_parse_sse_arith_imm_src_invalid(void) {
     int count = 0;
     char *captured_err;
     const char *source = "divps xmm3, $1\n";
@@ -535,7 +640,7 @@ int test_parse_sse_arith_imm_src_invalid(void) {
 }
 
 /* Test: Parser should reject invalid scale factor 5 */
-int test_parse_memory_invalid_scale5(void) {
+static int test_parse_memory_invalid_scale5(void) {
     int count = 0;
     char *captured_err;
     const char *source = "mov rax, [rbx + rcx * 5]\n";
@@ -557,7 +662,7 @@ int test_parse_memory_invalid_scale5(void) {
 }
 
 /* Test: Parser should reject invalid scale factor 6 */
-int test_parse_memory_invalid_scale6(void) {
+static int test_parse_memory_invalid_scale6(void) {
     int count = 0;
     char *captured_err;
     const char *source = "mov rax, [rbx + rcx * 6]\n";
@@ -576,7 +681,7 @@ int test_parse_memory_invalid_scale6(void) {
 }
 
 /* Test: Parser should reject invalid scale factor 7 */
-int test_parse_memory_invalid_scale7(void) {
+static int test_parse_memory_invalid_scale7(void) {
     int count = 0;
     char *captured_err;
     const char *source = "mov rax, [rbx + rcx * 7]\n";
@@ -595,7 +700,7 @@ int test_parse_memory_invalid_scale7(void) {
 }
 
 /* Test: Parser should reject RIP-relative form that also includes index/base */
-int test_parse_rip_relative_with_index_invalid(void) {
+static int test_parse_rip_relative_with_index_invalid(void) {
     int count = 0;
     char *captured_err;
     const char *source = "mov rax, [rip + rcx * 2]\n";
@@ -614,7 +719,7 @@ int test_parse_rip_relative_with_index_invalid(void) {
 }
 
 /* Test: Parser should accept legal RIP-relative addressing without base/index */
-int test_parse_rip_relative_legal(void) {
+static int test_parse_rip_relative_legal(void) {
     int count = 0;
     const char *source = "mov rax, [rip + 8]\n";
 
@@ -633,7 +738,7 @@ int test_parse_rip_relative_legal(void) {
 }
 
 /* Test: Parse explicit absolute memory addressing */
-int test_parse_absolute_memory_addressing(void) {
+static int test_parse_absolute_memory_addressing(void) {
     int count = 0;
     const char *source = "mov rax, [abs 0x1234]\n";
 
@@ -652,7 +757,7 @@ int test_parse_absolute_memory_addressing(void) {
 }
 
 /* Test: Parse FS/GS segment override memory operands */
-int test_parse_segment_override_memory(void) {
+static int test_parse_segment_override_memory(void) {
     int count = 0;
     const char *source =
         "mov rax, fs:[0]\n"
@@ -677,7 +782,7 @@ int test_parse_segment_override_memory(void) {
 }
 
 /* Test: Macro definition and lookup */
-int test_macro_definition(void) {
+static int test_macro_definition(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     
@@ -704,7 +809,7 @@ int test_macro_definition(void) {
 }
 
 /* Test: Macro expansion with parameter substitution */
-int test_macro_expansion(void) {
+static int test_macro_expansion(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     
@@ -731,7 +836,7 @@ int test_macro_expansion(void) {
 }
 
 /* Test: Macro with multiple parameters */
-int test_macro_multiple_params(void) {
+static int test_macro_multiple_params(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     
@@ -763,7 +868,7 @@ int test_macro_multiple_params(void) {
 }
 
 /* Test: Macro with alternative $param syntax */
-int test_macro_dollar_syntax(void) {
+static int test_macro_dollar_syntax(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     
@@ -787,7 +892,7 @@ int test_macro_dollar_syntax(void) {
 }
 
 /* Test: Macro without parameters */
-int test_macro_no_params(void) {
+static int test_macro_no_params(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     
@@ -813,7 +918,7 @@ int test_macro_no_params(void) {
 }
 
 /* Test: Multiple macro invocations */
-int test_macro_multiple_invocations(void) {
+static int test_macro_multiple_invocations(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     
@@ -839,8 +944,37 @@ int test_macro_multiple_invocations(void) {
     return 0;
 }
 
+/* Test: Recursive macro invocation should fail with actionable diagnostics */
+static int test_macro_recursive_invocation_fails(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        ".macro recur\n"
+        "    recur\n"
+        ".endm\n"
+        "recur\n";
+
+    char *captured_err;
+    int count = 0;
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    captured_err = test_capture_stderr_end();
+
+    ASSERT_NULL(insts);
+    ASSERT_EQ(0, count);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Unknown instruction 'recur'");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+
+    free(captured_err);
+    asm_free(ctx);
+    return 0;
+}
+
 /* Test: %define should substitute symbols in active lines */
-int test_preprocessor_define_substitution(void) {
+static int test_preprocessor_define_substitution(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
 
@@ -862,7 +996,7 @@ int test_preprocessor_define_substitution(void) {
 }
 
 /* Test: %if/%else/%endif should include only active branch */
-int test_preprocessor_if_else(void) {
+static int test_preprocessor_if_else(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
 
@@ -887,7 +1021,7 @@ int test_preprocessor_if_else(void) {
 }
 
 /* Test: %ifdef/%ifndef should evaluate based on %define symbols */
-int test_preprocessor_ifdef_ifndef(void) {
+static int test_preprocessor_ifdef_ifndef(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
 
@@ -915,7 +1049,7 @@ int test_preprocessor_ifdef_ifndef(void) {
 }
 
 /* Test: %warning should emit warning and continue preprocessing */
-int test_preprocessor_warning_directive(void) {
+static int test_preprocessor_warning_directive(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
 
@@ -941,7 +1075,7 @@ int test_preprocessor_warning_directive(void) {
 }
 
 /* Test: %error should fail preprocessing */
-int test_preprocessor_error_directive(void) {
+static int test_preprocessor_error_directive(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
 
@@ -958,7 +1092,9 @@ int test_preprocessor_error_directive(void) {
     ASSERT_NULL(insts);
     ASSERT_EQ(0, count);
     ASSERT_NOT_NULL(captured_err);
-    ASSERT_STR_CONTAINS(captured_err, "Error: hard stop");
+    ASSERT_STR_CONTAINS(captured_err, "Error at line");
+    ASSERT_STR_CONTAINS(captured_err, "hard stop");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
     ASSERT_STR_CONTAINS(captured_err, "Macro preprocessing failed");
 
     free(captured_err);
@@ -967,7 +1103,7 @@ int test_preprocessor_error_directive(void) {
 }
 
 /* Test: Parse times directive expansion */
-int test_parse_times_directive(void) {
+static int test_parse_times_directive(void) {
     int count = 0;
     const char *source = "times 3 nop\n";
     
@@ -983,7 +1119,7 @@ int test_parse_times_directive(void) {
 }
 
 /* Test: Parse times with larger count */
-int test_parse_times_large_count(void) {
+static int test_parse_times_large_count(void) {
     int count = 0;
     const char *source = "times 10 nop\n";
     
@@ -999,7 +1135,7 @@ int test_parse_times_large_count(void) {
 }
 
 /* Test: Parse equ directive */
-int test_parse_equ_directive(void) {
+static int test_parse_equ_directive(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     
@@ -1022,7 +1158,7 @@ int test_parse_equ_directive(void) {
 }
 
 /* Test: Parse equ with hex value */
-int test_parse_equ_hex(void) {
+static int test_parse_equ_hex(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     
@@ -1041,7 +1177,7 @@ int test_parse_equ_hex(void) {
 }
 
 /* Test: Parse resb directive */
-int test_parse_resb(void) {
+static int test_parse_resb(void) {
     int count = 0;
     const char *source = "buffer: resb 64\n";
     
@@ -1060,7 +1196,7 @@ int test_parse_resb(void) {
 }
 
 /* Test: Parse equ with label subtraction expression */
-int test_parse_equ_label_subtraction(void) {
+static int test_parse_equ_label_subtraction(void) {
     int count = 0;
     const char *source = "DELTA equ end - start\n";
 
@@ -1080,7 +1216,7 @@ int test_parse_equ_label_subtraction(void) {
 }
 
 /* Test: Parse weak/hidden symbol attribute directives */
-int test_parse_weak_hidden_directives(void) {
+static int test_parse_weak_hidden_directives(void) {
     int count = 0;
     const char *source =
         "weak foo, bar\n"
@@ -1107,7 +1243,7 @@ int test_parse_weak_hidden_directives(void) {
 }
 
 /* Test: Parse resw directive */
-int test_parse_resw(void) {
+static int test_parse_resw(void) {
     int count = 0;
     const char *source = "words: resw 10\n";
     
@@ -1122,7 +1258,7 @@ int test_parse_resw(void) {
 }
 
 /* Test: Parse resd directive */
-int test_parse_resd(void) {
+static int test_parse_resd(void) {
     int count = 0;
     const char *source = "dwords: resd 5\n";
     
@@ -1137,7 +1273,7 @@ int test_parse_resd(void) {
 }
 
 /* Test: Parse resq directive */
-int test_parse_resq(void) {
+static int test_parse_resq(void) {
     int count = 0;
     const char *source = "qwords: resq 4\n";
     
@@ -1152,7 +1288,7 @@ int test_parse_resq(void) {
 }
 
 /* Test: Parse db with string literal */
-int test_parse_db_string(void) {
+static int test_parse_db_string(void) {
     int count = 0;
     const char *source = "msg: db \"Hello\"\n";
     
@@ -1170,7 +1306,7 @@ int test_parse_db_string(void) {
 }
 
 /* Test: Parse db with string containing escape sequences */
-int test_parse_db_string_escapes(void) {
+static int test_parse_db_string_escapes(void) {
     int count = 0;
     const char *source = "msg: db \"Hello\\nWorld\\t!\"\n";
     
@@ -1188,7 +1324,7 @@ int test_parse_db_string_escapes(void) {
 }
 
 /* Test: Parse db with mixed string and immediates */
-int test_parse_db_mixed(void) {
+static int test_parse_db_mixed(void) {
     int count = 0;
     const char *source = "msg: db \"Hi\", 10, 0\n";
     
@@ -1208,7 +1344,7 @@ int test_parse_db_mixed(void) {
 }
 
 /* Test: Parse .bss section directive */
-int test_parse_bss_section(void) {
+static int test_parse_bss_section(void) {
     int count = 0;
     const char *source =
         "section .bss\n"
@@ -1225,7 +1361,7 @@ int test_parse_bss_section(void) {
 }
 
 /* Test: Parse .rodata section directive */
-int test_parse_rodata_section(void) {
+static int test_parse_rodata_section(void) {
     int count = 0;
     const char *source =
         "section .rodata\n"
@@ -1242,7 +1378,7 @@ int test_parse_rodata_section(void) {
 }
 
 /* Test: Parse character literal */
-int test_parse_char_literal(void) {
+static int test_parse_char_literal(void) {
     int count = 0;
     const char *source = "mov al, 'A'\n";
     
@@ -1260,7 +1396,7 @@ int test_parse_char_literal(void) {
 }
 
 /* Test: Parse character literal with escape sequence */
-int test_parse_char_literal_escape(void) {
+static int test_parse_char_literal_escape(void) {
     int count = 0;
     const char *source = "mov al, '\\n'\n";
     
@@ -1276,7 +1412,7 @@ int test_parse_char_literal_escape(void) {
 }
 
 /* Test: Parse character literal in db directive */
-int test_parse_char_literal_in_db(void) {
+static int test_parse_char_literal_in_db(void) {
     int count = 0;
     const char *source = "char_a: db 'A'\n";
     
@@ -1294,7 +1430,7 @@ int test_parse_char_literal_in_db(void) {
 }
 
 /* Test: Parse character literal in instruction */
-int test_parse_char_literal_in_instruction(void) {
+static int test_parse_char_literal_in_instruction(void) {
     int count = 0;
     const char *source =
         "section .text\n"
@@ -1317,7 +1453,7 @@ int test_parse_char_literal_in_instruction(void) {
 }
 
 /* Test: Parse align directive */
-int test_parse_align(void) {
+static int test_parse_align(void) {
     int count = 0;
     const char *source =
         "section .text\n"
@@ -1341,7 +1477,7 @@ int test_parse_align(void) {
 }
 
 /* Test: Parse align directive with different alignments */
-int test_parse_align_various(void) {
+static int test_parse_align_various(void) {
     int count = 0;
     const char *source =
         "section .text\n"
@@ -1370,7 +1506,7 @@ int test_parse_align_various(void) {
 }
 
 /* Test: Parse align in data section */
-int test_parse_align_data(void) {
+static int test_parse_align_data(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -1392,7 +1528,7 @@ int test_parse_align_data(void) {
 }
 
 /* Test: Parse UTF-8 string with emoji */
-int test_parse_utf8_string(void) {
+static int test_parse_utf8_string(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -1413,7 +1549,7 @@ int test_parse_utf8_string(void) {
 }
 
 /* Test: Parse UTF-8 string with Chinese characters */
-int test_parse_utf8_chinese(void) {
+static int test_parse_utf8_chinese(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -1432,7 +1568,7 @@ int test_parse_utf8_chinese(void) {
 }
 
 /* Test: Parse UTF-8 string mixed with escapes */
-int test_parse_utf8_mixed(void) {
+static int test_parse_utf8_mixed(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -1461,7 +1597,7 @@ int test_parse_utf8_mixed(void) {
 }
 
 /* Test: Parse incbin directive */
-int test_parse_incbin(void) {
+static int test_parse_incbin(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -1481,7 +1617,7 @@ int test_parse_incbin(void) {
 }
 
 /* Test: String concatenation (two strings) */
-int test_parse_string_concat(void) {
+static int test_parse_string_concat(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -1501,7 +1637,7 @@ int test_parse_string_concat(void) {
 }
 
 /* Test: String concatenation (multiple strings) */
-int test_parse_string_concat_multiple(void) {
+static int test_parse_string_concat_multiple(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -1520,7 +1656,7 @@ int test_parse_string_concat_multiple(void) {
 }
 
 /* Test: String concatenation with escape sequences */
-int test_parse_string_concat_with_escapes(void) {
+static int test_parse_string_concat_with_escapes(void) {
     int count = 0;
     const char *source =
         "section .data\n"
@@ -1542,7 +1678,7 @@ int test_parse_string_concat_with_escapes(void) {
 }
 
 /* Test: .comm directive */
-int test_parse_comm(void) {
+static int test_parse_comm(void) {
     int count = 0;
     const char *source =
         "section .bss\n"
@@ -1564,7 +1700,7 @@ int test_parse_comm(void) {
 }
 
 /* Test: .comm directive with alignment */
-int test_parse_comm_with_alignment(void) {
+static int test_parse_comm_with_alignment(void) {
     int count = 0;
     const char *source =
         "section .bss\n"
@@ -1585,7 +1721,7 @@ int test_parse_comm_with_alignment(void) {
 }
 
 /* Test: .lcomm directive */
-int test_parse_lcomm(void) {
+static int test_parse_lcomm(void) {
     int count = 0;
     const char *source =
         "section .bss\n"
@@ -1605,7 +1741,7 @@ int test_parse_lcomm(void) {
 }
 
 /* Test: .lcomm directive with alignment */
-int test_parse_lcomm_with_alignment(void) {
+static int test_parse_lcomm_with_alignment(void) {
     int count = 0;
     const char *source =
         "section .bss\n"
@@ -1637,6 +1773,8 @@ TEST_SUITE(parser) {
     TEST(parse_label_column);
     TEST(parse_memory);
     TEST(parse_memory_disp);
+    TEST(parse_memory_displacement_extremes);
+    TEST(parse_label_max_length);
     TEST(parse_memory_index_scale2);
     TEST(parse_memory_ext_base_index);
     TEST(parse_registers);
@@ -1650,6 +1788,9 @@ TEST_SUITE(parser) {
     TEST(parse_int);
     TEST(parse_enter_and_legacy_signext);
     TEST(parse_unknown_instruction);
+    TEST(parse_unknown_instruction_did_you_mean);
+    TEST(parse_memory_operand_suggestion);
+    TEST(parse_segment_override_requires_memory);
     TEST(parse_sse_move_mem_dst_imm_src_invalid);
     TEST(parse_sse_arith_non_xmm_dst_invalid);
     TEST(parse_sse_arith_imm_src_invalid);
@@ -1666,6 +1807,7 @@ TEST_SUITE(parser) {
     TEST(macro_dollar_syntax);
     TEST(macro_no_params);
     TEST(macro_multiple_invocations);
+    TEST(macro_recursive_invocation_fails);
     TEST(preprocessor_define_substitution);
     TEST(preprocessor_if_else);
     TEST(preprocessor_ifdef_ifndef);

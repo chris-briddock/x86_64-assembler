@@ -4,11 +4,10 @@
  */
 
 #include "x86_64_asm.h"
+#include "x86_64_asm/opcode_lookup.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <assert.h>
 #include <stdarg.h>
 
 /* Standardized encoder diagnostic helpers for roadmap phase 2.1.1. */
@@ -33,389 +32,22 @@ static void encoder_diagf(int line, const char *category,
 }
 
 /* ============================================================================
- * REGISTER TABLE AND PARSING
+ * ENCODER-LOCAL VALIDATION HELPERS
  * ============================================================================ */
 
-typedef struct {
-    const char *name;
-    reg_t reg;
-    reg_size_t size;
-} reg_entry_t;
-
-static const reg_entry_t reg_table[] = {
-    /* 64-bit registers */
-    {"rax", RAX, REG_SIZE_64}, {"rcx", RCX, REG_SIZE_64},
-    {"rdx", RDX, REG_SIZE_64}, {"rbx", RBX, REG_SIZE_64},
-    {"rsp", RSP, REG_SIZE_64}, {"rbp", RBP, REG_SIZE_64},
-    {"rsi", RSI, REG_SIZE_64}, {"rdi", RDI, REG_SIZE_64},
-    {"r8",  R8,  REG_SIZE_64}, {"r9",  R9,  REG_SIZE_64},
-    {"r10", R10, REG_SIZE_64}, {"r11", R11, REG_SIZE_64},
-    {"r12", R12, REG_SIZE_64}, {"r13", R13, REG_SIZE_64},
-    {"r14", R14, REG_SIZE_64}, {"r15", R15, REG_SIZE_64},
-    /* 32-bit registers */
-    {"eax", EAX, REG_SIZE_32}, {"ecx", ECX, REG_SIZE_32},
-    {"edx", EDX, REG_SIZE_32}, {"ebx", EBX, REG_SIZE_32},
-    {"esp", ESP, REG_SIZE_32}, {"ebp", EBP, REG_SIZE_32},
-    {"esi", ESI, REG_SIZE_32}, {"edi", EDI, REG_SIZE_32},
-    {"r8d", R8D, REG_SIZE_32}, {"r9d", R9D, REG_SIZE_32},
-    {"r10d", R10D, REG_SIZE_32}, {"r11d", R11D, REG_SIZE_32},
-    {"r12d", R12D, REG_SIZE_32}, {"r13d", R13D, REG_SIZE_32},
-    {"r14d", R14D, REG_SIZE_32}, {"r15d", R15D, REG_SIZE_32},
-    /* 16-bit registers */
-    {"ax", AX, REG_SIZE_16}, {"cx", CX, REG_SIZE_16},
-    {"dx", DX, REG_SIZE_16}, {"bx", BX, REG_SIZE_16},
-    {"sp", SP, REG_SIZE_16}, {"bp", BP, REG_SIZE_16},
-    {"si", SI, REG_SIZE_16}, {"di", DI, REG_SIZE_16},
-    {"r8w", R8W, REG_SIZE_16}, {"r9w", R9W, REG_SIZE_16},
-    {"r10w", R10W, REG_SIZE_16}, {"r11w", R11W, REG_SIZE_16},
-    {"r12w", R12W, REG_SIZE_16}, {"r13w", R13W, REG_SIZE_16},
-    {"r14w", R14W, REG_SIZE_16}, {"r15w", R15W, REG_SIZE_16},
-    /* 8-bit low registers */
-    {"al", AL, REG_SIZE_8}, {"cl", CL, REG_SIZE_8},
-    {"dl", DL, REG_SIZE_8}, {"bl", BL, REG_SIZE_8},
-    {"spl", SPL, REG_SIZE_8}, {"bpl", BPL, REG_SIZE_8},
-    {"sil", SIL, REG_SIZE_8}, {"dil", DIL, REG_SIZE_8},
-    {"r8b", R8B, REG_SIZE_8}, {"r9b", R9B, REG_SIZE_8},
-    {"r10b", R10B, REG_SIZE_8}, {"r11b", R11B, REG_SIZE_8},
-    {"r12b", R12B, REG_SIZE_8}, {"r13b", R13B, REG_SIZE_8},
-    {"r14b", R14B, REG_SIZE_8}, {"r15b", R15B, REG_SIZE_8},
-    /* 8-bit high registers */
-    {"ah", AH, REG_SIZE_8H}, {"ch", CH, REG_SIZE_8H},
-    {"dh", DH, REG_SIZE_8H}, {"bh", BH, REG_SIZE_8H},
-    /* Special registers */
-    {"rip", RIP, REG_SIZE_64},
-    /* XMM registers */
-    {"xmm0", XMM0, REG_SIZE_XMM}, {"xmm1", XMM1, REG_SIZE_XMM},
-    {"xmm2", XMM2, REG_SIZE_XMM}, {"xmm3", XMM3, REG_SIZE_XMM},
-    {"xmm4", XMM4, REG_SIZE_XMM}, {"xmm5", XMM5, REG_SIZE_XMM},
-    {"xmm6", XMM6, REG_SIZE_XMM}, {"xmm7", XMM7, REG_SIZE_XMM},
-    {"xmm8", XMM8, REG_SIZE_XMM}, {"xmm9", XMM9, REG_SIZE_XMM},
-    {"xmm10", XMM10, REG_SIZE_XMM}, {"xmm11", XMM11, REG_SIZE_XMM},
-    {"xmm12", XMM12, REG_SIZE_XMM}, {"xmm13", XMM13, REG_SIZE_XMM},
-    {"xmm14", XMM14, REG_SIZE_XMM}, {"xmm15", XMM15, REG_SIZE_XMM},
-    {NULL, REG_NONE, REG_SIZE_64}
-};
-
-reg_t parse_register(const char *name, reg_size_t *size) {
-    for (int i = 0; reg_table[i].name != NULL; i++) {
-        if (strcasecmp(name, reg_table[i].name) == 0) {
-            if (size) *size = reg_table[i].size;
-            return reg_table[i].reg;
-        }
-    }
-    if (size) *size = REG_SIZE_64;
-    return REG_NONE;
-}
-
-const char *register_name(reg_t reg, reg_size_t size) {
-    for (int i = 0; reg_table[i].name != NULL; i++) {
-        if (reg_table[i].reg == reg && reg_table[i].size == size) {
-            return reg_table[i].name;
-        }
-    }
-    return "???";
-}
-
-int get_reg_size_bytes(reg_size_t size) {
-    switch (size) {
-        case REG_SIZE_8:
-        case REG_SIZE_8H:
-            return 1;
-        case REG_SIZE_16:
-            return 2;
-        case REG_SIZE_32:
-            return 4;
-        case REG_SIZE_64:
-            return 8;
-        case REG_SIZE_XMM:
-            return 16;
-        default:
-            return 8;
-    }
-}
-
-/* ============================================================================
- * OUTPUT BUFFER OPERATIONS
- * ============================================================================ */
-
-int emit_byte(assembler_context_t *ctx, uint8_t byte) {
-    if (ctx->current_section == 1) {
-        /* Write to data section */
-        if (ctx->data_size >= ctx->data_capacity) {
-            fprintf(stderr, "Error: Data section overflow\n");
-            return -1;
-        }
-        ctx->data_section[ctx->data_size++] = byte;
-        ctx->current_address++;
-        return 0;
-    }
-    /* Write to text section */
-    if (ctx->text_size >= ctx->text_capacity) {
-        fprintf(stderr, "Error: Text section overflow\n");
-        return -1;
-    }
-    ctx->text_section[ctx->text_size++] = byte;
-    ctx->current_address++;
-    return 0;
-}
-
-int emit_bytes(assembler_context_t *ctx, const uint8_t *bytes, size_t count) {
-    for (size_t i = 0; i < count; i++) {
-        if (emit_byte(ctx, bytes[i]) < 0) return -1;
-    }
-    return 0;
-}
-
-int emit_word(assembler_context_t *ctx, uint16_t word) {
-    uint8_t bytes[2] = { word & 0xFF, (word >> 8) & 0xFF };
-    return emit_bytes(ctx, bytes, 2);
-}
-
-int emit_dword(assembler_context_t *ctx, uint32_t dword) {
-    uint8_t bytes[4] = {
-        dword & 0xFF,
-        (dword >> 8) & 0xFF,
-        (dword >> 16) & 0xFF,
-        (dword >> 24) & 0xFF
-    };
-    return emit_bytes(ctx, bytes, 4);
-}
-
-int emit_qword(assembler_context_t *ctx, uint64_t qword) {
-    uint8_t bytes[8];
-    for (int i = 0; i < 8; i++) {
-        bytes[i] = (qword >> (i * 8)) & 0xFF;
-    }
-    return emit_bytes(ctx, bytes, 8);
-}
-
-int emit_le16(assembler_context_t *ctx, int16_t val) {
-    return emit_word(ctx, (uint16_t)val);
-}
-
-int emit_le32(assembler_context_t *ctx, int32_t val) {
-    return emit_dword(ctx, (uint32_t)val);
-}
-
-int emit_le64(assembler_context_t *ctx, int64_t val) {
-    return emit_qword(ctx, (uint64_t)val);
-}
-
-/* ============================================================================
- * REX PREFIX
- * ============================================================================ */
-
-/* Check if an operand is a high 8-bit register (AH, BH, CH, DH) */
+/* Check if an operand is a high 8-bit register (AH, BH, CH, DH). */
 static int is_high_8bit_reg(const operand_t *op) {
     return op && op->type == OPERAND_REG && op->reg_size == REG_SIZE_8H;
 }
 
-/* Check if an operand requires REX prefix (R8-R15, SPL/BPL/SIL/DIL) */
-static int operand_needs_rex(const operand_t *op) {
-    if (!op) return 0;
-    if (op->type == OPERAND_REG) {
-        if (op->reg >= 8) return 1;
-        if (op->reg_size == REG_SIZE_8 && op->reg >= 4) return 1;
-        /* REG_SIZE_8H (AH/BH/CH/DH) does NOT need REX */
-    } else if (op->type == OPERAND_MEM) {
-        if (op->mem.base >= 8) return 1;
-        if (op->mem.has_index && op->mem.index >= 8) return 1;
-    }
-    return 0;
-}
-
-/* Check for invalid combination: high 8-bit reg with REX-requiring operand */
+/* Check for invalid combination: high 8-bit reg with any REX-requiring operand. */
 static int check_rex_conflict(const parsed_instruction_t *inst, int op1_idx, int op2_idx) {
     const operand_t *op1 = (op1_idx >= 0 && op1_idx < inst->operand_count) ? &inst->operands[op1_idx] : NULL;
     const operand_t *op2 = (op2_idx >= 0 && op2_idx < inst->operand_count) ? &inst->operands[op2_idx] : NULL;
-    
+
     int has_high_8bit = is_high_8bit_reg(op1) || is_high_8bit_reg(op2);
-    int needs_rex = operand_needs_rex(op1) || operand_needs_rex(op2);
-    
-    return has_high_8bit && needs_rex;
-}
-
-int needs_rex(const operand_t *op) {
-    if (op->type == OPERAND_REG) {
-        /* REX needed for R8-R15, SPL/BPL/SIL/DIL (low 8-bit regs 4-7) */
-        /* AH/BH/CH/DH (REG_SIZE_8H) do NOT use REX - they use legacy encoding */
-        if (op->reg >= 8) return 1;
-        if (op->reg_size == REG_SIZE_8 && op->reg >= 4) return 1;
-        /* Note: REG_SIZE_8H (AH/BH/CH/DH) return 0 - no REX needed */
-    } else if (op->type == OPERAND_MEM) {
-        if (op->mem.base >= 8 || op->mem.index >= 8) return 1;
-    }
-    return 0;
-}
-
-uint8_t make_rex(bool w, bool r, bool x, bool b) {
-    return 0x40 | (w ? 0x08 : 0) | (r ? 0x04 : 0) | (x ? 0x02 : 0) | (b ? 0x01 : 0);
-}
-
-int emit_rex(assembler_context_t *ctx, bool w, const operand_t *reg_op,
-                    const operand_t *rm_op, const operand_t *sib_index_op) {
-    bool r = false, x = false, b = false;
-
-    if (reg_op && reg_op->type == OPERAND_REG && reg_op->reg >= 8) {
-        r = true;
-    }
-
-    if (sib_index_op && sib_index_op->type == OPERAND_REG && sib_index_op->reg >= 8) {
-        x = true;
-    }
-
-    if (rm_op) {
-        if (rm_op->type == OPERAND_REG && rm_op->reg >= 8) {
-            b = true;
-        } else if (rm_op->type == OPERAND_MEM) {
-            if (rm_op->mem.has_base && rm_op->mem.base >= 8) b = true;
-            if (rm_op->mem.has_index && rm_op->mem.index >= 8) x = true;
-        }
-    }
-
-    uint8_t rex = make_rex(w, r, x, b);
-
-    /* Don't emit REX if not needed, unless we need 64-bit operand size */
-    if (!w && !r && !x && !b) return 0;
-
-    return emit_byte(ctx, rex);
-}
-
-/* ============================================================================
- * MODR/M AND SIB ENCODING
- * ============================================================================ */
-
-uint8_t make_modrm(uint8_t mod, uint8_t reg, uint8_t rm) {
-    return ((mod & 3) << 6) | ((reg & 7) << 3) | (rm & 7);
-}
-
-uint8_t make_sib(uint8_t scale, uint8_t index, uint8_t base) {
-    uint8_t scale_bits = (scale == 8) ? 3 : (scale == 4) ? 2 : (scale == 2) ? 1 : 0;
-    return (scale_bits << 6) | ((index & 7) << 3) | (base & 7);
-}
-
-/* Check if displacement fits in signed 8-bit */
-static int fits_in_int8(int32_t val) {
-    return val >= -128 && val <= 127;
-}
-
-/* Forward declaration for add_fixup */
-extern int add_fixup(assembler_context_t *ctx, const char *label, uint64_t location,
-                     int size, instruction_type_t inst_type);
-extern int add_fixup_rip_relative(assembler_context_t *ctx, const char *label,
-                                   uint64_t location, int section);
-
-int emit_modrm_sib(assembler_context_t *ctx, uint8_t reg_opcode,
-                   const operand_t *operand, reg_size_t size) {
-    (void)size;
-
-    if (operand->type == OPERAND_REG) {
-        /* Register direct: mod=3, rm=reg */
-        uint8_t modrm = make_modrm(3, reg_opcode, operand->reg & 7);
-        return emit_byte(ctx, modrm);
-    }
-
-    if (operand->type != OPERAND_MEM) {
-        fprintf(stderr, "Error: Expected memory operand\n");
-        return -1;
-    }
-
-    const mem_operand_t *mem = &operand->mem;
-
-    if (mem->has_index && !(mem->scale == 1 || mem->scale == 2 || mem->scale == 4 || mem->scale == 8)) {
-        fprintf(stderr, "Error: Invalid scale factor %d (expected 1, 2, 4, or 8)\n", mem->scale);
-        return -1;
-    }
-
-    if (mem->is_rip_relative && (mem->has_index || mem->has_base)) {
-        fprintf(stderr, "Error: RIP-relative addressing cannot combine base/index registers\n");
-        return -1;
-    }
-
-    /* RIP-relative addressing: mod=00, r/m=101 with 32-bit displacement */
-    if (mem->is_rip_relative) {
-        /* RIP-relative: [RIP + disp32] - mod=00, r/m=101 */
-        uint8_t modrm = make_modrm(0, reg_opcode, 5); /* 5 = RIP-relative indicator */
-        if (emit_byte(ctx, modrm) < 0) return -1;
-        
-        /* Emit displacement - either immediate value or add fixup for label */
-        if (mem->label[0] != '\0') {
-            /* Label reference - add fixup for RIP-relative addressing */
-            if (add_fixup_rip_relative(ctx, mem->label, ctx->current_address, ctx->current_section) < 0) {
-                return -1;
-            }
-            /* Emit placeholder (0) for now */
-            if (emit_le32(ctx, 0) < 0) return -1;
-        } else {
-            /* Just a displacement */
-            if (emit_le32(ctx, mem->displacement) < 0) return -1;
-        }
-        return 0;
-    }
-
-    /* Simple [base] or [base+disp] addressing */
-    if (!mem->has_index) {
-        uint8_t base_reg = mem->has_base ? (mem->base & 7) : 5; /* 5 = disp32 only */
-
-        if (!mem->has_displacement && mem->has_base && base_reg != 4 && base_reg != 5) {
-            /* [base] - mod=0, no displacement (except RBP which needs disp8=0) */
-            uint8_t modrm = make_modrm(0, reg_opcode, base_reg);
-            if (emit_byte(ctx, modrm) < 0) return -1;
-        } else if (!mem->has_displacement && mem->has_base && base_reg == 5) {
-            /* [RBP] requires disp8=0 */
-            uint8_t modrm = make_modrm(1, reg_opcode, 5);
-            if (emit_byte(ctx, modrm) < 0) return -1;
-            if (emit_byte(ctx, 0) < 0) return -1;
-        } else if (mem->has_displacement && fits_in_int8(mem->displacement)) {
-            /* [base+disp8] */
-            uint8_t modrm = make_modrm(1, reg_opcode, base_reg);
-            if (emit_byte(ctx, modrm) < 0) return -1;
-            if (base_reg == 4) {
-                /* Need SIB byte for RSP/R12 */
-                uint8_t sib = make_sib(1, 4, base_reg);
-                if (emit_byte(ctx, sib) < 0) return -1;
-            }
-            if (emit_byte(ctx, (uint8_t)(int8_t)mem->displacement) < 0) return -1;
-        } else {
-            /* [base+disp32] or [disp32] */
-            uint8_t modrm = make_modrm(mem->has_base ? 2 : 0, reg_opcode, base_reg);
-            if (emit_byte(ctx, modrm) < 0) return -1;
-            if (base_reg == 4 && mem->has_base) {
-                /* Need SIB byte for RSP/R12 */
-                uint8_t sib = make_sib(1, 4, base_reg);
-                if (emit_byte(ctx, sib) < 0) return -1;
-            }
-            if (emit_le32(ctx, mem->displacement) < 0) return -1;
-        }
-    } else {
-        /* [base + index*scale + disp] - requires SIB */
-        uint8_t base_reg = mem->has_base ? (mem->base & 7) : 5;
-        uint8_t index_reg = mem->index & 7;
-
-        /* Special case: RBP/R13 as base with mod=0 needs disp8=0 */
-        bool need_sib_disp = (!mem->has_base || base_reg == 5) && mem->displacement == 0;
-
-        if (mem->has_displacement && fits_in_int8(mem->displacement) && !need_sib_disp) {
-            /* disp8 */
-            uint8_t modrm = make_modrm(1, reg_opcode, 4); /* 4 = SIB follows */
-            uint8_t sib = make_sib(mem->scale, index_reg, base_reg);
-            if (emit_byte(ctx, modrm) < 0) return -1;
-            if (emit_byte(ctx, sib) < 0) return -1;
-            if (emit_byte(ctx, (uint8_t)(int8_t)mem->displacement) < 0) return -1;
-        } else {
-            /* disp32 or no base */
-            uint8_t mod = (mem->has_displacement || !mem->has_base) ? 2 : 0;
-            uint8_t modrm = make_modrm(mod, reg_opcode, 4); /* 4 = SIB follows */
-            uint8_t sib = make_sib(mem->scale, index_reg, base_reg);
-            if (emit_byte(ctx, modrm) < 0) return -1;
-            if (emit_byte(ctx, sib) < 0) return -1;
-            if (mod != 0 || !mem->has_base) {
-                if (emit_le32(ctx, mem->displacement) < 0) return -1;
-            }
-        }
-    }
-
-    return 0;
+    int rex_required = (op1 && needs_rex(op1)) || (op2 && needs_rex(op2));
+    return has_high_8bit && rex_required;
 }
 
 /* ============================================================================
@@ -425,7 +57,9 @@ int emit_modrm_sib(assembler_context_t *ctx, uint8_t reg_opcode,
 /* MOV instruction encoding */
 int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: mov requires 2 operands at line %d\n", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "mov requires two operands: source and destination",
+                      "mov requires 2 operands");
         return -1;
     }
 
@@ -477,11 +111,19 @@ int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     /* mov reg, imm - MOV r64, imm64 or MOV r32, imm32 or MOV r16, imm16 or MOV r8, imm8 */
     if (dst->type == OPERAND_REG && src->type == OPERAND_IMM) {
         int reg_val = dst->reg & 7;
+        bool fits_u32 = (src->immediate >= 0 && src->immediate <= UINT32_MAX);
 
-        if (is_64bit && (src->immediate < INT32_MIN || src->immediate > INT32_MAX)) {
+        if (is_64bit && fits_u32) {
+            /* Canonical form for many assemblers: B8+rd imm32 (zero-extends into r64). */
+            if (dst->reg >= 8) {
+                if (emit_byte(ctx, make_rex(false, false, false, true)) < 0) return -1;
+            }
+            if (emit_byte(ctx, (uint8_t)(0xB8 + reg_val)) < 0) return -1;
+            if (emit_le32(ctx, (int32_t)(uint32_t)src->immediate) < 0) return -1;
+        } else if (is_64bit && (src->immediate < INT32_MIN || src->immediate > INT32_MAX)) {
             /* MOV r64, imm64 - special encoding: REX.W + C7 /0 followed by imm64,
              * but actually the shorter form for certain regs uses B8+rq */
-            uint8_t opcode = 0xB8 + reg_val;
+            uint8_t opcode = (uint8_t)(0xB8 + reg_val);
             if (emit_rex(ctx, true, dst, NULL, NULL) < 0) return -1;
             if (emit_byte(ctx, opcode) < 0) return -1;
             if (emit_le64(ctx, src->immediate) < 0) return -1;
@@ -497,7 +139,7 @@ int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
             if (need_rex_prefix) {
                 if (emit_rex(ctx, false, dst, NULL, NULL) < 0) return -1;
             }
-            if (emit_byte(ctx, 0xB8 + reg_val) < 0) return -1;
+            if (emit_byte(ctx, (uint8_t)(0xB8 + reg_val)) < 0) return -1;
             if (emit_le32(ctx, (int32_t)src->immediate) < 0) return -1;
         } else if (size == REG_SIZE_16) {
             /* MOV r16, imm16 - need 0x66 prefix */
@@ -505,16 +147,16 @@ int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
             if (need_rex_prefix) {
                 if (emit_rex(ctx, false, dst, NULL, NULL) < 0) return -1;
             }
-            if (emit_byte(ctx, 0xB8 + reg_val) < 0) return -1;
+            if (emit_byte(ctx, (uint8_t)(0xB8 + reg_val)) < 0) return -1;
             if (emit_le16(ctx, (int16_t)src->immediate) < 0) return -1;
         } else {
             /* MOV r8, imm8 */
             if (dst->reg_size == REG_SIZE_8H) {
                 /* AH, BH, CH, DH - no REX allowed */
-                if (emit_byte(ctx, 0xB0 + reg_val) < 0) return -1;
+                if (emit_byte(ctx, (uint8_t)(0xB0 + reg_val)) < 0) return -1;
             } else {
                 if (emit_rex(ctx, false, dst, NULL, NULL) < 0) return -1;
-                if (emit_byte(ctx, 0xB0 + reg_val) < 0) return -1;
+                if (emit_byte(ctx, (uint8_t)(0xB0 + reg_val)) < 0) return -1;
             }
             if (emit_byte(ctx, (uint8_t)src->immediate) < 0) return -1;
         }
@@ -571,15 +213,19 @@ int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
         return 0;
     }
 
-    fprintf(stderr, "Error: Unsupported mov operand combination at line %d\n", inst->line_number);
+    encoder_diagf(inst->line_number, "Encoding",
+                  "Supported forms: mov reg, reg | mov reg, imm | mov reg, mem | mov mem, reg | mov mem, imm",
+                  "Unsupported mov operand combination");
     return -1;
 }
 
 /* PUSH/POP encoding */
 int encode_push_pop(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1) {
-        fprintf(stderr, "Error: %s requires 1 operand at line %d\n",
-                inst->type == INST_PUSH ? "push" : "pop", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      inst->type == INST_PUSH ? "push requires one operand: register, memory, or immediate"
+                                              : "pop requires one operand: register or memory",
+                      "%s requires 1 operand", inst->type == INST_PUSH ? "push" : "pop");
         return -1;
     }
 
@@ -596,14 +242,16 @@ int encode_push_pop(assembler_context_t *ctx, const parsed_instruction_t *inst) 
         }
 
         /* 50+rq for PUSH, 58+rq for POP */
-        uint8_t opcode = is_push ? (0x50 + reg) : (0x58 + reg);
+        uint8_t opcode = (uint8_t)(is_push ? (0x50 + reg) : (0x58 + reg));
         if (emit_byte(ctx, opcode) < 0) return -1;
         return 0;
     }
 
     if (op->type == OPERAND_IMM) {
         if (!is_push) {
-            fprintf(stderr, "Error: pop with immediate not valid\n");
+            encoder_diagf(inst->line_number, "Encoding",
+                          "pop only accepts register or memory operands, not immediates",
+                          "pop with immediate not valid");
             return -1;
         }
 
@@ -627,14 +275,18 @@ int encode_push_pop(assembler_context_t *ctx, const parsed_instruction_t *inst) 
         return 0;
     }
 
-    fprintf(stderr, "Error: Unsupported push/pop operand at line %d\n", inst->line_number);
+    encoder_diagf(inst->line_number, "Encoding",
+                  "Supported forms: push reg | push mem | push imm | pop reg | pop mem",
+                  "Unsupported push/pop operand");
     return -1;
 }
 
 /* Arithmetic instructions (ADD, SUB, AND, OR, XOR, CMP) */
 int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: Arithmetic instruction requires 2 operands at line %d\n", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Arithmetic instructions require two operands: destination and source",
+                      "Arithmetic instruction requires 2 operands");
         return -1;
     }
 
@@ -661,18 +313,11 @@ int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst
 
     /* Get the reg/opcode field for ModR/M */
     uint8_t reg_opcode;
-    switch (inst->type) {
-        case INST_ADD: reg_opcode = 0; break;
-        case INST_OR:  reg_opcode = 1; break;
-        case INST_ADC: reg_opcode = 2; break;
-        case INST_SBB: reg_opcode = 3; break;
-        case INST_AND: reg_opcode = 4; break;
-        case INST_SUB: reg_opcode = 5; break;
-        case INST_XOR: reg_opcode = 6; break;
-        case INST_CMP: reg_opcode = 7; break;
-        default:
-            fprintf(stderr, "Error: Unknown arithmetic instruction\n");
-            return -1;
+    if (x86_lookup_group1_reg_opcode(inst->type, &reg_opcode) < 0) {
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Supported: add, sub, and, or, xor, cmp, adc, sbb",
+                      "Unknown arithmetic instruction");
+        return -1;
     }
 
     /* ADD/SUB/AND/OR/XOR/CMP reg, imm */
@@ -693,7 +338,7 @@ int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst
             (size != REG_SIZE_64 || fits_signed32)) {
             /* 05 id (ADD), 0D id (OR), 15 id (ADC), 1D id (SBB),
                25 id (AND), 2D id (SUB), 35 id (XOR), 3D id (CMP) */
-            uint8_t opcode = 0x05 + (reg_opcode << 3);
+            uint8_t opcode = (uint8_t)(0x05 + (reg_opcode << 3));
             if (is_64bit && emit_rex(ctx, true, dst, NULL, NULL) < 0) return -1;
             if (emit_byte(ctx, opcode) < 0) return -1;
             if (emit_le32(ctx, imm32) < 0) return -1;
@@ -704,13 +349,13 @@ int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst
          * we need to load it into a register first. This is because all
          * immediate forms sign-extend to 64 bits. */
         if (is_64bit && !fits_signed32) {
-            fprintf(stderr, "Error: 64-bit immediate 0x%llx out of range for %s, "
-                    "use mov reg, imm64 first at line %d\n",
-                    (unsigned long long)imm64,
-                    inst->type == INST_CMP ? "cmp" :
-                    inst->type == INST_ADD ? "add" :
-                    inst->type == INST_SUB ? "sub" : "op",
-                    inst->line_number);
+            encoder_diagf(inst->line_number, "Constraint",
+                          "Load the 64-bit immediate into a register first using 'mov reg, imm64'",
+                          "64-bit immediate 0x%llx out of range for %s, use mov reg, imm64 first",
+                          (unsigned long long)imm64,
+                          inst->type == INST_CMP ? "cmp" :
+                          inst->type == INST_ADD ? "add" :
+                          inst->type == INST_SUB ? "sub" : "op");
             return -1;
         }
 
@@ -735,7 +380,7 @@ int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst
     if (dst->type == OPERAND_REG && src->type == OPERAND_REG) {
         /* dst = dst op src: 01 /r (ADD), 09 /r (OR), 11 /r (ADC), 19 /r (SBB),
                              21 /r (AND), 29 /r (SUB), 31 /r (XOR), 39 /r (CMP) */
-        uint8_t opcode = 0x01 + (reg_opcode << 3);
+        uint8_t opcode = (uint8_t)(0x01 + (reg_opcode << 3));
         if (emit_rex(ctx, is_64bit, src, dst, NULL) < 0) return -1;
         if (emit_byte(ctx, opcode) < 0) return -1;
         if (emit_modrm_sib(ctx, src->reg & 7, dst, size) < 0) return -1;
@@ -744,7 +389,7 @@ int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst
 
     /* ADD/SUB/AND/OR/XOR/CMP reg, mem */
     if (dst->type == OPERAND_REG && src->type == OPERAND_MEM) {
-        uint8_t opcode = 0x03 + (reg_opcode << 3); /* 03 /r (ADD), 0B /r (OR), etc */
+        uint8_t opcode = (uint8_t)(0x03 + (reg_opcode << 3)); /* 03 /r (ADD), 0B /r (OR), etc */
         if (emit_rex(ctx, is_64bit, dst, src, NULL) < 0) return -1;
         if (emit_byte(ctx, opcode) < 0) return -1;
         if (emit_modrm_sib(ctx, dst->reg & 7, src, size) < 0) return -1;
@@ -753,7 +398,7 @@ int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst
 
     /* ADD/SUB/AND/OR/XOR/CMP mem, reg */
     if (dst->type == OPERAND_MEM && src->type == OPERAND_REG) {
-        uint8_t opcode = 0x01 + (reg_opcode << 3);
+        uint8_t opcode = (uint8_t)(0x01 + (reg_opcode << 3));
         if (emit_rex(ctx, is_64bit, src, dst, NULL) < 0) return -1;
         if (emit_byte(ctx, opcode) < 0) return -1;
         if (emit_modrm_sib(ctx, src->reg & 7, dst, size) < 0) return -1;
@@ -779,14 +424,18 @@ int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst
         return 0;
     }
 
-    fprintf(stderr, "Error: Unsupported arithmetic operand combination at line %d\n", inst->line_number);
+    encoder_diagf(inst->line_number, "Encoding",
+                  "Supported forms: op reg, imm | op reg, reg | op reg, mem | op mem, reg | op mem, imm",
+                  "Unsupported arithmetic operand combination");
     return -1;
 }
 
 /* INC/DEC/NEG/NOT encoding */
 int encode_unary_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 1) {
-        fprintf(stderr, "Error: Unary instruction requires 1 operand at line %d\n", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "inc, dec, neg, and not require one operand: register or memory",
+                      "Unary instruction requires 1 operand");
         return -1;
     }
 
@@ -804,7 +453,9 @@ int encode_unary_arithmetic(assembler_context_t *ctx, const parsed_instruction_t
         case INST_NOT: reg_opcode = 2; break;
         case INST_NEG: reg_opcode = 3; break;
         default:
-            fprintf(stderr, "Error: Unknown unary instruction\n");
+            encoder_diagf(inst->line_number, "Encoding",
+                          "Supported: inc, dec, not, neg",
+                          "Unknown unary instruction");
             return -1;
     }
 
@@ -825,14 +476,18 @@ int encode_unary_arithmetic(assembler_context_t *ctx, const parsed_instruction_t
         return 0;
     }
 
-    fprintf(stderr, "Error: Unsupported unary operand at line %d\n", inst->line_number);
+    encoder_diagf(inst->line_number, "Encoding",
+                  "Supported forms: inc reg | inc mem | dec reg | dec mem | not reg | not mem | neg reg | neg mem",
+                  "Unsupported unary operand");
     return -1;
 }
 
 /* LEA encoding */
 int encode_lea(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: lea requires 2 operands at line %d\n", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "lea requires two operands: destination register and memory source",
+                      "lea requires 2 operands");
         return -1;
     }
 
@@ -840,13 +495,17 @@ int encode_lea(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     const operand_t *src = &inst->operands[1];
 
     if (dst->type != OPERAND_REG || src->type != OPERAND_MEM) {
-        fprintf(stderr, "Error: lea requires register destination and memory source\n");
+        encoder_diagf(inst->line_number, "Encoding",
+                      "lea requires a register destination and a memory source (e.g., lea rax, [rbx + 8])",
+                      "lea requires register destination and memory source");
         return -1;
     }
 
     reg_size_t size = dst->reg_size;
     if (size == REG_SIZE_8 || size == REG_SIZE_8H) {
-        fprintf(stderr, "Error: lea destination must be 16, 32, or 64-bit register\n");
+        encoder_diagf(inst->line_number, "Encoding",
+                      "lea destination must be 16, 32, or 64-bit register (ax, eax, rax)",
+                      "lea destination must be 16, 32, or 64-bit register");
         return -1;
     }
 
@@ -867,7 +526,9 @@ int encode_lea(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 /* String instruction encoding (movsb, movsw, movsd, movsq) */
 int encode_string(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 0) {
-        fprintf(stderr, "Error: String instruction takes no operands at line %d\n", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "String instructions (movsb, movsw, movsd, movsq) take no operands",
+                      "String instruction takes no operands");
         return -1;
     }
 
@@ -891,7 +552,9 @@ int encode_string(assembler_context_t *ctx, const parsed_instruction_t *inst) {
             if (emit_byte(ctx, 0xA5) < 0) return -1;
             break;
         default:
-            fprintf(stderr, "Error: Unknown string instruction at line %d\n", inst->line_number);
+            encoder_diagf(inst->line_number, "Encoding",
+                          "Supported: movsb, movsw, movsd, movsq",
+                          "Unknown string instruction");
             return -1;
     }
 
@@ -932,13 +595,15 @@ int encode_sse_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
 
     /* Validate XMM register operands use 128-bit register size metadata. */
     if (dst_is_xmm && dst->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE move XMM destination must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE move XMM destination must use xmm register size");
         return -1;
     }
     if (src_is_xmm && src->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE move XMM source must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE move XMM source must use xmm register size");
         return -1;
     }
 
@@ -1049,7 +714,9 @@ int encode_sse_mov(assembler_context_t *ctx, const parsed_instruction_t *inst) {
             break;
 
         default:
-            fprintf(stderr, "Error: Unknown SSE move instruction at line %d\n", inst->line_number);
+            encoder_diagf(inst->line_number, "Encoding",
+                          "Supported: movaps, movups, movss, movapd, movupd, movsd, movdqa, movdqu",
+                          "Unknown SSE move instruction");
             return -1;
     }
 
@@ -1150,8 +817,9 @@ int encode_sse_arith(assembler_context_t *ctx, const parsed_instruction_t *inst)
         return -1;
     }
     if (dst->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE arithmetic destination must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE arithmetic destination must use xmm register size");
         return -1;
     }
 
@@ -1169,8 +837,9 @@ int encode_sse_arith(assembler_context_t *ctx, const parsed_instruction_t *inst)
         return -1;
     }
     if (src_is_xmm && src->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE arithmetic XMM source must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE arithmetic XMM source must use xmm register size");
         return -1;
     }
 
@@ -1206,7 +875,9 @@ int encode_sse_arith(assembler_context_t *ctx, const parsed_instruction_t *inst)
         case INST_DIVPD: need_66_prefix = true; opcode2 = 0x5E; break;
 
         default:
-            fprintf(stderr, "Error: Unknown SSE arithmetic instruction at line %d\n", inst->line_number);
+            encoder_diagf(inst->line_number, "Encoding",
+                          "Supported: addss, addps, addsd, addpd, subss, subps, subsd, subpd, mulss, mulps, mulsd, mulpd, divss, divps, divsd, divpd",
+                          "Unknown SSE arithmetic instruction");
             return -1;
     }
 
@@ -1253,7 +924,9 @@ int encode_sse_arith(assembler_context_t *ctx, const parsed_instruction_t *inst)
  */
 int encode_sse_packed_arith(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: SSE packed arithmetic requires 2 operands at line %d\n", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Use exactly two operands: destination XMM register and source (XMM or memory)",
+                      "SSE packed arithmetic requires 2 operands");
         return -1;
     }
 
@@ -1267,25 +940,29 @@ int encode_sse_packed_arith(assembler_context_t *ctx, const parsed_instruction_t
 
     /* Validate XMM register operands use 128-bit register size metadata */
     if (!dst_is_xmm) {
-        fprintf(stderr, "Error: SSE packed arithmetic destination must be XMM register at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Use an XMM destination register, e.g. paddb xmm0, xmm1.",
+                      "SSE packed arithmetic destination must be XMM register");
         return -1;
     }
     if (dst->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE packed arithmetic XMM destination must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE packed arithmetic XMM destination must use xmm register size");
         return -1;
     }
     if (src_is_xmm && src->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE packed arithmetic XMM source must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE packed arithmetic XMM source must use xmm register size");
         return -1;
     }
 
     /* Validate source is XMM or memory */
     if (!src_is_xmm && !src_is_mem) {
-        fprintf(stderr, "Error: SSE packed arithmetic source must be XMM or memory at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Source must be an XMM register or memory operand",
+                      "SSE packed arithmetic source must be XMM or memory");
         return -1;
     }
 
@@ -1319,7 +996,9 @@ int encode_sse_packed_arith(assembler_context_t *ctx, const parsed_instruction_t
             opcode2 = 0xFB;  /* 66 0F FB /r - PSUBQ xmm1, xmm2/m128 */
             break;
         default:
-            fprintf(stderr, "Error: Unknown SSE packed arithmetic instruction at line %d\n", inst->line_number);
+            encoder_diagf(inst->line_number, "Encoding",
+                          "Supported: paddb, paddw, paddd, paddq, psubb, psubw, psubd, psubq",
+                          "Unknown SSE packed arithmetic instruction");
             return -1;
     }
 
@@ -1360,7 +1039,9 @@ int encode_sse_packed_arith(assembler_context_t *ctx, const parsed_instruction_t
  */
 int encode_sse_packed_cmp(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: SSE packed compare requires 2 operands at line %d\n", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Use exactly two operands: destination XMM register and source (XMM or memory)",
+                      "SSE packed compare requires 2 operands");
         return -1;
     }
 
@@ -1374,25 +1055,29 @@ int encode_sse_packed_cmp(assembler_context_t *ctx, const parsed_instruction_t *
 
     /* Validate XMM register operands use 128-bit register size metadata */
     if (!dst_is_xmm) {
-        fprintf(stderr, "Error: SSE packed compare destination must be XMM register at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Use an XMM destination register, e.g. pcmpeqb xmm0, xmm1.",
+                      "SSE packed compare destination must be XMM register");
         return -1;
     }
     if (dst->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE packed compare XMM destination must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE packed compare XMM destination must use xmm register size");
         return -1;
     }
     if (src_is_xmm && src->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE packed compare XMM source must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE packed compare XMM source must use xmm register size");
         return -1;
     }
 
     /* Validate source is XMM or memory */
     if (!src_is_xmm && !src_is_mem) {
-        fprintf(stderr, "Error: SSE packed compare source must be XMM or memory at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Source must be an XMM register or memory operand",
+                      "SSE packed compare source must be XMM or memory");
         return -1;
     }
 
@@ -1429,7 +1114,9 @@ int encode_sse_packed_cmp(assembler_context_t *ctx, const parsed_instruction_t *
             need_0f38_escape = true;
             break;
         default:
-            fprintf(stderr, "Error: Unknown SSE packed compare instruction at line %d\n", inst->line_number);
+            encoder_diagf(inst->line_number, "Encoding",
+                          "Supported: pcmpeqb, pcmpeqw, pcmpeqd, pcmpeqq, pcmpgtb, pcmpgtw, pcmpgtd, pcmpgtq",
+                          "Unknown SSE packed compare instruction");
             return -1;
     }
 
@@ -1473,7 +1160,9 @@ int encode_sse_packed_cmp(assembler_context_t *ctx, const parsed_instruction_t *
  */
 int encode_sse_packed_logic(assembler_context_t *ctx, const parsed_instruction_t *inst) {
     if (inst->operand_count != 2) {
-        fprintf(stderr, "Error: SSE logical instruction requires 2 operands at line %d\n", inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Use exactly two operands: destination XMM register and source (XMM or memory)",
+                      "SSE logical instruction requires 2 operands");
         return -1;
     }
 
@@ -1487,25 +1176,29 @@ int encode_sse_packed_logic(assembler_context_t *ctx, const parsed_instruction_t
 
     /* Validate XMM register operands use 128-bit register size metadata */
     if (!dst_is_xmm) {
-        fprintf(stderr, "Error: SSE logical instruction destination must be XMM register at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Use an XMM destination register, e.g. pand xmm0, xmm1.",
+                      "SSE logical instruction destination must be XMM register");
         return -1;
     }
     if (dst->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE logical instruction XMM destination must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE logical instruction XMM destination must use xmm register size");
         return -1;
     }
     if (src_is_xmm && src->reg_size != REG_SIZE_XMM) {
-        fprintf(stderr, "Error: SSE logical instruction XMM source must use xmm register size at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "XMM registers must use REG_SIZE_XMM internal size metadata",
+                      "SSE logical instruction XMM source must use xmm register size");
         return -1;
     }
 
     /* Validate source is XMM or memory */
     if (!src_is_xmm && !src_is_mem) {
-        fprintf(stderr, "Error: SSE logical instruction source must be XMM or memory at line %d\n",
-                inst->line_number);
+        encoder_diagf(inst->line_number, "Encoding",
+                      "Source must be an XMM register or memory operand",
+                      "SSE logical instruction source must be XMM or memory");
         return -1;
     }
 
@@ -1527,7 +1220,9 @@ int encode_sse_packed_logic(assembler_context_t *ctx, const parsed_instruction_t
             opcode2 = 0xEF;  /* 66 0F EF /r - PXOR xmm1, xmm2/m128 */
             break;
         default:
-            fprintf(stderr, "Error: Unknown SSE logical instruction at line %d\n", inst->line_number);
+            encoder_diagf(inst->line_number, "Encoding",
+                          "Supported: pand, pandn, por, pxor",
+                          "Unknown SSE logical instruction");
             return -1;
     }
 

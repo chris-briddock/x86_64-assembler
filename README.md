@@ -10,10 +10,13 @@ This project was built to experiment with AI Code Generation and is completley g
 - **ELF64 Output**: Generates standard Linux executables
 - **Modern x86_64 Support**: 64-bit registers, RIP-relative addressing,
     and a practical instruction subset
+- **Disassembler Mode**: Decode ELF64 `.text` with readable Intel-style output
+- **Listing Output**: Emit `.lst` files with address, bytes, source, and symbol appendix
 - **Sections**: Support for `.text`, `.data`, `.bss`, and `.rodata` sections
 - **Labels & Symbols**: Full label support with forward/backward references
 - **Memory Operands**: Direct, indirect, and displaced addressing modes
 - **Parser Diagnostics**: Contextual parse errors with source line and caret position
+- **Performance Instrumentation**: Parser profiling hooks and reproducible benchmark target
 - **Minimal Dependencies**: Only requires GCC/Clang and standard C library
 
 ## Supported Instructions
@@ -78,6 +81,19 @@ chmod +x hello
 ./hello
 ```
 
+### Disassemble Mode
+
+```bash
+./bin/x86_64-asm --disassemble ./bin/x86_64-asm
+```
+
+### Listing Output
+
+```bash
+./bin/x86_64-asm examples/hello.asm -o hello.out -l
+cat hello.out.lst
+```
+
 ## Assembly Syntax
 
 ### Basic Program Structure
@@ -122,8 +138,33 @@ _start:
 
 ```bash
 make test-unit        # Run encoder and parser unit tests
+make test-disassembler # Run disassembler unit tests
 make test-integration # Run integration tests
-make test            # Run legacy example tests
+make test            # Run NASM parity gate + legacy example tests (excludes stress fixtures)
+make test-stress     # Assemble stress fixtures and verify non-empty output
+make profile-stress  # Generate stress timing/output metrics report
+make compare-nasm    # Compare curated compatibility fixtures against NASM bytes
+make compare-nasm-gate # Fail unless NASM comparison report has zero mismatches
+make compile-commands # Generate compile_commands.json via bear (for Sonar C/C++ analysis)
+make static-analyze  # Run GCC -fanalyzer conformance pass
+make ci              # Aggregate quality gate (parity + unit + disassembler + integration + stress)
+```
+
+For SonarQube for IDE in VS Code (extension `sonarsource.sonarlint-vscode`),
+run `make compile-commands` so C/C++ analysis can resolve translation units.
+The helper uses `bear` when available, and falls back to deriving compile
+commands from `make -n` output when `bear` is not installed.
+
+Production gate command:
+
+```bash
+make ci
+```
+
+Full Phase 3 quality gate:
+
+```bash
+make test-parser && make test-encoder && make test-disassembler && make test-integration
 ```
 
 `make test-unit` now prints individual suite summaries and a final combined summary
@@ -131,18 +172,66 @@ make test            # Run legacy example tests
 
 ### Test Coverage
 
-- **Encoder Tests** (50 tests): Encoding verification including SSE scalar, packed integer, and packed comparison edge-cases
-- **Parser Tests** (28 tests): Syntax parsing and parser-side SSE form validation
-- **Integration Tests** (18 tests): End-to-end assembly pipeline including SSE/debug/include paths
+- **Encoder Tests** (140 tests): Encoding verification across integer, control-flow, SSE scalar/packed, diagnostics, and addressing matrices
+- **Parser Tests** (83 tests): Syntax, macro/preprocessor, diagnostics, section/data directives, and SSE form validation
+- **Disassembler Tests** (16 tests): Core decode families and targeted regression fixtures
+- **Integration Tests** (61 tests): End-to-end assemble/disassemble/listing/debug/reference validation paths, including stress fixture compile checks
+
+Stress fixtures (Phase 4 kickoff):
+
+- `examples/stress_100_functions.asm`
+- `examples/stress_1000_labels.asm`
+- `examples/stress_50kb_mixed.asm` (~81 KB source)
+- `examples/stress_macro_nested.asm`
+- `examples/stress_sse_broad.asm`
+- `examples/stress_addressing_matrix.asm`
+
+Reference comparison fixtures (Phase 4 WS3 kickoff):
+
+- `examples/reference_nasm_arith.asm`
+- `examples/reference_nasm_bitops.asm`
+- `examples/reference_nasm_controlflow.asm`
+- `examples/reference_nasm_data.asm`
+- `examples/reference_nasm_logic.asm`
+- `examples/reference_nasm_memory.asm`
+- `examples/reference_nasm_shifts.asm`
+- `examples/reference_nasm_sse.asm`
+- `examples/reference_nasm_high_regs.asm`
+- `examples/reference_nasm_stack.asm`
 
 ## Documentation
 
 - [Assembly Reference](docs/ASSEMBLY_REFERENCE.md)
 - [DWARF Support](docs/DWARF_SUPPORT.md)
 - [SSE Coverage Matrix](docs/SSE_COVERAGE_MATRIX.md)
+- [Listing Format](docs/LISTING_FORMAT.md)
+- [Disassembler Design](docs/DISASSEMBLER_DESIGN.md)
+- [Parser Profiling Report](docs/PARSER_PROFILING.md)
+- [Stress Metrics Report](docs/STRESS_METRICS.md)
+- [NASM Comparison Report](docs/NASM_COMPARISON_REPORT.md)
+- [Release Checklist](docs/RELEASE_CHECKLIST.md)
 - [Examples Walkthrough](docs/EXAMPLES_WALKTHROUGH.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Parser Diagnostics](docs/PARSER_DIAGNOSTICS.md)
+- [Changelog](CHANGELOG.md)
+
+## Phase 3 Completion Snapshot (2026-04-07)
+
+- Listing feature is complete with integration validation.
+- Disassembler mode is complete with semantic cross-check fixtures against `objdump`.
+- Parser performance optimization is complete with reproducible profiling.
+
+Final gate rerun:
+
+- `make test-parser`: 83/83 pass
+- `make test-encoder`: 140/140 pass
+- `make test-disassembler`: 16/16 pass
+- `make test-integration`: 61/61 pass
+
+Performance snapshot (`make profile-parser`):
+
+- Average parse time: ~158.540 ms on ~15k-line synthetic input (5 runs)
+- Symbol lookup benchmark: 63.71x speedup (hash lookup vs linear scan)
 
 ## Project Structure
 
@@ -154,7 +243,7 @@ make test            # Run legacy example tests
 ├── src/              # Source code
 │   ├── asm.c         # Main entry point
 │   ├── x86_64_asm.c  # Core assembler logic
-│   ├── x86_64_asm.h  # Header file
+│   ├── include/x86_64_asm/x86_64_asm.h  # Public header file
 │   ├── x86_64_encoder.c    # Instruction encoding
 │   ├── x86_64_parser.c     # Assembly parser
 │   └── x86_64_controlflow.c # Control flow instructions

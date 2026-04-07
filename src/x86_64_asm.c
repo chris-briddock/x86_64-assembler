@@ -7,8 +7,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <assert.h>
+#include <stdarg.h>
 
 /* External functions */
 extern parsed_instruction_t *parse_source(const char *source, int *count);
@@ -51,9 +53,9 @@ extern int encode_bit_scan(assembler_context_t *ctx, const parsed_instruction_t 
 
 extern int emit_byte(assembler_context_t *ctx, uint8_t byte);
 
-int add_symbol(assembler_context_t *ctx, const char *name, uint64_t address,
-               bool is_global, bool is_external, int section);
-int find_symbol_address(assembler_context_t *ctx, const char *name, uint64_t *addr);
+static int add_symbol(assembler_context_t *ctx, const char *name, uint64_t address,
+                      bool is_global, bool is_external, int section);
+static int find_symbol_address(assembler_context_t *ctx, const char *name, uint64_t *addr);
 
 static bool section_name_matches(const char *section_name, const char *base_name) {
     const char *name = section_name;
@@ -133,6 +135,25 @@ static void copy_bounded_text(char *dst, size_t dst_size, const char *src) {
     dst[n] = '\0';
 }
 
+static void asm_clear_last_error(assembler_context_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->last_error[0] = '\0';
+}
+
+static void asm_set_last_errorf(assembler_context_t *ctx, const char *fmt, ...) {
+    va_list args;
+
+    if (!ctx || !fmt) {
+        return;
+    }
+
+    va_start(args, fmt);
+    (void)vsnprintf(ctx->last_error, sizeof(ctx->last_error), fmt, args);
+    va_end(args);
+}
+
 typedef struct {
     int scope_id;
     char local_name[MAX_LABEL_LENGTH];
@@ -182,8 +203,7 @@ static int lookup_local_alias(local_label_alias_t *aliases, int alias_count,
     for (int i = 0; i < alias_count; i++) {
         if (aliases[i].scope_id == scope_id &&
             strcmp(aliases[i].local_name, local_name) == 0) {
-            strncpy(out, aliases[i].scoped_name, out_size - 1);
-            out[out_size - 1] = '\0';
+            copy_bounded_text(out, out_size, aliases[i].scoped_name);
             return 0;
         }
     }
@@ -199,23 +219,26 @@ static int get_or_create_local_alias(local_label_alias_t *aliases, int *alias_co
     }
 
     if (*alias_count >= MAX_SYMBOLS) {
-        fprintf(stderr, "Error: Too many local label aliases\n");
+        fprintf(stderr,
+                "Error at line 1, column 1: [Symbol] Too many local label aliases\n"
+                "Suggestion: Reduce local-label fanout or split code into smaller blocks.\n");
         return -1;
     }
 
     local_label_alias_t *entry = &aliases[*alias_count];
     entry->scope_id = scope_id;
-    strncpy(entry->local_name, local_name, sizeof(entry->local_name) - 1);
-    entry->local_name[sizeof(entry->local_name) - 1] = '\0';
+    copy_bounded_text(entry->local_name, sizeof(entry->local_name), local_name);
 
     if (build_scoped_local_label(entry->scoped_name, sizeof(entry->scoped_name),
                                  scope_id, local_name) < 0) {
-        fprintf(stderr, "Error: Local label name too long: '%s'\n", local_name);
+        fprintf(stderr,
+            "Error at line 1, column 1: [Symbol] Local label name too long: '%s'\n"
+            "Suggestion: Shorten the label name so its canonicalized form fits internal limits.\n",
+            local_name);
         return -1;
     }
 
-    strncpy(out, entry->scoped_name, out_size - 1);
-    out[out_size - 1] = '\0';
+    copy_bounded_text(out, out_size, entry->scoped_name);
 
     (*alias_count)++;
     return 0;
@@ -245,12 +268,82 @@ static int lookup_anonymous_ref(const anonymous_label_def_t *defs, int def_count
         return -1;
     }
 
-    strncpy(out, defs[chosen].scoped_name, out_size - 1);
-    out[out_size - 1] = '\0';
+    copy_bounded_text(out, out_size, defs[chosen].scoped_name);
     return 0;
 }
 
-static int normalize_label_reference(char *label,
+static int min3_int(int a, int b, int c) {
+    int m = a < b ? a : b;
+    return m < c ? m : c;
+}
+
+static int symbol_name_distance(const char *lhs, const char *rhs) {
+    size_t lhs_len = strlen(lhs);
+    size_t rhs_len = strlen(rhs);
+
+    if (lhs_len > 63 || rhs_len > 63) {
+        return 999;
+    }
+
+    int prev[64];
+    int curr[64];
+
+    for (size_t j = 0; j <= rhs_len; j++) {
+        prev[j] = (int)j;
+    }
+
+    for (size_t i = 1; i <= lhs_len; i++) {
+        curr[0] = (int)i;
+        char lc = (char)tolower((unsigned char)lhs[i - 1]);
+        for (size_t j = 1; j <= rhs_len; j++) {
+            char rc = (char)tolower((unsigned char)rhs[j - 1]);
+            int cost = (lc == rc) ? 0 : 1;
+            curr[j] = min3_int(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+        }
+        for (size_t j = 0; j <= rhs_len; j++) {
+            prev[j] = curr[j];
+        }
+    }
+
+    return prev[rhs_len];
+}
+
+static const char *find_closest_symbol_name(const assembler_context_t *ctx,
+                                            const char *name,
+                                            int *out_distance) {
+    const char *best = NULL;
+    int best_dist = 999;
+
+    if (!ctx || !name || name[0] == '\0') {
+        if (out_distance) *out_distance = best_dist;
+        return NULL;
+    }
+
+    for (int i = 0; i < ctx->symbol_count; i++) {
+        const char *candidate = ctx->symbols[i].name;
+        if (!candidate || candidate[0] == '\0') {
+            continue;
+        }
+        /* Hide internal canonicalized symbols from suggestions. */
+        if (strncmp(candidate, "__", 2) == 0) {
+            continue;
+        }
+
+        int dist = symbol_name_distance(name, candidate);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = candidate;
+        }
+    }
+
+    if (out_distance) {
+        *out_distance = best_dist;
+    }
+    return best;
+}
+
+static int normalize_label_reference(assembler_context_t *ctx,
+                                     char *label,
                                      int scope_id,
                                      int instruction_index,
                                      local_label_alias_t *local_aliases,
@@ -270,37 +363,40 @@ static int normalize_label_reference(char *label,
                                       replacement, sizeof(replacement)) < 0) {
             return -1;
         }
-        strncpy(label, replacement, MAX_LABEL_LENGTH - 1);
-        label[MAX_LABEL_LENGTH - 1] = '\0';
+        copy_bounded_text(label, MAX_LABEL_LENGTH, replacement);
         return 0;
     }
 
     if (is_anonymous_forward_ref(label)) {
         if (lookup_anonymous_ref(anon_defs, anon_def_count, instruction_index,
                                  true, replacement, sizeof(replacement)) < 0) {
-            fprintf(stderr, "Error at line %d: @F has no matching forward @@ label\n", source_line);
+            asm_set_last_errorf(ctx,
+                                "Error at line %d, column 1: [Symbol] @F has no matching forward @@ label\n"
+                                "Suggestion: Define a forward @@ label after this reference or use a named label.",
+                                source_line);
             return -1;
         }
-        strncpy(label, replacement, MAX_LABEL_LENGTH - 1);
-        label[MAX_LABEL_LENGTH - 1] = '\0';
+        copy_bounded_text(label, MAX_LABEL_LENGTH, replacement);
         return 0;
     }
 
     if (is_anonymous_backward_ref(label)) {
         if (lookup_anonymous_ref(anon_defs, anon_def_count, instruction_index,
                                  false, replacement, sizeof(replacement)) < 0) {
-            fprintf(stderr, "Error at line %d: @B has no matching backward @@ label\n", source_line);
+            asm_set_last_errorf(ctx,
+                                "Error at line %d, column 1: [Symbol] @B has no matching backward @@ label\n"
+                                "Suggestion: Define an @@ label before this reference or use a named label.",
+                                source_line);
             return -1;
         }
-        strncpy(label, replacement, MAX_LABEL_LENGTH - 1);
-        label[MAX_LABEL_LENGTH - 1] = '\0';
+        copy_bounded_text(label, MAX_LABEL_LENGTH, replacement);
         return 0;
     }
 
     return 0;
 }
 
-static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
+static int canonicalize_symbol_labels(assembler_context_t *ctx, parsed_instruction_t *insts, int count) {
     local_label_alias_t local_aliases[MAX_SYMBOLS];
     anonymous_label_def_t anon_defs[MAX_SYMBOLS];
     int local_alias_count = 0;
@@ -324,13 +420,19 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             int written;
 
             if (anon_def_count >= MAX_SYMBOLS) {
-                fprintf(stderr, "Error: Too many anonymous labels\n");
+                asm_set_last_errorf(ctx,
+                                    "Error at line %d, column 1: [Symbol] Too many anonymous labels\n"
+                                    "Suggestion: Reduce @@ label density or split the file into multiple sections.",
+                                    inst->line_number);
                 return -1;
             }
 
             written = snprintf(scoped_name, sizeof(scoped_name), "__anon_%d", anonymous_counter++);
             if (written < 0 || (size_t)written >= sizeof(scoped_name)) {
-                fprintf(stderr, "Error: Anonymous label name overflow\n");
+                asm_set_last_errorf(ctx,
+                                    "Error at line %d, column 1: [Internal] Anonymous label name overflow\n"
+                                    "Suggestion: Reduce anonymous label count in this file.",
+                                    inst->line_number);
                 return -1;
             }
 
@@ -350,8 +452,10 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             if (lookup_local_alias(local_aliases, local_alias_count,
                                    scope_id, inst->label,
                                    scoped_name, sizeof(scoped_name)) == 0) {
-                fprintf(stderr, "Error at line %d: Redefined local label '%s' in the same scope\n",
-                        inst->line_number, inst->label);
+                asm_set_last_errorf(ctx,
+                                    "Error at line %d, column 1: [Symbol] Redefined local label '%s' in the same scope\n"
+                                    "Suggestion: Rename one of the local labels or introduce a new global scope label.",
+                                    inst->line_number, inst->label);
                 return -1;
             }
 
@@ -387,7 +491,7 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             operand_t *op = &inst->operands[op_idx];
 
             if (op->type == OPERAND_LABEL) {
-                if (normalize_label_reference(op->label, scope_id, i,
+                if (normalize_label_reference(ctx, op->label, scope_id, i,
                                               local_aliases, &local_alias_count,
                                               anon_defs, anon_def_count,
                                               inst->line_number) < 0) {
@@ -397,13 +501,13 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             }
 
             if (op->type == OPERAND_LABEL_DIFF) {
-                if (normalize_label_reference(op->label, scope_id, i,
+                if (normalize_label_reference(ctx, op->label, scope_id, i,
                                               local_aliases, &local_alias_count,
                                               anon_defs, anon_def_count,
                                               inst->line_number) < 0) {
                     return -1;
                 }
-                if (normalize_label_reference(op->label_rhs, scope_id, i,
+                if (normalize_label_reference(ctx, op->label_rhs, scope_id, i,
                                               local_aliases, &local_alias_count,
                                               anon_defs, anon_def_count,
                                               inst->line_number) < 0) {
@@ -413,7 +517,7 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             }
 
             if (op->type == OPERAND_MEM && op->mem.label[0] != '\0') {
-                if (normalize_label_reference(op->mem.label, scope_id, i,
+                if (normalize_label_reference(ctx, op->mem.label, scope_id, i,
                                               local_aliases, &local_alias_count,
                                               anon_defs, anon_def_count,
                                               inst->line_number) < 0) {
@@ -430,7 +534,10 @@ static int upsert_constant_symbol(assembler_context_t *ctx, const char *name, in
     hash_entry_t *existing = symbol_hash_lookup(ctx, name);
     if (existing) {
         if (existing->is_external) {
-            fprintf(stderr, "Error: Cannot redefine external symbol '%s' as equ constant\n", name);
+            fprintf(stderr,
+                    "Error at line 1, column 1: [Symbol] Cannot redefine external symbol '%s' as equ constant\n"
+                    "Suggestion: Remove extern for this symbol or choose a different equ name.\n",
+                    name);
             return -1;
         }
         if (symbol_hash_update(ctx, name, (uint64_t)value, existing->is_global, false, -1) < 0) {
@@ -467,25 +574,37 @@ static int resolve_equ_symbol_values(assembler_context_t *ctx,
             value = inst->operands[0].immediate;
         } else if (inst->operands[0].type == OPERAND_LABEL) {
             if (find_symbol_address(ctx, inst->operands[0].label, &lhs_addr) < 0) {
-                fprintf(stderr, "Error: Undefined symbol '%s' in equ at line %d\n",
-                        inst->operands[0].label, inst->line_number);
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Symbol] Undefined symbol '%s' in equ\n"
+                        "Suggestion: Define the symbol before use or mark it extern if resolved at link time.\n",
+                        inst->line_number,
+                        inst->operands[0].label);
                 return -1;
             }
             value = (int64_t)lhs_addr;
         } else if (inst->operands[0].type == OPERAND_LABEL_DIFF) {
             if (find_symbol_address(ctx, inst->operands[0].label, &lhs_addr) < 0) {
-                fprintf(stderr, "Error: Undefined symbol '%s' in equ at line %d\n",
-                        inst->operands[0].label, inst->line_number);
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Symbol] Undefined symbol '%s' in equ\n"
+                        "Suggestion: Define the symbol before use or mark it extern if resolved at link time.\n",
+                        inst->line_number,
+                        inst->operands[0].label);
                 return -1;
             }
             if (find_symbol_address(ctx, inst->operands[0].label_rhs, &rhs_addr) < 0) {
-                fprintf(stderr, "Error: Undefined symbol '%s' in equ at line %d\n",
-                        inst->operands[0].label_rhs, inst->line_number);
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Symbol] Undefined symbol '%s' in equ\n"
+                        "Suggestion: Define the symbol before use or mark it extern if resolved at link time.\n",
+                        inst->line_number,
+                        inst->operands[0].label_rhs);
                 return -1;
             }
             value = (int64_t)lhs_addr - (int64_t)rhs_addr;
         } else {
-            fprintf(stderr, "Error: Unsupported equ expression at line %d\n", inst->line_number);
+            fprintf(stderr,
+                    "Error at line %d, column 1: [Directive] Unsupported equ expression\n"
+                    "Suggestion: Use an immediate, a single symbol, or symbol subtraction (a - b).\n",
+                    inst->line_number);
             return -1;
         }
 
@@ -535,8 +654,11 @@ static int apply_symbol_attributes(assembler_context_t *ctx,
     for (int i = 0; i < attr_count; i++) {
         symbol_t *sym = find_symbol_entry(ctx, attrs[i]);
         if (!sym) {
-            fprintf(stderr, "Error: %s references undefined symbol '%s'\n",
-                    directive_name, attrs[i]);
+            fprintf(stderr,
+                "Error at line 1, column 1: [Symbol] %s references undefined symbol '%s'\n"
+                "Suggestion: Declare the symbol label before applying this attribute.\n",
+                directive_name,
+                attrs[i]);
             return -1;
         }
         if (mark_weak) sym->is_weak = true;
@@ -583,7 +705,9 @@ int symbol_hash_insert(assembler_context_t *ctx, const char *name, uint64_t addr
     /* Create new entry */
     hash_entry_t *entry = malloc(sizeof(hash_entry_t));
     if (!entry) {
-        fprintf(stderr, "Error: Out of memory for symbol hash table\n");
+        fprintf(stderr,
+                "Error at line 1, column 1: [Memory] Out of memory for symbol hash table\n"
+                "Suggestion: Retry with a smaller input or increase process memory limits.\n");
         return -1;
     }
     
@@ -642,8 +766,22 @@ assembler_context_t *asm_init(void) {
     ctx->current_section = 0; /* text section */
     ctx->symbol_count = 0;
     ctx->fixup_count = 0;
+    ctx->listing_entries = NULL;
+    ctx->listing_count = 0;
+    ctx->listing_capacity = 0;
+    ctx->listing_active_index = -1;
+    ctx->listing_active = false;
+    ctx->enable_forward_short_branches = true;
+    asm_clear_last_error(ctx);
 
     return ctx;
+}
+
+const char *asm_get_last_error(const assembler_context_t *ctx) {
+    if (!ctx) {
+        return "";
+    }
+    return ctx->last_error;
 }
 
 void asm_free(assembler_context_t *ctx) {
@@ -661,6 +799,7 @@ void asm_free(assembler_context_t *ctx) {
     
     free(ctx->text_section);
     free(ctx->data_section);
+    free(ctx->listing_entries);
     free(ctx->output);
     free(ctx);
 }
@@ -669,10 +808,12 @@ void asm_free(assembler_context_t *ctx) {
  * SYMBOL TABLE
  * ============================================================================ */
 
-int add_symbol(assembler_context_t *ctx, const char *name, uint64_t address,
-               bool is_global, bool is_external, int section) {
+static int add_symbol(assembler_context_t *ctx, const char *name, uint64_t address,
+                      bool is_global, bool is_external, int section) {
     if (ctx->symbol_count >= MAX_SYMBOLS) {
-        fprintf(stderr, "Error: Symbol table full\n");
+        fprintf(stderr,
+                "Error at line 1, column 1: [Symbol] Symbol table full\n"
+                "Suggestion: Reduce symbol count or increase MAX_SYMBOLS.\n");
         return -1;
     }
 
@@ -697,7 +838,10 @@ int add_symbol(assembler_context_t *ctx, const char *name, uint64_t address,
             }
             return 0;
         }
-        fprintf(stderr, "Error: Redefined symbol '%s'\n", name);
+        fprintf(stderr,
+            "Error at line 1, column 1: [Symbol] Redefined symbol '%s'\n"
+            "Suggestion: Rename one definition or remove the duplicate label.\n",
+            name);
         return -1;
     }
 
@@ -725,7 +869,7 @@ int add_symbol(assembler_context_t *ctx, const char *name, uint64_t address,
     return 0;
 }
 
-int find_symbol_address(assembler_context_t *ctx, const char *name, uint64_t *addr) {
+static int find_symbol_address(assembler_context_t *ctx, const char *name, uint64_t *addr) {
     /* Use hash table for O(1) lookup instead of linear search */
     hash_entry_t *entry = symbol_hash_lookup(ctx, name);
     if (entry && entry->is_resolved) {
@@ -752,7 +896,9 @@ hash_entry_t *get_symbol_info(assembler_context_t *ctx, const char *name) {
 int add_fixup(assembler_context_t *ctx, const char *label, uint64_t location,
               int size, instruction_type_t inst_type) {
     if (ctx->fixup_count >= MAX_SYMBOLS) {
-        fprintf(stderr, "Error: Fixup list full\n");
+        fprintf(stderr,
+                "Error at line 1, column 1: [Fixup] Fixup list full\n"
+                "Suggestion: Reduce unresolved references or increase MAX_SYMBOLS.\n");
         return -1;
     }
 
@@ -771,7 +917,9 @@ int add_fixup(assembler_context_t *ctx, const char *label, uint64_t location,
 int add_fixup_rip_relative(assembler_context_t *ctx, const char *label,
                            uint64_t location, int section) {
     if (ctx->fixup_count >= MAX_SYMBOLS) {
-        fprintf(stderr, "Error: Fixup list full\n");
+        fprintf(stderr,
+                "Error at line 1, column 1: [Fixup] Fixup list full\n"
+                "Suggestion: Reduce unresolved references or increase MAX_SYMBOLS.\n");
         return -1;
     }
 
@@ -791,12 +939,26 @@ int resolve_fixups(assembler_context_t *ctx) {
     for (int i = 0; i < ctx->fixup_count; i++) {
         uint64_t target;
         if (find_symbol_address(ctx, ctx->fixups[i].label, &target) < 0) {
-            fprintf(stderr, "Error: Undefined symbol '%s'\n", ctx->fixups[i].label);
+            int dist = 999;
+            const char *closest = find_closest_symbol_name(ctx, ctx->fixups[i].label, &dist);
+            if (closest && dist <= 3) {
+                fprintf(stderr,
+                        "Error at line 1, column 1: [Symbol] Undefined symbol '%s'\n"
+                        "Suggestion: Define the label before use or mark it extern if linker-resolved. Did you mean '%s'?\n",
+                        ctx->fixups[i].label,
+                        closest);
+            } else {
+                fprintf(stderr,
+                        "Error at line 1, column 1: [Symbol] Undefined symbol '%s'\n"
+                        "Suggestion: Define the label before use or mark it extern if linker-resolved.\n",
+                        ctx->fixups[i].label);
+            }
             return -1;
         }
 
         uint64_t location = ctx->fixups[i].location;
         int size = ctx->fixups[i].size;
+        uint64_t size_u = (uint64_t)size;
 
         /* Calculate relative offset for control flow instructions */
         int64_t value;
@@ -805,11 +967,11 @@ int resolve_fixups(assembler_context_t *ctx) {
         if (ctx->fixups[i].is_rip_relative) {
             /* RIP-relative addressing: offset from end of instruction to target */
             /* location points to the displacement field, size is 4 bytes */
-            value = (int64_t)target - ((int64_t)location + size);
+            value = (int64_t)target - ((int64_t)location + (int64_t)size);
         } else if (inst_type == INST_JMP || inst_type == INST_CALL ||
             (inst_type >= INST_JA && inst_type <= INST_JS)) {
             /* Relative offset for control flow */
-            value = (int64_t)target - ((int64_t)location + size);
+            value = (int64_t)target - ((int64_t)location + (int64_t)size);
         } else {
             /* Absolute address */
             value = (int64_t)target;
@@ -817,32 +979,56 @@ int resolve_fixups(assembler_context_t *ctx) {
 
         /* Write the value to the output */
         uint64_t offset = location - ctx->base_address;
-        if (offset + size > ctx->text_size) {
-            fprintf(stderr, "Error: Fixup location out of bounds\n");
+        if (offset + size_u > ctx->text_size) {
+            fprintf(stderr,
+                    "Error at line 1, column 1: [Fixup] Fixup location out of bounds\n"
+                    "Suggestion: Verify emitted instruction sizes and fixup target offsets.\n");
             return -1;
+        }
+
+        /* Preserve any pre-emitted immediate/displacement addend. */
+        if (size == 1) {
+            int8_t addend = (int8_t)ctx->text_section[offset];
+            value += (int64_t)addend;
+        } else if (size == 4) {
+            int32_t addend = (int32_t)((uint32_t)ctx->text_section[offset] |
+                                       ((uint32_t)ctx->text_section[offset + 1] << 8) |
+                                       ((uint32_t)ctx->text_section[offset + 2] << 16) |
+                                       ((uint32_t)ctx->text_section[offset + 3] << 24));
+            value += (int64_t)addend;
+        } else if (size == 8) {
+            uint64_t raw = 0;
+            for (uint64_t j = 0; j < 8u; j++) {
+                raw |= ((uint64_t)ctx->text_section[offset + j]) << (unsigned int)(j * 8u);
+            }
+            value += (int64_t)raw;
         }
 
         /* Patch the bytes */
         if (size == 1) {
             if (value < -128 || value > 127) {
-                fprintf(stderr, "Error: Fixup value out of 8-bit range\n");
+                fprintf(stderr,
+                        "Error at line 1, column 1: [Fixup] Fixup value out of 8-bit range\n"
+                        "Suggestion: Use a wider encoding form or place the label closer to the instruction.\n");
                 return -1;
             }
             ctx->text_section[offset] = (uint8_t)(int8_t)value;
         } else if (size == 4) {
             if (value < INT32_MIN || value > INT32_MAX) {
-                fprintf(stderr, "Error: Fixup value out of 32-bit range\n");
+                fprintf(stderr,
+                        "Error at line 1, column 1: [Fixup] Fixup value out of 32-bit range\n"
+                        "Suggestion: Use an absolute/indirect form or reduce control-flow distance.\n");
                 return -1;
             }
             int32_t v32 = (int32_t)value;
-            ctx->text_section[offset] = v32 & 0xFF;
-            ctx->text_section[offset + 1] = (v32 >> 8) & 0xFF;
-            ctx->text_section[offset + 2] = (v32 >> 16) & 0xFF;
-            ctx->text_section[offset + 3] = (v32 >> 24) & 0xFF;
+            ctx->text_section[offset] = (uint8_t)(v32 & 0xFF);
+            ctx->text_section[offset + 1] = (uint8_t)((v32 >> 8) & 0xFF);
+            ctx->text_section[offset + 2] = (uint8_t)((v32 >> 16) & 0xFF);
+            ctx->text_section[offset + 3] = (uint8_t)((v32 >> 24) & 0xFF);
         } else if (size == 8) {
             uint64_t v64 = (uint64_t)value;
-            for (int j = 0; j < 8; j++) {
-                ctx->text_section[offset + j] = (v64 >> (j * 8)) & 0xFF;
+            for (uint64_t j = 0; j < 8u; j++) {
+                ctx->text_section[offset + j] = (uint8_t)((v64 >> (unsigned int)(j * 8u)) & 0xFFu);
             }
         }
     }
@@ -864,8 +1050,10 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
         }
 
         if (segment_override != MEM_SEG_DEFAULT && segment_override != op->mem.segment_override) {
-            fprintf(stderr, "Error: Conflicting segment overrides on memory operands at line %d\n",
-                    inst->line_number);
+            fprintf(stderr,
+                "Error at line %d, column 1: [Operand] Conflicting segment overrides on memory operands\n"
+                "Suggestion: Use a single segment override per instruction.\n",
+                inst->line_number);
             return -1;
         }
 
@@ -1047,18 +1235,18 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
                         emit_byte(ctx, (uint8_t)inst->operands[i].immediate);
                     } else if (inst->type == INST_DW) {
                         uint16_t v = (uint16_t)inst->operands[i].immediate;
-                        emit_byte(ctx, v & 0xFF);
-                        emit_byte(ctx, (v >> 8) & 0xFF);
+                        emit_byte(ctx, (uint8_t)(v & 0xFFu));
+                        emit_byte(ctx, (uint8_t)((v >> 8) & 0xFFu));
                     } else if (inst->type == INST_DD) {
                         uint32_t v = (uint32_t)inst->operands[i].immediate;
-                        emit_byte(ctx, v & 0xFF);
-                        emit_byte(ctx, (v >> 8) & 0xFF);
-                        emit_byte(ctx, (v >> 16) & 0xFF);
-                        emit_byte(ctx, (v >> 24) & 0xFF);
+                        emit_byte(ctx, (uint8_t)(v & 0xFFu));
+                        emit_byte(ctx, (uint8_t)((v >> 8) & 0xFFu));
+                        emit_byte(ctx, (uint8_t)((v >> 16) & 0xFFu));
+                        emit_byte(ctx, (uint8_t)((v >> 24) & 0xFFu));
                     } else {
                         uint64_t v = (uint64_t)inst->operands[i].immediate;
                         for (int j = 0; j < 8; j++) {
-                            emit_byte(ctx, (v >> (j * 8)) & 0xFF);
+                            emit_byte(ctx, (uint8_t)((v >> (unsigned int)(j * 8)) & 0xFFu));
                         }
                     }
                 } else if (inst->operands[i].type == OPERAND_STRING && inst->type == INST_DB) {
@@ -1114,7 +1302,8 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
                 int alignment = (int)inst->operands[0].immediate;
                 if (alignment > 0 && (alignment & (alignment - 1)) == 0) {  /* Power of 2 */
                     uint64_t current_addr = ctx->current_address;
-                    uint64_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
+                    uint64_t alignment_u = (uint64_t)alignment;
+                    uint64_t aligned_addr = (current_addr + alignment_u - 1u) & ~(alignment_u - 1u);
                     int padding = (int)(aligned_addr - current_addr);
                     
                     /* Emit padding: NOPs for text section, zeros for data section */
@@ -1126,12 +1315,16 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
                         }
                     }
                 } else {
-                    fprintf(stderr, "Error: align directive requires a power of 2 at line %d\n",
+                    fprintf(stderr,
+                            "Error at line %d, column 1: [Directive] align directive requires a power of 2\n"
+                            "Suggestion: Use align values like 2, 4, 8, 16, or 32.\n",
                             inst->line_number);
                     return -1;
                 }
             } else {
-                fprintf(stderr, "Error: align directive requires an immediate operand at line %d\n",
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Directive] align directive requires an immediate operand\n"
+                        "Suggestion: Provide a numeric value, for example: align 16.\n",
                         inst->line_number);
                 return -1;
             }
@@ -1143,8 +1336,11 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
                 const char *filename = inst->operands[0].string;
                 FILE *fp = fopen(filename, "rb");
                 if (!fp) {
-                    fprintf(stderr, "Error: Cannot open incbin file '%s' at line %d\n",
-                            filename, inst->line_number);
+                    fprintf(stderr,
+                        "Error at line %d, column 1: [I/O] Cannot open incbin file '%s'\n"
+                        "Suggestion: Check that the path is correct and readable from the current working directory.\n",
+                        inst->line_number,
+                        filename);
                     return -1;
                 }
                 
@@ -1154,8 +1350,11 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
                 fseek(fp, 0, SEEK_SET);
                 
                 if (file_size < 0) {
-                    fprintf(stderr, "Error: Cannot determine size of incbin file '%s' at line %d\n",
-                            filename, inst->line_number);
+                    fprintf(stderr,
+                        "Error at line %d, column 1: [I/O] Cannot determine size of incbin file '%s'\n"
+                        "Suggestion: Verify the file exists and is a regular file.\n",
+                        inst->line_number,
+                        filename);
                     fclose(fp);
                     return -1;
                 }
@@ -1170,16 +1369,21 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
                 }
                 
                 if (ferror(fp)) {
-                    fprintf(stderr, "Error: Failed to read incbin file '%s' at line %d\n",
-                            filename, inst->line_number);
+                    fprintf(stderr,
+                        "Error at line %d, column 1: [I/O] Failed to read incbin file '%s'\n"
+                        "Suggestion: Re-check file permissions and storage health, then retry.\n",
+                        inst->line_number,
+                        filename);
                     fclose(fp);
                     return -1;
                 }
                 
                 fclose(fp);
             } else {
-                fprintf(stderr, "Error: incbin directive requires a string filename at line %d\n",
-                        inst->line_number);
+                fprintf(stderr,
+                    "Error at line %d, column 1: [Directive] incbin directive requires a string filename\n"
+                    "Suggestion: Use syntax like: incbin \"path/to/file.bin\".\n",
+                    inst->line_number);
                 return -1;
             }
             return 0;
@@ -1187,11 +1391,6 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
         case INST_COMM:
         case INST_LCOMM:
             /* Common symbol declaration - reserve uninitialized space in BSS */
-
-        case INST_WEAK:
-        case INST_HIDDEN:
-            /* Symbol attribute directives do not emit bytes. */
-            return 0;
             if (inst->operand_count >= 2 &&
                 inst->operands[0].type == OPERAND_LABEL &&
                 inst->operands[1].type == OPERAND_IMM) {
@@ -1199,45 +1398,55 @@ int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *ins
                 int64_t size = inst->operands[1].immediate;
                 int64_t alignment = (inst->operand_count >= 3) ?
                                    inst->operands[2].immediate : 1;
-                
+
                 if (size <= 0) {
-                    fprintf(stderr, "Error: %s size must be positive at line %d\n",
-                            (inst->type == INST_COMM) ? ".comm" : ".lcomm",
-                            inst->line_number);
+                    fprintf(stderr,
+                        "Error at line %d, column 1: [Directive] %s size must be positive\n"
+                        "Suggestion: Provide a size greater than zero.\n",
+                        inst->line_number,
+                        (inst->type == INST_COMM) ? ".comm" : ".lcomm");
                     return -1;
                 }
-                
-                /* Add symbol to BSS section */
-                /* For now, treat as data section address */
+
+                /* Add symbol at current aligned address and reserve BSS bytes. */
                 uint64_t addr = ctx->current_address;
-                
-                /* Apply alignment if specified */
+
                 if (alignment > 1) {
-                    addr = (addr + alignment - 1) & ~(alignment - 1);
+                    uint64_t alignment_u = (uint64_t)alignment;
+                    addr = (addr + alignment_u - 1u) & ~(alignment_u - 1u);
                     int padding = (int)(addr - ctx->current_address);
                     for (int i = 0; i < padding; i++) {
                         emit_byte(ctx, 0);
                     }
                 }
-                
-                /* Add symbol */
+
                 add_symbol(ctx, symbol, addr, (inst->type == INST_COMM), false, 1);
-                
-                /* Reserve space by emitting zeros */
+
                 for (int64_t i = 0; i < size; i++) {
                     emit_byte(ctx, 0);
                 }
             } else {
-                fprintf(stderr, "Error: %s requires symbol name and size at line %d\n",
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Directive] %s requires symbol name and size\n"
+                        "Suggestion: Use syntax like: %s symbol, size[, alignment].\n",
+                        inst->line_number,
                         (inst->type == INST_COMM) ? ".comm" : ".lcomm",
-                        inst->line_number);
+                        (inst->type == INST_COMM) ? ".comm" : ".lcomm");
                 return -1;
             }
             return 0;
 
+        case INST_WEAK:
+        case INST_HIDDEN:
+            /* Symbol attribute directives do not emit bytes. */
+            return 0;
+
         default:
-            fprintf(stderr, "Error: Unhandled instruction type %d at line %d\n",
-                    inst->type, inst->line_number);
+            fprintf(stderr,
+                    "Error at line %d, column 1: [Internal] Unhandled instruction type %d\n"
+                    "Suggestion: Add encoder support for this instruction type in encode_instruction().\n",
+                    inst->line_number,
+                    inst->type);
             return -1;
     }
 }
@@ -1466,6 +1675,124 @@ static int estimate_instruction_size(const parsed_instruction_t *inst) {
     }
 }
 
+static int estimate_instruction_size_relaxed(assembler_context_t *ctx,
+                                             const parsed_instruction_t *inst,
+                                             uint64_t current_address) {
+    uint64_t target = 0;
+    int64_t rel8 = 0;
+
+    if (inst->type == INST_JMP &&
+        inst->operand_count == 1 &&
+        inst->operands[0].type == OPERAND_LABEL) {
+        if (find_symbol_address(ctx, inst->operands[0].label, &target) == 0) {
+            rel8 = (int64_t)target - (int64_t)(current_address + 2);
+            if (rel8 >= INT8_MIN && rel8 <= INT8_MAX) {
+                return 2; /* EB cb */
+            }
+        }
+        return 5; /* E9 cd */
+    }
+
+    if ((inst->type >= INST_JA && inst->type <= INST_JS) &&
+        inst->operand_count == 1 &&
+        inst->operands[0].type == OPERAND_LABEL) {
+        if (find_symbol_address(ctx, inst->operands[0].label, &target) == 0) {
+            rel8 = (int64_t)target - (int64_t)(current_address + 2);
+            if (rel8 >= INT8_MIN && rel8 <= INT8_MAX) {
+                return 2; /* 70+cc cb */
+            }
+        }
+        return 6; /* 0F 80+cc cd */
+    }
+
+    return estimate_instruction_size(inst);
+}
+
+static int recompute_text_layout_relaxed(assembler_context_t *ctx,
+                                         parsed_instruction_t *insts,
+                                         int count) {
+    const int max_iterations = 8;
+
+    for (int iter = 0; iter < max_iterations; iter++) {
+        bool changed = false;
+        int current_section = 0;
+        uint64_t current_address = ctx->base_address;
+
+        for (int i = 0; i < count; i++) {
+            parsed_instruction_t *inst = &insts[i];
+
+            if (inst->type == INST_SECTION) {
+                current_section = classify_section_name(section_name_from_instruction(inst));
+                continue;
+            }
+
+            if (current_section == 1) {
+                continue;
+            }
+
+            if (inst->has_label) {
+                symbol_t *sym = find_symbol_entry(ctx, inst->label);
+                if (sym && sym->address != current_address) {
+                    sym->address = current_address;
+                    changed = true;
+                    symbol_hash_update(ctx, inst->label, current_address,
+                                       sym->is_global,
+                                       sym->is_external,
+                                       sym->section);
+                }
+            }
+
+            if (inst->type == INST_GLOBAL || inst->type == INST_EXTERN ||
+                inst->type == INST_WEAK || inst->type == INST_HIDDEN ||
+                inst->type == INST_TIMES) {
+                continue;
+            }
+
+            if (inst->type == INST_NOP && inst->operand_count == 0 && inst->has_label) {
+                continue;
+            }
+
+            if (inst->type == INST_DB || inst->type == INST_DW ||
+                inst->type == INST_DD || inst->type == INST_DQ) {
+                int item_size = (inst->type == INST_DB) ? 1 :
+                                (inst->type == INST_DW) ? 2 :
+                                (inst->type == INST_DD) ? 4 : 8;
+                for (int j = 0; j < inst->operand_count; j++) {
+                    if (inst->operands[j].type == OPERAND_STRING && inst->type == INST_DB) {
+                        current_address += (uint64_t)strlen(inst->operands[j].string);
+                    } else {
+                        current_address += (uint64_t)item_size;
+                    }
+                }
+                continue;
+            }
+
+            if (inst->type == INST_RESB || inst->type == INST_RESW ||
+                inst->type == INST_RESD || inst->type == INST_RESQ) {
+                if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_IMM) {
+                    int reserve_size = (inst->type == INST_RESB) ? 1 :
+                                       (inst->type == INST_RESW) ? 2 :
+                                       (inst->type == INST_RESD) ? 4 : 8;
+                    current_address += (uint64_t)(inst->operands[0].immediate * reserve_size);
+                }
+                continue;
+            }
+
+            if (inst->type == INST_EQU) {
+                continue;
+            }
+
+            current_address += (uint64_t)estimate_instruction_size_relaxed(ctx, inst, current_address);
+        }
+
+        if (!changed) {
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
 /* ============================================================================
  * MAIN ASSEMBLY
  * ============================================================================ */
@@ -1476,20 +1803,28 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
     char hidden_attrs[MAX_SYMBOLS][MAX_LABEL_LENGTH];
     int weak_attr_count = 0;
     int hidden_attr_count = 0;
+
+    asm_clear_last_error(ctx);
+
     /* Use context-aware parsing to enable macro support */
     parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
     if (!insts) {
-        fprintf(stderr, "Error: Parsing failed\n");
+        fprintf(stderr,
+                "Error at line 1, column 1: [Parser] Parsing failed\n"
+                "Suggestion: Review the first parser diagnostic above for exact token context.\n");
         return -1;
     }
 
-    if (canonicalize_symbol_labels(insts, count) < 0) {
+    if (canonicalize_symbol_labels(ctx, insts, count) < 0) {
         free_instructions(insts);
         return -1;
     }
 
     ctx->current_address = ctx->base_address;
     ctx->line_map_count = 0;
+    ctx->listing_count = 0;
+    ctx->listing_active_index = -1;
+    ctx->listing_active = false;
 
     /* First pass: collect labels and calculate addresses */
     /* We do two passes through the instructions - first for text, then for data */
@@ -1513,11 +1848,11 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                 int size = (inst->type == INST_DB) ? 1 :
                           (inst->type == INST_DW) ? 2 :
                           (inst->type == INST_DD) ? 4 : 8;
-                text_size += size * inst->operand_count;
+                text_size += (uint64_t)((size_t)size * (size_t)inst->operand_count);
             } else if (inst->type != INST_GLOBAL && inst->type != INST_EXTERN &&
                        inst->type != INST_WEAK && inst->type != INST_HIDDEN &&
                        inst->type != INST_NOP) {
-                text_size += estimate_instruction_size(inst);
+                text_size += (uint64_t)estimate_instruction_size(inst);
             }
         }
     }
@@ -1564,12 +1899,12 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                       (inst->type == INST_DW) ? 2 :
                       (inst->type == INST_DD) ? 4 : 8;
             /* Calculate total bytes - handle string literals for db */
-            int total_bytes = 0;
+            uint64_t total_bytes = 0;
             for (int j = 0; j < inst->operand_count; j++) {
                 if (inst->operands[j].type == OPERAND_STRING && inst->type == INST_DB) {
-                    total_bytes += (int)strlen(inst->operands[j].string);
+                    total_bytes += (uint64_t)strlen(inst->operands[j].string);
                 } else {
-                    total_bytes += size;
+                    total_bytes += (uint64_t)size;
                 }
             }
             if (ctx->current_section == 0) {
@@ -1585,10 +1920,18 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                           (inst->type == INST_RESW) ? 2 :
                           (inst->type == INST_RESD) ? 4 : 8;
                 int64_t reserved = inst->operands[0].immediate * size;
+                if (reserved < 0) {
+                    fprintf(stderr,
+                            "Error at line %d, column 1: [Directive] Negative reserve size\n"
+                            "Suggestion: Use a non-negative reserve count with resb/resw/resd/resq.\n",
+                            inst->line_number);
+                    free_instructions(insts);
+                    return -1;
+                }
                 if (ctx->current_section == 0) {
-                    ctx->current_address += reserved;
+                    ctx->current_address += (uint64_t)reserved;
                 } else {
-                    current_data_addr += reserved;
+                    current_data_addr += (uint64_t)reserved;
                 }
             }
         } else if (inst->type == INST_EQU) {
@@ -1600,12 +1943,13 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                 if (alignment > 0 && (alignment & (alignment - 1)) == 0) {  /* Power of 2 */
                     uint64_t current_addr = (ctx->current_section == 0) ?
                                            ctx->current_address : current_data_addr;
-                    uint64_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
+                    uint64_t alignment_u = (uint64_t)alignment;
+                    uint64_t aligned_addr = (current_addr + alignment_u - 1u) & ~(alignment_u - 1u);
                     int padding = (int)(aligned_addr - current_addr);
                     if (ctx->current_section == 0) {
-                        ctx->current_address += padding;
+                        ctx->current_address += (uint64_t)padding;
                     } else {
-                        current_data_addr += padding;
+                        current_data_addr += (uint64_t)padding;
                     }
                 }
             }
@@ -1620,9 +1964,9 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                     fclose(fp);
                     if (file_size > 0) {
                         if (ctx->current_section == 0) {
-                            ctx->current_address += file_size;
+                            ctx->current_address += (uint64_t)file_size;
                         } else {
-                            current_data_addr += file_size;
+                            current_data_addr += (uint64_t)file_size;
                         }
                     }
                 }
@@ -1639,16 +1983,17 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                                     &ctx->current_address : &current_data_addr;
                     /* Apply alignment */
                     if (alignment > 1) {
-                        *addr = (*addr + alignment - 1) & ~(alignment - 1);
+                        uint64_t alignment_u = (uint64_t)alignment;
+                        *addr = (*addr + alignment_u - 1u) & ~(alignment_u - 1u);
                     }
-                    *addr += size;
+                    *addr += (uint64_t)size;
                 }
             }
         } else if (inst->type != INST_GLOBAL && inst->type != INST_EXTERN &&
                    inst->type != INST_WEAK && inst->type != INST_HIDDEN &&
                    inst->type != INST_NOP && inst->type != INST_TIMES) {
             if (ctx->current_section == 0) {
-                ctx->current_address += estimate_instruction_size(inst);
+                ctx->current_address += (uint64_t)estimate_instruction_size(inst);
             }
         }
     }
@@ -1658,136 +2003,194 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         return -1;
     }
 
-    /* Second pass: generate text section code */
-    ctx->current_address = ctx->base_address;
-    ctx->current_section = 0;
-    ctx->text_size = 0;
-    ctx->fixup_count = 0;
+    if (recompute_text_layout_relaxed(ctx, insts, count) < 0) {
+        free_instructions(insts);
+        return -1;
+    }
 
-    for (int i = 0; i < count; i++) {
-        parsed_instruction_t *inst = &insts[i];
+    if (resolve_equ_symbol_values(ctx, insts, count) < 0) {
+        free_instructions(insts);
+        return -1;
+    }
 
-        /* Handle section directives */
-        if (inst->type == INST_SECTION) {
-            apply_section_directive(ctx, inst);
-            continue;
-        }
+    /* Second pass: generate text section code.
+     * Iterate until text-label addresses stabilize so short/near branch
+     * decisions converge with the final emitted layout. */
+    const int text_pass_max_iterations = 6;
+    bool text_mode_converged = false;
 
-        if (inst->type == INST_WEAK || inst->type == INST_HIDDEN) {
-            for (int j = 0; j < inst->operand_count; j++) {
-                if (inst->operands[j].type != OPERAND_LABEL) {
-                    fprintf(stderr, "Error: %s requires label operands at line %d\n",
-                            inst->type == INST_WEAK ? "weak" : "hidden",
-                            inst->line_number);
-                    free_instructions(insts);
-                    return -1;
-                }
+    for (int mode_iter = 0; mode_iter < 2 && !text_mode_converged; mode_iter++) {
+        ctx->enable_forward_short_branches = (mode_iter == 0);
+        for (int pass_iter = 0; pass_iter < text_pass_max_iterations; pass_iter++) {
+            bool text_layout_changed = false;
 
-                if (inst->type == INST_WEAK) {
-                    if (weak_attr_count >= MAX_SYMBOLS) {
-                        fprintf(stderr, "Error: Too many weak symbol attributes\n");
+            ctx->current_address = ctx->base_address;
+            ctx->current_section = 0;
+            ctx->text_size = 0;
+            ctx->fixup_count = 0;
+            ctx->line_map_count = 0;
+            ctx->listing_count = 0;
+            ctx->listing_active = false;
+            ctx->listing_active_index = -1;
+            weak_attr_count = 0;
+            hidden_attr_count = 0;
+
+        for (int i = 0; i < count; i++) {
+            parsed_instruction_t *inst = &insts[i];
+
+            /* Handle section directives */
+            if (inst->type == INST_SECTION) {
+                apply_section_directive(ctx, inst);
+                continue;
+            }
+
+            if (inst->type == INST_WEAK || inst->type == INST_HIDDEN) {
+                for (int j = 0; j < inst->operand_count; j++) {
+                    if (inst->operands[j].type != OPERAND_LABEL) {
+                        fprintf(stderr,
+                                "Error at line %d, column 1: [Directive] %s requires label operands\n"
+                                "Suggestion: Provide symbol names only, e.g. %s sym1, sym2.\n",
+                                inst->line_number,
+                                inst->type == INST_WEAK ? "weak" : "hidden",
+                                inst->type == INST_WEAK ? "weak" : "hidden");
                         free_instructions(insts);
                         return -1;
                     }
-                    strncpy(weak_attrs[weak_attr_count], inst->operands[j].label, MAX_LABEL_LENGTH - 1);
-                    weak_attrs[weak_attr_count][MAX_LABEL_LENGTH - 1] = '\0';
-                    weak_attr_count++;
-                } else {
-                    if (hidden_attr_count >= MAX_SYMBOLS) {
-                        fprintf(stderr, "Error: Too many hidden symbol attributes\n");
-                        free_instructions(insts);
-                        return -1;
+
+                    if (inst->type == INST_WEAK) {
+                        if (weak_attr_count >= MAX_SYMBOLS) {
+                            fprintf(stderr,
+                                    "Error at line %d, column 1: [Directive] Too many weak symbol attributes\n"
+                                    "Suggestion: Reduce weak declarations or increase MAX_SYMBOLS.\n",
+                                    inst->line_number);
+                            free_instructions(insts);
+                            return -1;
+                        }
+                        strncpy(weak_attrs[weak_attr_count], inst->operands[j].label, MAX_LABEL_LENGTH - 1);
+                        weak_attrs[weak_attr_count][MAX_LABEL_LENGTH - 1] = '\0';
+                        weak_attr_count++;
+                    } else {
+                        if (hidden_attr_count >= MAX_SYMBOLS) {
+                            fprintf(stderr,
+                                    "Error at line %d, column 1: [Directive] Too many hidden symbol attributes\n"
+                                    "Suggestion: Reduce hidden declarations or increase MAX_SYMBOLS.\n",
+                                    inst->line_number);
+                            free_instructions(insts);
+                            return -1;
+                        }
+                        strncpy(hidden_attrs[hidden_attr_count], inst->operands[j].label, MAX_LABEL_LENGTH - 1);
+                        hidden_attrs[hidden_attr_count][MAX_LABEL_LENGTH - 1] = '\0';
+                        hidden_attr_count++;
                     }
-                    strncpy(hidden_attrs[hidden_attr_count], inst->operands[j].label, MAX_LABEL_LENGTH - 1);
-                    hidden_attrs[hidden_attr_count][MAX_LABEL_LENGTH - 1] = '\0';
-                    hidden_attr_count++;
+                }
+                continue;
+            }
+
+            /* Skip data section in text pass */
+            if (ctx->current_section == 1) {
+                continue;
+            }
+
+            /* Update label addresses */
+            if (inst->has_label) {
+                for (int j = 0; j < ctx->symbol_count; j++) {
+                    if (strcmp(ctx->symbols[j].name, inst->label) == 0) {
+                        if (ctx->symbols[j].address != ctx->current_address) {
+                            text_layout_changed = true;
+                        }
+                        ctx->symbols[j].address = ctx->current_address;
+                        /* Keep hash table in sync for fixup resolution lookups. */
+                        symbol_hash_update(ctx, inst->label, ctx->current_address,
+                                           ctx->symbols[j].is_global,
+                                           ctx->symbols[j].is_external,
+                                           ctx->symbols[j].section);
+                    }
                 }
             }
-            continue;
-        }
 
-        /* Skip data section in text pass */
-        if (ctx->current_section == 1) {
-            continue;
-        }
+            /* Record address for this instruction */
+            inst->address = ctx->current_address;
 
-        /* Update label addresses */
-        if (inst->has_label) {
-            for (int j = 0; j < ctx->symbol_count; j++) {
-                if (strcmp(ctx->symbols[j].name, inst->label) == 0) {
-                    ctx->symbols[j].address = ctx->current_address;
-                    /* Keep hash table in sync for fixup resolution lookups. */
-                    symbol_hash_update(ctx, inst->label, ctx->current_address,
-                                       ctx->symbols[j].is_global,
-                                       ctx->symbols[j].is_external,
-                                       ctx->symbols[j].section);
-                }
-            }
-        }
+            rewrite_constant_label_operands(ctx, inst);
 
-        /* Record address for this instruction */
-        inst->address = ctx->current_address;
-
-        rewrite_constant_label_operands(ctx, inst);
-
-        /* Handle pseudo-instructions */
-        if (inst->type == INST_GLOBAL) {
-            for (int j = 0; j < inst->operand_count; j++) {
-                if (inst->operands[j].type == OPERAND_LABEL) {
-                    for (int k = 0; k < ctx->symbol_count; k++) {
-                        if (strcmp(ctx->symbols[k].name, inst->operands[j].label) == 0) {
-                            ctx->symbols[k].is_global = true;
-                            if (ctx->symbols[k].section == 0) {
-                                ctx->symbols[k].is_function = true;
+            /* Handle pseudo-instructions */
+            if (inst->type == INST_GLOBAL) {
+                for (int j = 0; j < inst->operand_count; j++) {
+                    if (inst->operands[j].type == OPERAND_LABEL) {
+                        for (int k = 0; k < ctx->symbol_count; k++) {
+                            if (strcmp(ctx->symbols[k].name, inst->operands[j].label) == 0) {
+                                ctx->symbols[k].is_global = true;
+                                if (ctx->symbols[k].section == 0) {
+                                    ctx->symbols[k].is_function = true;
+                                }
                             }
                         }
                     }
                 }
+                continue;
             }
-            continue;
-        }
 
-        if (inst->type == INST_CALL && inst->operand_count > 0 &&
-            inst->operands[0].type == OPERAND_LABEL) {
-            for (int k = 0; k < ctx->symbol_count; k++) {
-                if (strcmp(ctx->symbols[k].name, inst->operands[0].label) == 0 &&
-                    ctx->symbols[k].section == 0) {
-                    ctx->symbols[k].is_function = true;
-                    break;
+            if (inst->type == INST_CALL && inst->operand_count > 0 &&
+                inst->operands[0].type == OPERAND_LABEL) {
+                for (int k = 0; k < ctx->symbol_count; k++) {
+                    if (strcmp(ctx->symbols[k].name, inst->operands[0].label) == 0 &&
+                        ctx->symbols[k].section == 0) {
+                        ctx->symbols[k].is_function = true;
+                        break;
+                    }
                 }
             }
-        }
 
-        if (inst->type == INST_EXTERN) {
-            for (int j = 0; j < inst->operand_count; j++) {
-                if (inst->operands[j].type == OPERAND_LABEL) {
-                    add_symbol(ctx, inst->operands[j].label, 0, false, true, 0);
+            if (inst->type == INST_EXTERN) {
+                for (int j = 0; j < inst->operand_count; j++) {
+                    if (inst->operands[j].type == OPERAND_LABEL) {
+                        add_symbol(ctx, inst->operands[j].label, 0, false, true, 0);
+                    }
                 }
+                continue;
             }
-            continue;
+
+            if (inst->type == INST_NOP && inst->operand_count == 0 && inst->has_label) {
+                /* Label-only line - skip encoding but don't advance address */
+                continue;
+            }
+
+            if (inst->type == INST_ALIGN) {
+                /* Align directive handled by encoder */
+            }
+
+            if (ctx->line_map_count < MAX_LINE_MAP) {
+                ctx->line_map[ctx->line_map_count].address = inst->address;
+                ctx->line_map[ctx->line_map_count].line = inst->line_number > 0 ? inst->line_number : 1;
+                ctx->line_map_count++;
+            }
+
+            /* Encode instruction */
+            listing_start_instruction(ctx, inst->line_number, inst->original_line);
+            if (encode_instruction(ctx, inst) < 0) {
+                listing_end_instruction(ctx);
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Encoder] Failed to encode instruction\n"
+                        "Suggestion: Check operand types/sizes and directive context for this instruction.\n",
+                        inst->line_number);
+                free_instructions(insts);
+                return -1;
+            }
+            listing_end_instruction(ctx);
         }
 
-        if (inst->type == INST_NOP && inst->operand_count == 0 && inst->has_label) {
-            /* Label-only line - skip encoding but don't advance address */
-            continue;
+            if (!text_layout_changed) {
+                text_mode_converged = true;
+                break;
+            }
         }
+    }
 
-        if (inst->type == INST_ALIGN) {
-            /* Align directive handled by encoder */
-        }
-
-        if (ctx->line_map_count < MAX_LINE_MAP) {
-            ctx->line_map[ctx->line_map_count].address = inst->address;
-            ctx->line_map[ctx->line_map_count].line = inst->line_number > 0 ? inst->line_number : 1;
-            ctx->line_map_count++;
-        }
-
-        /* Encode instruction */
-        if (encode_instruction(ctx, inst) < 0) {
-            fprintf(stderr, "Error: Failed to encode instruction at line %d\n", inst->line_number);
-            free_instructions(insts);
-            return -1;
-        }
+    if (!text_mode_converged) {
+        /* Keep the last conservative pass output rather than failing assembly.
+         * Some branch-boundary patterns may not converge under repeated sizing,
+         * but single-pass emission remains compatible with previous behavior. */
+        ctx->enable_forward_short_branches = false;
     }
 
     if (apply_symbol_attributes(ctx, weak_attrs, weak_attr_count, true, false, "weak") < 0 ||
@@ -1834,24 +2237,25 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
 
         if (inst->type == INST_DB || inst->type == INST_DW ||
             inst->type == INST_DD || inst->type == INST_DQ) {
+            listing_start_instruction(ctx, inst->line_number, inst->original_line);
             for (int j = 0; j < inst->operand_count; j++) {
                 if (inst->operands[j].type == OPERAND_IMM) {
                     if (inst->type == INST_DB) {
                         emit_byte(ctx, (uint8_t)inst->operands[j].immediate);
                     } else if (inst->type == INST_DW) {
                         uint16_t v = (uint16_t)inst->operands[j].immediate;
-                        emit_byte(ctx, v & 0xFF);
-                        emit_byte(ctx, (v >> 8) & 0xFF);
+                        emit_byte(ctx, (uint8_t)(v & 0xFFu));
+                        emit_byte(ctx, (uint8_t)((v >> 8) & 0xFFu));
                     } else if (inst->type == INST_DD) {
                         uint32_t v = (uint32_t)inst->operands[j].immediate;
-                        emit_byte(ctx, v & 0xFF);
-                        emit_byte(ctx, (v >> 8) & 0xFF);
-                        emit_byte(ctx, (v >> 16) & 0xFF);
-                        emit_byte(ctx, (v >> 24) & 0xFF);
+                        emit_byte(ctx, (uint8_t)(v & 0xFFu));
+                        emit_byte(ctx, (uint8_t)((v >> 8) & 0xFFu));
+                        emit_byte(ctx, (uint8_t)((v >> 16) & 0xFFu));
+                        emit_byte(ctx, (uint8_t)((v >> 24) & 0xFFu));
                     } else {
                         uint64_t v = (uint64_t)inst->operands[j].immediate;
                         for (int k = 0; k < 8; k++) {
-                            emit_byte(ctx, (v >> (k * 8)) & 0xFF);
+                            emit_byte(ctx, (uint8_t)((v >> (unsigned int)(k * 8)) & 0xFFu));
                         }
                     }
                 } else if (inst->operands[j].type == OPERAND_STRING && inst->type == INST_DB) {
@@ -1862,41 +2266,61 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
                     }
                 }
             }
+            listing_end_instruction(ctx);
         } else if (inst->type == INST_RESB || inst->type == INST_RESW ||
                    inst->type == INST_RESD || inst->type == INST_RESQ) {
             /* Reserve uninitialized space - emit zeros */
             if (inst->operand_count >= 1 && inst->operands[0].type == OPERAND_IMM) {
-                int64_t count = inst->operands[0].immediate;
+                listing_start_instruction(ctx, inst->line_number, inst->original_line);
+                int64_t repeat_count = inst->operands[0].immediate;
                 int size = (inst->type == INST_RESB) ? 1 :
                           (inst->type == INST_RESW) ? 2 :
                           (inst->type == INST_RESD) ? 4 : 8;
-                for (int64_t k = 0; k < count * size; k++) {
+                for (int64_t k = 0; k < repeat_count * size; k++) {
                     emit_byte(ctx, 0);
                 }
+                listing_end_instruction(ctx);
             }
         } else if (inst->type == INST_ALIGN) {
             /* Align directive - handled by encoder */
+            listing_start_instruction(ctx, inst->line_number, inst->original_line);
             if (encode_instruction(ctx, inst) < 0) {
-                fprintf(stderr, "Error: Failed to encode align at line %d\n", inst->line_number);
-                free_instructions(insts);
-                return -1;
-            }
-        } else if (inst->type == INST_INCBIN) {
-            /* Include binary file - handled by encoder */
-            if (encode_instruction(ctx, inst) < 0) {
-                fprintf(stderr, "Error: Failed to encode incbin at line %d\n", inst->line_number);
-                free_instructions(insts);
-                return -1;
-            }
-        } else if (inst->type == INST_COMM || inst->type == INST_LCOMM) {
-            /* Common symbol - handled by encoder */
-            if (encode_instruction(ctx, inst) < 0) {
-                fprintf(stderr, "Error: Failed to encode %s at line %d\n",
-                        (inst->type == INST_COMM) ? ".comm" : ".lcomm",
+                listing_end_instruction(ctx);
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Encoder] Failed to encode align\n"
+                        "Suggestion: Validate align operand type and power-of-two value.\n",
                         inst->line_number);
                 free_instructions(insts);
                 return -1;
             }
+            listing_end_instruction(ctx);
+        } else if (inst->type == INST_INCBIN) {
+            /* Include binary file - handled by encoder */
+            listing_start_instruction(ctx, inst->line_number, inst->original_line);
+            if (encode_instruction(ctx, inst) < 0) {
+                listing_end_instruction(ctx);
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Encoder] Failed to encode incbin\n"
+                        "Suggestion: Verify incbin path and read permissions for the referenced file.\n",
+                        inst->line_number);
+                free_instructions(insts);
+                return -1;
+            }
+            listing_end_instruction(ctx);
+        } else if (inst->type == INST_COMM || inst->type == INST_LCOMM) {
+            /* Common symbol - handled by encoder */
+            listing_start_instruction(ctx, inst->line_number, inst->original_line);
+            if (encode_instruction(ctx, inst) < 0) {
+                listing_end_instruction(ctx);
+                fprintf(stderr,
+                        "Error at line %d, column 1: [Encoder] Failed to encode %s\n"
+                        "Suggestion: Check directive operands: symbol, positive size, and optional power-of-two alignment.\n",
+                        inst->line_number,
+                        (inst->type == INST_COMM) ? ".comm" : ".lcomm");
+                free_instructions(insts);
+                return -1;
+            }
+            listing_end_instruction(ctx);
         }
     }
 
@@ -1913,7 +2337,10 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
 int asm_assemble_file(assembler_context_t *ctx, const char *filename) {
     FILE *f = fopen(filename, "r");
     if (!f) {
-        fprintf(stderr, "Error: Cannot open file '%s'\n", filename);
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Cannot open file '%s'\n"
+                "Suggestion: Verify file path and read permissions.\n",
+                filename);
         return -1;
     }
 
@@ -1921,14 +2348,20 @@ int asm_assemble_file(assembler_context_t *ctx, const char *filename) {
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    char *source = malloc(size + 1);
+    size_t size_u = (size_t)size;
+
+    char *source = malloc(size_u + 1u);
     if (!source) {
         fclose(f);
         return -1;
     }
 
-    fread(source, 1, size, f);
-    source[size] = '\0';
+    if (fread(source, 1u, size_u, f) != size_u) {
+        free(source);
+        fclose(f);
+        return -1;
+    }
+    source[size_u] = '\0';
     fclose(f);
 
     strncpy(ctx->current_filename, filename, MAX_FILEPATH_LENGTH - 1);
@@ -2108,7 +2541,10 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
     const bool emit_dwarf = ctx->emit_debug_map;
     FILE *f = fopen(filename, "wb");
     if (!f) {
-        fprintf(stderr, "Error: Cannot create file '%s'\n", filename);
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Cannot create file '%s'\n"
+                "Suggestion: Check write permissions and whether the path is a directory.\n",
+                filename);
         return -1;
     }
 
@@ -2660,7 +3096,9 @@ int asm_write_elf64(assembler_context_t *ctx, const char *filename) {
     return 0;
 
 dwarf_overflow:
-    fprintf(stderr, "Error: DWARF section data exceeded internal buffer capacity\n");
+    fprintf(stderr,
+            "Error at line 1, column 1: [Internal] DWARF section data exceeded internal buffer capacity\n"
+            "Suggestion: Increase debug buffer sizes or reduce emitted debug metadata volume.\n");
     fclose(f);
     return -1;
 }
@@ -2668,7 +3106,10 @@ dwarf_overflow:
 int asm_write_binary(assembler_context_t *ctx, const char *filename) {
     FILE *f = fopen(filename, "wb");
     if (!f) {
-        fprintf(stderr, "Error: Cannot create file '%s'\n", filename);
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Cannot create file '%s'\n"
+                "Suggestion: Check write permissions and whether the path is a directory.\n",
+                filename);
         return -1;
     }
 
@@ -2680,7 +3121,10 @@ int asm_write_binary(assembler_context_t *ctx, const char *filename) {
 int asm_write_hex(assembler_context_t *ctx, const char *filename) {
     FILE *f = fopen(filename, "w");
     if (!f) {
-        fprintf(stderr, "Error: Cannot create file '%s'\n", filename);
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Cannot create file '%s'\n"
+                "Suggestion: Check write permissions and whether the path is a directory.\n",
+                filename);
         return -1;
     }
 
@@ -2702,13 +3146,18 @@ int asm_write_debug_map(assembler_context_t *ctx, const char *filename) {
     if (!ctx || !filename) return -1;
 
     if (snprintf(map_name, sizeof(map_name), "%s.dbg", filename) >= (int)sizeof(map_name)) {
-        fprintf(stderr, "Error: Debug map filename too long\n");
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Debug map filename too long\n"
+                "Suggestion: Use a shorter output filename/path.\n");
         return -1;
     }
 
     f = fopen(map_name, "w");
     if (!f) {
-        fprintf(stderr, "Error: Cannot create debug map '%s'\n", map_name);
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Cannot create debug map '%s'\n"
+                "Suggestion: Check write permissions and parent directory existence.\n",
+                map_name);
         return -1;
     }
 
@@ -2726,6 +3175,89 @@ int asm_write_debug_map(assembler_context_t *ctx, const char *filename) {
                 ctx->symbols[i].section == 0 ? "text" : "data",
                 ctx->symbols[i].is_global ? 1 : 0,
                 ctx->symbols[i].is_external ? 1 : 0);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/* ============================================================================
+ * LISTING FILE OUTPUT
+ * ============================================================================ */
+
+int asm_write_listing(assembler_context_t *ctx, const char *filename) {
+    char list_name[MAX_FILEPATH_LENGTH];
+    FILE *f;
+
+    if (!ctx || !filename) return -1;
+
+    if (snprintf(list_name, sizeof(list_name), "%s.lst", filename) >= (int)sizeof(list_name)) {
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Listing filename too long\n"
+                "Suggestion: Use a shorter output filename/path.\n");
+        return -1;
+    }
+
+    f = fopen(list_name, "w");
+    if (!f) {
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Cannot create listing file '%s'\n"
+                "Suggestion: Check write permissions and parent directory existence.\n",
+                list_name);
+        return -1;
+    }
+
+    /* Write header */
+    fprintf(f, "; x86_64-asm listing file\n");
+    fprintf(f, "; Source: %s\n", ctx->current_filename);
+    fprintf(f, "; base_address=0x%lx\n\n", ctx->base_address);
+
+    /* Write column headers */
+    fprintf(f, "%-6s %-8s %-32s %s\n", "Line", "Address", "Machine Code", "Source");
+    fprintf(f, "%-6s %-8s %-32s %s\n", "----", "-------", "------------", "------");
+
+    /* Write listing entries */
+    for (int i = 0; i < ctx->listing_count; i++) {
+        listing_entry_t *entry = &ctx->listing_entries[i];
+        
+        /* Format machine code bytes */
+        char bytes_str[64];
+        bytes_str[0] = '\0';
+        for (int j = 0; j < entry->byte_count && j < 16; j++) {
+            char byte_hex[4];
+            snprintf(byte_hex, sizeof(byte_hex), "%02x", entry->bytes[j]);
+            if (j > 0) strncat(bytes_str, " ", sizeof(bytes_str) - strlen(bytes_str) - 1);
+            strncat(bytes_str, byte_hex, sizeof(bytes_str) - strlen(bytes_str) - 1);
+        }
+        
+        /* Truncate source line if too long */
+        char source_trunc[MAX_LINE_LENGTH];
+        strncpy(source_trunc, entry->source_line, sizeof(source_trunc) - 1);
+        source_trunc[sizeof(source_trunc) - 1] = '\0';
+        
+        /* Remove trailing newline */
+        size_t len = strlen(source_trunc);
+        if (len > 0 && source_trunc[len - 1] == '\n') {
+            source_trunc[len - 1] = '\0';
+        }
+        
+        fprintf(f, "%-6d %-8lx %-32s %s\n",
+                entry->line_number,
+                entry->address,
+                bytes_str,
+                source_trunc);
+    }
+
+    /* Write symbol table */
+    fprintf(f, "\n; Symbol Table\n");
+    fprintf(f, "; %-30s %-16s %s\n", "Name", "Address", "Section");
+    fprintf(f, "; %-30s %-16s %s\n", "----", "-------", "-------");
+    
+    for (int i = 0; i < ctx->symbol_count; i++) {
+        fprintf(f, "; %-30s 0x%016lx %s\n",
+                ctx->symbols[i].name,
+                ctx->symbols[i].address,
+                ctx->symbols[i].section == 0 ? "text" : "data");
     }
 
     fclose(f);

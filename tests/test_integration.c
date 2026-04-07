@@ -4,13 +4,21 @@
  */
 
 #include "test_framework.h"
-#include "../src/x86_64_asm.h"
+#include "x86_64_asm/x86_64_asm.h"
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <ctype.h>
+
+typedef struct {
+    int line_number;
+    uint64_t address;
+    uint8_t bytes[16];
+    int byte_count;
+    char raw_line[512];
+} listing_row_t;
 
 typedef struct {
     uint8_t e_ident[16];
@@ -152,18 +160,186 @@ static int assemble_file_and_run(const char *asm_file) {
 /* Test helper: Assemble source and run it, return exit code */
 static int assemble_and_run(const char *source) {
     /* Create temp files */
-    char asm_file[] = "/tmp/test_XXXXXX.asm";
+    char asm_file[] = "/tmp/test_XXXXXX";
+    size_t total_written;
+    size_t source_len;
+    const char *cursor;
     
-    int fd = mkstemps(asm_file, 4);
+    int fd = mkstemp(asm_file);
     if (fd < 0) return -1;
     
     /* Write assembly to temp file */
-    write(fd, source, strlen(source));
+    source_len = strlen(source);
+    total_written = 0;
+    cursor = source;
+
+    while (total_written < source_len) {
+        ssize_t written = write(fd, cursor + total_written, source_len - total_written);
+        if (written <= 0) {
+            close(fd);
+            unlink(asm_file);
+            return -1;
+        }
+        total_written += (size_t)written;
+    }
+
     close(fd);
     
     int result = assemble_file_and_run(asm_file);
     unlink(asm_file);
     return result;
+}
+
+/* Assemble a fixture file and ensure the emitted ELF artifact is non-empty. */
+static int assemble_fixture_and_verify_nonempty_output(const char *fixture_path) {
+    assembler_context_t *ctx;
+    char out_file[] = "/tmp/test_stress_out_XXXXXX";
+    struct stat st;
+    int out_fd;
+    int result;
+
+    if (!fixture_path) {
+        return -1;
+    }
+
+    out_fd = mkstemp(out_file);
+    if (out_fd < 0) {
+        return -1;
+    }
+    close(out_fd);
+
+    ctx = asm_init();
+    if (!ctx) {
+        unlink(out_file);
+        return -1;
+    }
+
+    result = asm_assemble_file(ctx, fixture_path);
+    if (result == 0) {
+        result = asm_write_elf64(ctx, out_file);
+    }
+
+    asm_free(ctx);
+
+    if (result != 0) {
+        unlink(out_file);
+        return -1;
+    }
+
+    if (stat(out_file, &st) != 0 || st.st_size <= 0) {
+        unlink(out_file);
+        return -1;
+    }
+
+    unlink(out_file);
+    return 0;
+}
+
+static char *disassemble_buffer_to_string(const uint8_t *code, size_t size, uint64_t base) {
+    FILE *fp;
+    long length;
+    char *buffer;
+
+    fp = tmpfile();
+    if (!fp) {
+        return NULL;
+    }
+
+    if (disassemble_code_buffer(code, size, base, fp) < 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    if (fflush(fp) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    length = ftell(fp);
+    if (length < 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    buffer = (char *)malloc((size_t)length + 1U);
+    if (!buffer) {
+        fclose(fp);
+        return NULL;
+    }
+
+    if (fread(buffer, 1U, (size_t)length, fp) != (size_t)length) {
+        free(buffer);
+        fclose(fp);
+        return NULL;
+    }
+
+    buffer[length] = '\0';
+    fclose(fp);
+    return buffer;
+}
+
+static char *capture_command_output(const char *cmd) {
+    FILE *fp;
+    char line[512];
+    char *buffer;
+    size_t len = 0;
+    size_t cap = 4096;
+    int status;
+
+    if (!cmd) {
+        return NULL;
+    }
+
+    fp = popen(cmd, "r");
+    if (!fp) {
+        return NULL;
+    }
+
+    buffer = (char *)malloc(cap);
+    if (!buffer) {
+        pclose(fp);
+        return NULL;
+    }
+    buffer[0] = '\0';
+
+    while (fgets(line, sizeof(line), fp)) {
+        size_t chunk = strlen(line);
+        if (len + chunk + 1U > cap) {
+            size_t new_cap = cap * 2U;
+            while (len + chunk + 1U > new_cap) {
+                new_cap *= 2U;
+            }
+            char *tmp = (char *)realloc(buffer, new_cap);
+            if (!tmp) {
+                free(buffer);
+                pclose(fp);
+                return NULL;
+            }
+            buffer = tmp;
+            cap = new_cap;
+        }
+        memcpy(buffer + len, line, chunk);
+        len += chunk;
+        buffer[len] = '\0';
+    }
+
+    status = pclose(fp);
+    if (status != 0 && len == 0U) {
+        free(buffer);
+        return NULL;
+    }
+
+    return buffer;
 }
 
 static const symbol_t *find_symbol_by_name(assembler_context_t *ctx, const char *name) {
@@ -175,8 +351,146 @@ static const symbol_t *find_symbol_by_name(assembler_context_t *ctx, const char 
     return NULL;
 }
 
+static int parse_listing_row(const char *line, listing_row_t *out) {
+    char local[512];
+    uint8_t parsed_bytes[16];
+    char *p;
+    char *end;
+    int count = 0;
+
+    if (!line || !out) {
+        return 0;
+    }
+
+    strncpy(local, line, sizeof(local) - 1);
+    local[sizeof(local) - 1] = '\0';
+    p = local;
+
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    if (!isdigit((unsigned char)*p)) {
+        return 0;
+    }
+
+    long ln = strtol(p, &end, 10);
+    if (end == p) {
+        return 0;
+    }
+    p = end;
+
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    unsigned long long addr = strtoull(p, &end, 16);
+    if (end == p) {
+        return 0;
+    }
+    p = end;
+
+    while (*p && count < 16) {
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+
+        if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1])) {
+            break;
+        }
+        if (isxdigit((unsigned char)p[2])) {
+            break;
+        }
+
+        char hex[3];
+        hex[0] = p[0];
+        hex[1] = p[1];
+        hex[2] = '\0';
+        parsed_bytes[count++] = (uint8_t)strtoul(hex, NULL, 16);
+        p += 2;
+    }
+
+    if (count <= 0) {
+        return 0;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->line_number = (int)ln;
+    out->address = (uint64_t)addr;
+    out->byte_count = count;
+    memcpy(out->bytes, parsed_bytes, (size_t)count);
+    strncpy(out->raw_line, line, sizeof(out->raw_line) - 1);
+    out->raw_line[sizeof(out->raw_line) - 1] = '\0';
+    return 1;
+}
+
+static int assemble_and_write_listing(const char *source,
+                                      char *asm_file,
+                                      size_t asm_file_size,
+                                      char *out_file,
+                                      size_t out_file_size,
+                                      char *lst_file,
+                                      size_t lst_file_size,
+                                      assembler_context_t **out_ctx) {
+    int fd = -1;
+    assembler_context_t *ctx = NULL;
+
+    if (!source || !asm_file || !out_file || !lst_file || !out_ctx) {
+        return -1;
+    }
+
+    *out_ctx = NULL;
+    snprintf(asm_file, asm_file_size, "/tmp/test_listing_src_XXXXXX");
+    fd = mkstemp(asm_file);
+    if (fd < 0) {
+        return -1;
+    }
+
+    if (write(fd, source, strlen(source)) != (ssize_t)strlen(source)) {
+        close(fd);
+        unlink(asm_file);
+        return -1;
+    }
+    close(fd);
+
+    snprintf(out_file, out_file_size, "%s.out", asm_file);
+    snprintf(lst_file, lst_file_size, "%s.lst", out_file);
+
+    ctx = asm_init();
+    if (!ctx) {
+        unlink(asm_file);
+        return -1;
+    }
+    ctx->emit_listing = true;
+
+    if (asm_assemble_file(ctx, asm_file) < 0) {
+        asm_free(ctx);
+        unlink(asm_file);
+        return -1;
+    }
+
+    if (asm_write_elf64(ctx, out_file) < 0) {
+        asm_free(ctx);
+        unlink(asm_file);
+        unlink(out_file);
+        unlink(lst_file);
+        return -1;
+    }
+
+    if (asm_write_listing(ctx, out_file) < 0) {
+        asm_free(ctx);
+        unlink(asm_file);
+        unlink(out_file);
+        unlink(lst_file);
+        return -1;
+    }
+
+    *out_ctx = ctx;
+    return 0;
+}
+
 /* Test: Simple exit program */
-int test_integration_exit(void) {
+static int test_integration_exit(void) {
     const char *source = 
         "section .text\n"
         "global _start\n"
@@ -191,7 +505,7 @@ int test_integration_exit(void) {
 }
 
 /* Test: Arithmetic operations */
-int test_integration_arithmetic(void) {
+static int test_integration_arithmetic(void) {
     const char *source = 
         "section .text\n"
         "global _start\n"
@@ -209,7 +523,7 @@ int test_integration_arithmetic(void) {
 }
 
 /* Test: Register moves */
-int test_integration_registers(void) {
+static int test_integration_registers(void) {
     const char *source = 
         "section .text\n"
         "global _start\n"
@@ -226,7 +540,7 @@ int test_integration_registers(void) {
 }
 
 /* Test: Conditional jump */
-int test_integration_conditional(void) {
+static int test_integration_conditional(void) {
     const char *source = 
         "section .text\n"
         "global _start\n"
@@ -248,7 +562,7 @@ int test_integration_conditional(void) {
 }
 
 /* Test: Loop */
-int test_integration_loop(void) {
+static int test_integration_loop(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -269,7 +583,7 @@ int test_integration_loop(void) {
 }
 
 /* Test: Local labels should be scoped to the nearest non-local label. */
-int test_integration_local_labels_scoped(void) {
+static int test_integration_local_labels_scoped(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -296,7 +610,7 @@ int test_integration_local_labels_scoped(void) {
 }
 
 /* Test: Anonymous labels should resolve with @B/@F references. */
-int test_integration_anonymous_labels(void) {
+static int test_integration_anonymous_labels(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -318,7 +632,7 @@ int test_integration_anonymous_labels(void) {
 }
 
 /* Test: Push and pop */
-int test_integration_pushpop(void) {
+static int test_integration_pushpop(void) {
     const char *source = 
         "section .text\n"
         "global _start\n"
@@ -337,7 +651,7 @@ int test_integration_pushpop(void) {
 }
 
 /* Test: Call and ret */
-int test_integration_callret(void) {
+static int test_integration_callret(void) {
     const char *source = 
         "section .text\n"
         "global _start\n"
@@ -358,7 +672,7 @@ int test_integration_callret(void) {
 }
 
 /* Test: enter/leave and legacy sign-extension helpers should assemble and execute */
-int test_integration_enter_legacy_signext(void) {
+static int test_integration_enter_legacy_signext(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -382,7 +696,7 @@ int test_integration_enter_legacy_signext(void) {
 }
 
 /* Test: 8-bit register operations */
-int test_integration_8bit(void) {
+static int test_integration_8bit(void) {
     /* Test 8-bit low registers (al, bl, cl, dl) which are more commonly used
      * Note: 8-bit high registers (ah, bh, ch, dh) have encoding limitations
      * in 64-bit mode with REX prefixes */
@@ -404,7 +718,7 @@ int test_integration_8bit(void) {
 }
 
 /* Test: Data section usage */
-int test_integration_data(void) {
+static int test_integration_data(void) {
     const char *source = 
         "section .data\n"
         "value: dq $72\n"
@@ -421,7 +735,7 @@ int test_integration_data(void) {
 }
 
 /* Test: Named section variants should map to data/text behavior */
-int test_integration_named_sections(void) {
+static int test_integration_named_sections(void) {
     const char *source =
         "section .data.custom\n"
         "value: dq $91\n"
@@ -438,7 +752,7 @@ int test_integration_named_sections(void) {
 }
 
 /* Test: segment alias should behave the same as section */
-int test_integration_segment_alias(void) {
+static int test_integration_segment_alias(void) {
     const char *source =
         "segment .data\n"
         "value: dq $66\n"
@@ -455,7 +769,7 @@ int test_integration_segment_alias(void) {
 }
 
 /* Test: Preprocessor directives should participate in assembly flow */
-int test_integration_preprocessor_conditionals(void) {
+static int test_integration_preprocessor_conditionals(void) {
     const char *source =
         "%define EXIT_CODE 23\n"
         "%if EXIT_CODE\n"
@@ -476,7 +790,7 @@ int test_integration_preprocessor_conditionals(void) {
 }
 
 /* Test: Empty program should fail gracefully */
-int test_integration_empty(void) {
+static int test_integration_empty(void) {
     const char *source = "";
     char *captured_err;
     
@@ -500,7 +814,7 @@ int test_integration_empty(void) {
 }
 
 /* Test: Invalid instruction should fail */
-int test_integration_invalid(void) {
+static int test_integration_invalid(void) {
     const char *source = 
         "section .text\n"
         "global _start\n"
@@ -528,7 +842,7 @@ int test_integration_invalid(void) {
 }
 
 /* Test: Invalid ENTER operand range should fail with clear diagnostic */
-int test_integration_enter_invalid_operands(void) {
+static int test_integration_enter_invalid_operands(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -560,7 +874,7 @@ int test_integration_enter_invalid_operands(void) {
 }
 
 /* Test: Invalid ENTER nesting-level operand should fail with clear diagnostic */
-int test_integration_enter_invalid_nesting(void) {
+static int test_integration_enter_invalid_nesting(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -591,8 +905,145 @@ int test_integration_enter_invalid_nesting(void) {
     return 0;
 }
 
+/* Test: integration failure matrix should emit actionable diagnostics across parser/encoder paths */
+static int test_integration_failure_scenarios_matrix(void) {
+    struct {
+        const char *name;
+        const char *source;
+        const char *must_contain_1;
+        const char *must_contain_2;
+    } cases[] = {
+        {
+            "unknown instruction typo",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    ad rax, rbx\n",
+            "Unknown instruction 'ad'",
+            "Did you mean 'add'"
+        },
+        {
+            "invalid memory scale",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    mov rax, [rbx + rcx * 5]\n",
+            "Expected scale factor (1, 2, 4, or 8)",
+            "Suggestion:"
+        },
+        {
+            "rip relative with index",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    mov rax, [rip + rcx * 2]\n",
+            "RIP-relative addressing cannot combine base/index registers",
+            "Suggestion:"
+        },
+        {
+            "segment override non-memory",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    mov rax, fs:rax\n",
+            "Segment override requires a memory operand",
+            "Suggestion:"
+        },
+        {
+            "sse move mem dst imm src",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    movups [rax], $1\n",
+            "memory destination requires XMM source",
+            "Suggestion:"
+        },
+        {
+            "sse arithmetic dst non xmm",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    addss rax, xmm1\n",
+            "destination must be XMM register",
+            "Suggestion:"
+        },
+        {
+            "enter size out of range",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    enter $70000, $0\n",
+            "enter first operand must fit in 16 bits",
+            "Suggestion:"
+        },
+        {
+            "enter nesting out of range",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    enter $0, $300\n",
+            "enter second operand must fit in 8 bits",
+            "Suggestion:"
+        },
+        {
+            "xchg high8 rex conflict",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    xchg ah, r8b\n",
+            "Cannot use AH/BH/CH/DH",
+            "Suggestion:"
+        },
+        {
+            "test high8 rex conflict",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    test ah, r8b\n",
+            "Cannot use AH/BH/CH/DH",
+            "Suggestion:"
+        },
+        {
+            "undefined label did you mean",
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    jmp donee\n"
+            "done:\n"
+            "    mov rax, $60\n"
+            "    mov rdi, $0\n"
+            "    syscall\n",
+            "Undefined symbol 'donee'",
+            "Did you mean 'done'"
+        }
+    };
+
+    size_t case_count = sizeof(cases) / sizeof(cases[0]);
+    for (size_t i = 0; i < case_count; i++) {
+        assembler_context_t *ctx = asm_init();
+        char *captured_err;
+        int result;
+
+        ASSERT_NOT_NULL(ctx);
+        ASSERT_EQ(0, test_capture_stderr_begin());
+        result = asm_assemble(ctx, cases[i].source);
+        captured_err = test_capture_stderr_end();
+        asm_free(ctx);
+
+        ASSERT_EQ(-1, result);
+        ASSERT_NOT_NULL(captured_err);
+        ASSERT_STR_CONTAINS(captured_err, cases[i].must_contain_1);
+        ASSERT_STR_CONTAINS(captured_err, cases[i].must_contain_2);
+        ASSERT_STR_CONTAINS(captured_err, "Error at line");
+
+        free(captured_err);
+    }
+
+    return 0;
+}
+
 /* Regression test: sectionless source should still enter at _start */
-int test_integration_sectionless_entrypoint(void) {
+static int test_integration_sectionless_entrypoint(void) {
     const char *source =
         "global _start\n"
         "_start:\n"
@@ -606,7 +1057,7 @@ int test_integration_sectionless_entrypoint(void) {
 }
 
 /* Test: Relative include file should be resolved from source file directory */
-int test_integration_include_relative(void) {
+static int test_integration_include_relative(void) {
     char dir_template[] = "/tmp/asm_inc_XXXXXX";
     char main_path[512];
     char include_path[512];
@@ -649,8 +1100,198 @@ int test_integration_include_relative(void) {
     return 0;
 }
 
+/* Test: Circular includes should fail with clear diagnostics */
+static int test_integration_include_circular_fails(void) {
+    char dir_template[] = "/tmp/asm_circular_inc_XXXXXX";
+    char main_path[512];
+    char a_path[512];
+    char b_path[512];
+    FILE *main_f;
+    FILE *a_f;
+    FILE *b_f;
+    assembler_context_t *ctx;
+    char *captured_err;
+    int result;
+
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
+    ASSERT_TRUE(snprintf(a_path, sizeof(a_path), "%s/a.inc", dir) < (int)sizeof(a_path));
+    ASSERT_TRUE(snprintf(b_path, sizeof(b_path), "%s/b.inc", dir) < (int)sizeof(b_path));
+
+    a_f = fopen(a_path, "w");
+    ASSERT_NOT_NULL(a_f);
+    fprintf(a_f, ".include \"b.inc\"\n");
+    fclose(a_f);
+
+    b_f = fopen(b_path, "w");
+    ASSERT_NOT_NULL(b_f);
+    fprintf(b_f, ".include \"a.inc\"\n");
+    fclose(b_f);
+
+    main_f = fopen(main_path, "w");
+    ASSERT_NOT_NULL(main_f);
+    fprintf(main_f,
+            "section .text\n"
+            "global _start\n"
+            ".include \"a.inc\"\n"
+            "_start:\n"
+            "    mov rax, $60\n"
+            "    xor rdi, rdi\n"
+            "    syscall\n");
+    fclose(main_f);
+
+    ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    result = asm_assemble_file(ctx, main_path);
+    captured_err = test_capture_stderr_end();
+    asm_free(ctx);
+
+    unlink(main_path);
+    unlink(a_path);
+    unlink(b_path);
+    rmdir(dir);
+
+    ASSERT_EQ(-1, result);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Circular include detected");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+
+    free(captured_err);
+    return 0;
+}
+
+/* Test: Duplicate include should assemble deterministically without crashing */
+static int test_integration_include_duplicate_symbol_handled(void) {
+    char dir_template[] = "/tmp/asm_dup_inc_XXXXXX";
+    char main_path[512];
+    char common_path[512];
+    FILE *main_f;
+    FILE *common_f;
+    assembler_context_t *ctx;
+    char *captured_err;
+    int result;
+    int exit_code;
+
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
+    ASSERT_TRUE(snprintf(common_path, sizeof(common_path), "%s/common.inc", dir) < (int)sizeof(common_path));
+
+    common_f = fopen(common_path, "w");
+    ASSERT_NOT_NULL(common_f);
+        fprintf(common_f, "helper:\n    nop\n");
+    fclose(common_f);
+
+    main_f = fopen(main_path, "w");
+    ASSERT_NOT_NULL(main_f);
+    fprintf(main_f,
+            "section .text\n"
+            "global _start\n"
+            ".include \"common.inc\"\n"
+            ".include \"common.inc\"\n"
+            "_start:\n"
+                "    mov rax, $60\n"
+                "    xor rdi, rdi\n"
+                "    syscall\n");
+    fclose(main_f);
+
+    ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    result = asm_assemble_file(ctx, main_path);
+    captured_err = test_capture_stderr_end();
+    asm_free(ctx);
+
+    exit_code = assemble_file_and_run(main_path);
+
+    unlink(main_path);
+    unlink(common_path);
+    rmdir(dir);
+
+    ASSERT_EQ(0, result);
+    ASSERT_EQ(0, exit_code);
+    ASSERT_NOT_NULL(captured_err);
+    if (captured_err[0] != '\0') {
+        ASSERT_STR_CONTAINS(captured_err, "Redefined");
+        ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+    }
+
+    free(captured_err);
+    return 0;
+}
+
+/* Test: Include nesting beyond MAX_INCLUDE_DEPTH should fail with actionable diagnostics */
+static int test_integration_include_depth_overflow_fails(void) {
+    char dir_template[] = "/tmp/asm_inc_depth_XXXXXX";
+    char main_path[512];
+    char paths[12][512];
+    FILE *f;
+    assembler_context_t *ctx;
+    char *captured_err;
+    int result;
+
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
+    for (int i = 0; i < 12; i++) {
+        ASSERT_TRUE(snprintf(paths[i], sizeof(paths[i]), "%s/inc%02d.inc", dir, i + 1) < (int)sizeof(paths[i]));
+    }
+
+    for (int i = 0; i < 12; i++) {
+        f = fopen(paths[i], "w");
+        ASSERT_NOT_NULL(f);
+        if (i < 11) {
+            fprintf(f, ".include \"inc%02d.inc\"\n", i + 2);
+        } else {
+            fprintf(f, "done_label:\n    nop\n");
+        }
+        fclose(f);
+    }
+
+    f = fopen(main_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "global _start\n"
+            ".include \"inc01.inc\"\n"
+            "_start:\n"
+            "    mov rax, $60\n"
+            "    xor rdi, rdi\n"
+            "    syscall\n");
+    fclose(f);
+
+    ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    ASSERT_EQ(0, test_capture_stderr_begin());
+    result = asm_assemble_file(ctx, main_path);
+    captured_err = test_capture_stderr_end();
+    asm_free(ctx);
+
+    unlink(main_path);
+    for (int i = 0; i < 12; i++) {
+        unlink(paths[i]);
+    }
+    rmdir(dir);
+
+    ASSERT_EQ(-1, result);
+    ASSERT_NOT_NULL(captured_err);
+    ASSERT_STR_CONTAINS(captured_err, "Include depth exceeded");
+    ASSERT_STR_CONTAINS(captured_err, "Suggestion:");
+
+    free(captured_err);
+    return 0;
+}
+
 /* Test: SSE instructions should assemble and execute in a simple program */
-int test_integration_sse_smoke(void) {
+static int test_integration_sse_smoke(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -671,7 +1312,7 @@ int test_integration_sse_smoke(void) {
 }
 
 /* Test: Mix SSE operations with integer loop/control-flow paths */
-int test_integration_sse_mixed_controlflow(void) {
+static int test_integration_sse_mixed_controlflow(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -698,7 +1339,7 @@ int test_integration_sse_mixed_controlflow(void) {
 }
 
 /* Test: Scalar SSE result should round-trip back into scalar register path */
-int test_integration_sse_scalar_to_gpr_runtime(void) {
+static int test_integration_sse_scalar_to_gpr_runtime(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -727,7 +1368,7 @@ int test_integration_sse_scalar_to_gpr_runtime(void) {
 }
 
 /* Test: Program should touch all 16 XMM registers and execute deterministically */
-int test_integration_sse_all_xmm_registers_runtime(void) {
+static int test_integration_sse_all_xmm_registers_runtime(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -761,7 +1402,7 @@ int test_integration_sse_all_xmm_registers_runtime(void) {
 }
 
 /* Test: Label subtraction in equ should resolve to absolute immediate constant. */
-int test_integration_label_arithmetic_equ(void) {
+static int test_integration_label_arithmetic_equ(void) {
     const char *source =
         "section .text\n"
         "start:\n"
@@ -780,7 +1421,7 @@ int test_integration_label_arithmetic_equ(void) {
 }
 
 /* Test: weak/hidden directives should mark symbol attributes in the table. */
-int test_integration_weak_hidden_attributes(void) {
+static int test_integration_weak_hidden_attributes(void) {
     const char *source =
         "section .text\n"
         "bar:\n"
@@ -810,7 +1451,7 @@ int test_integration_weak_hidden_attributes(void) {
 }
 
 /* Test: Multiple SSE instructions in sequence should execute and produce stable result */
-int test_integration_sse_sequence_runtime(void) {
+static int test_integration_sse_sequence_runtime(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -842,7 +1483,7 @@ int test_integration_sse_sequence_runtime(void) {
 }
 
 /* Test: SSE helper call should preserve caller XMM state via explicit save/restore */
-int test_integration_sse_function_call_preserve_runtime(void) {
+static int test_integration_sse_function_call_preserve_runtime(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -877,7 +1518,7 @@ int test_integration_sse_function_call_preserve_runtime(void) {
 }
 
 /* Test: Packed SSE arithmetic should produce deterministic memory result */
-int test_integration_sse_packed_arith_runtime(void) {
+static int test_integration_sse_packed_arith_runtime(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -906,7 +1547,7 @@ int test_integration_sse_packed_arith_runtime(void) {
 }
 
 /* Test: Packed compare/logical path should propagate all-ones lane pattern */
-int test_integration_sse_packed_logic_runtime(void) {
+static int test_integration_sse_packed_logic_runtime(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -930,7 +1571,7 @@ int test_integration_sse_packed_logic_runtime(void) {
 }
 
 /* Test: Packed SSE arithmetic with SIB-indexed memory operands should execute correctly */
-int test_integration_sse_packed_sib_runtime(void) {
+static int test_integration_sse_packed_sib_runtime(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -965,7 +1606,7 @@ int test_integration_sse_packed_sib_runtime(void) {
 }
 
 /* Test: Packed compare/logical ops with SIB-indexed memory should execute correctly */
-int test_integration_sse_packed_logic_sib_runtime(void) {
+static int test_integration_sse_packed_logic_sib_runtime(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -993,7 +1634,7 @@ int test_integration_sse_packed_logic_sib_runtime(void) {
 }
 
 /* Test: High 8-bit register should fail when paired with REX-required register */
-int test_integration_high8_rex_conflict(void) {
+static int test_integration_high8_rex_conflict(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -1018,7 +1659,7 @@ int test_integration_high8_rex_conflict(void) {
 }
 
 /* Test: -g should emit DWARF sections into ELF output */
-int test_integration_dwarf_sections(void) {
+static int test_integration_dwarf_sections(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -1030,10 +1671,10 @@ int test_integration_dwarf_sections(void) {
         "    syscall\n"
         "helper:\n"
         "    ret\n";
-    char asm_file[] = "/tmp/test_dbg_XXXXXX.asm";
+    char asm_file[] = "/tmp/test_dbg_XXXXXX";
     char bin_file[256];
     char dbg_file[300];
-    int fd = mkstemps(asm_file, 4);
+    int fd = mkstemp(asm_file);
     int found_info = 0;
     int found_abbrev = 0;
     int found_line = 0;
@@ -1108,7 +1749,7 @@ int test_integration_dwarf_sections(void) {
                                    ((uint32_t)info[1] << 8) |
                                    ((uint32_t)info[2] << 16) |
                                    ((uint32_t)info[3] << 24);
-            uint16_t version = (uint16_t)info[4] | ((uint16_t)info[5] << 8);
+            uint16_t version = (uint16_t)((uint16_t)info[4] | ((uint16_t)info[5] << 8));
             uint32_t abbrev_offset = (uint32_t)info[6] |
                                      ((uint32_t)info[7] << 8) |
                                      ((uint32_t)info[8] << 16) |
@@ -1127,7 +1768,7 @@ int test_integration_dwarf_sections(void) {
                 size_t p = 12;
                 size_t cu_attr_size = 4 + 2 + 4 + 4 + 4 + 8 + 8;
                 if (p + cu_attr_size <= info_len) {
-                    uint16_t language = (uint16_t)info[p + 4] | ((uint16_t)info[p + 5] << 8);
+                    uint16_t language = (uint16_t)((uint16_t)info[p + 4] | ((uint16_t)info[p + 5] << 8));
                     if (language == 0x0001) {
                         debug_info_language_ok = 1;
                     }
@@ -1247,7 +1888,7 @@ int test_integration_dwarf_sections(void) {
                                             ((uint32_t)line[1] << 8) |
                                             ((uint32_t)line[2] << 16) |
                                             ((uint32_t)line[3] << 24);
-                uint16_t line_version = (uint16_t)line[4] | ((uint16_t)line[5] << 8);
+                uint16_t line_version = (uint16_t)((uint16_t)line[4] | ((uint16_t)line[5] << 8));
                 uint32_t header_length = (uint32_t)line[6] |
                                          ((uint32_t)line[7] << 8) |
                                          ((uint32_t)line[8] << 16) |
@@ -1323,7 +1964,7 @@ int test_integration_dwarf_sections(void) {
 }
 
 /* Test: Validate DWARF output using readelf debug dump when tool is available */
-int test_integration_dwarf_readelf_validation(void) {
+static int test_integration_dwarf_readelf_validation(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -1335,9 +1976,9 @@ int test_integration_dwarf_readelf_validation(void) {
         "    syscall\n"
         "helper:\n"
         "    ret\n";
-    char asm_file[] = "/tmp/test_dbg_readelf_XXXXXX.asm";
+    char asm_file[] = "/tmp/test_dbg_readelf_XXXXXX";
     char bin_file[256];
-    int fd = mkstemps(asm_file, 4);
+    int fd = mkstemp(asm_file);
     char cmd[512];
     char line[512];
     int saw_comp_dir = 0;
@@ -1412,7 +2053,7 @@ int test_integration_dwarf_readelf_validation(void) {
 }
 
 /* Test: Validate DWARF output using dwarfdump/llvm-dwarfdump when available */
-int test_integration_dwarf_dwarfdump_validation(void) {
+static int test_integration_dwarf_dwarfdump_validation(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -1424,9 +2065,9 @@ int test_integration_dwarf_dwarfdump_validation(void) {
         "    syscall\n"
         "helper:\n"
         "    ret\n";
-    char asm_file[] = "/tmp/test_dbg_dwarfdump_XXXXXX.asm";
+    char asm_file[] = "/tmp/test_dbg_dwarfdump_XXXXXX";
     char bin_file[256];
-    int fd = mkstemps(asm_file, 4);
+    int fd = mkstemp(asm_file);
     char cmd[512];
     char line[512];
     int saw_compile_unit = 0;
@@ -1494,10 +2135,10 @@ int test_integration_dwarf_dwarfdump_validation(void) {
 }
 
 /* Test: DWARF generation should fail gracefully when debug buffers are exceeded */
-int test_integration_dwarf_overflow_failure(void) {
-    char asm_file[] = "/tmp/test_dbg_ovf_XXXXXX.asm";
+static int test_integration_dwarf_overflow_failure(void) {
+    char asm_file[] = "/tmp/test_dbg_ovf_XXXXXX";
     char bin_file[256];
-    int fd = mkstemps(asm_file, 4);
+    int fd = mkstemp(asm_file);
     assembler_context_t *ctx;
     char *source;
     size_t cap = 220000;
@@ -1563,7 +2204,7 @@ int test_integration_dwarf_overflow_failure(void) {
 }
 
 /* Test: .debug_line should carry known source line mappings for a simple program */
-int test_integration_dwarf_line_table_known_lines(void) {
+static int test_integration_dwarf_line_table_known_lines(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -1573,9 +2214,9 @@ int test_integration_dwarf_line_table_known_lines(void) {
         "    add rdi, $3\n"
         "    mov rax, $60\n"
         "    syscall\n";
-    char asm_file[] = "/tmp/test_dbg_line_XXXXXX.asm";
+    char asm_file[] = "/tmp/test_dbg_line_XXXXXX";
     char bin_file[256];
-    int fd = mkstemps(asm_file, 4);
+    int fd = mkstemp(asm_file);
     unsigned char *bytes = NULL;
     int saw_line_4 = 0;
     int saw_line_5 = 0;
@@ -1637,7 +2278,7 @@ int test_integration_dwarf_line_table_known_lines(void) {
                            ((uint32_t)line_sec[1] << 8) |
                            ((uint32_t)line_sec[2] << 16) |
                            ((uint32_t)line_sec[3] << 24);
-    uint16_t version = (uint16_t)line_sec[4] | ((uint16_t)line_sec[5] << 8);
+    uint16_t version = (uint16_t)((uint16_t)line_sec[4] | ((uint16_t)line_sec[5] << 8));
     uint32_t header_length = (uint32_t)line_sec[6] |
                              ((uint32_t)line_sec[7] << 8) |
                              ((uint32_t)line_sec[8] << 16) |
@@ -1699,7 +2340,7 @@ int test_integration_dwarf_line_table_known_lines(void) {
 }
 
 /* Test: DWARF DIE names should stay consistent with text symbols in .symtab */
-int test_integration_dwarf_symbol_table_crosscheck(void) {
+static int test_integration_dwarf_symbol_table_crosscheck(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -1711,9 +2352,9 @@ int test_integration_dwarf_symbol_table_crosscheck(void) {
         "    syscall\n"
         "helper:\n"
         "    ret\n";
-    char asm_file[] = "/tmp/test_dbg_sym_XXXXXX.asm";
+    char asm_file[] = "/tmp/test_dbg_sym_XXXXXX";
     char bin_file[256];
-    int fd = mkstemps(asm_file, 4);
+    int fd = mkstemp(asm_file);
     char cmd[512];
     char line[512];
     unsigned char *bytes = NULL;
@@ -1817,10 +2458,10 @@ int test_integration_dwarf_symbol_table_crosscheck(void) {
 }
 
 /* Test: Large (50+ function) DWARF generation should succeed and remain structured */
-int test_integration_dwarf_large_program_success(void) {
-    char asm_file[] = "/tmp/test_dbg_large_ok_XXXXXX.asm";
+static int test_integration_dwarf_large_program_success(void) {
+    char asm_file[] = "/tmp/test_dbg_large_ok_XXXXXX";
     char bin_file[256];
-    int fd = mkstemps(asm_file, 4);
+    int fd = mkstemp(asm_file);
     assembler_context_t *ctx;
     char *source;
     size_t cap = 160000;
@@ -1909,7 +2550,7 @@ int test_integration_dwarf_large_program_success(void) {
 }
 
 /* Test: All supported output formats should write valid artifacts */
-int test_integration_output_formats_compile(void) {
+static int test_integration_output_formats_compile(void) {
     const char *source =
         "section .text\n"
         "global _start\n"
@@ -1917,7 +2558,7 @@ int test_integration_output_formats_compile(void) {
         "    mov rax, $60\n"
         "    mov rdi, $0\n"
         "    syscall\n";
-    char asm_file[] = "/tmp/test_fmt_src_XXXXXX.asm";
+    char asm_file[] = "/tmp/test_fmt_src_XXXXXX";
     char out_elf[] = "/tmp/test_fmt_elf_XXXXXX";
     char out_bin[] = "/tmp/test_fmt_bin_XXXXXX";
     char out_hex[] = "/tmp/test_fmt_hex_XXXXXX";
@@ -1926,7 +2567,7 @@ int test_integration_output_formats_compile(void) {
     assembler_context_t *ctx = NULL;
     struct stat st;
 
-    asm_fd = mkstemps(asm_file, 4);
+    asm_fd = mkstemp(asm_file);
     ASSERT_TRUE(asm_fd >= 0);
     ASSERT_EQ((int)strlen(source), (int)write(asm_fd, source, strlen(source)));
     close(asm_fd);
@@ -1991,6 +2632,963 @@ int test_integration_output_formats_compile(void) {
     return 0;
 }
 
+/* Test: listing generation should produce a readable file with expected sections */
+static int test_integration_listing_file_sections(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n";
+    char asm_file[256];
+    char out_file[256];
+    char lst_file[256];
+    assembler_context_t *ctx = NULL;
+    struct stat st;
+    char line[512];
+    int saw_header = 0;
+    int saw_symbols = 0;
+
+    ASSERT_EQ(0, assemble_and_write_listing(source,
+                                            asm_file, sizeof(asm_file),
+                                            out_file, sizeof(out_file),
+                                            lst_file, sizeof(lst_file),
+                                            &ctx));
+    ASSERT_NOT_NULL(ctx);
+
+    ASSERT_EQ(0, stat(lst_file, &st));
+    ASSERT_TRUE(st.st_size > 0);
+
+    FILE *f = fopen(lst_file, "r");
+    ASSERT_NOT_NULL(f);
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "Line   Address  Machine Code") != NULL) {
+            saw_header = 1;
+        }
+        if (strstr(line, "; Symbol Table") != NULL) {
+            saw_symbols = 1;
+        }
+    }
+    fclose(f);
+
+    ASSERT_TRUE(saw_header);
+    ASSERT_TRUE(saw_symbols);
+
+    asm_free(ctx);
+    unlink(asm_file);
+    unlink(out_file);
+    unlink(lst_file);
+    return 0;
+}
+
+/* Test: listing should contain instruction/data rows with source snippets */
+static int test_integration_listing_rows_present(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n"
+        "section .data\n"
+        "msg: db \"OK\", 10\n";
+    char asm_file[256];
+    char out_file[256];
+    char lst_file[256];
+    assembler_context_t *ctx = NULL;
+    char line[512];
+    int row_count = 0;
+    int saw_mov = 0;
+
+    ASSERT_EQ(0, assemble_and_write_listing(source,
+                                            asm_file, sizeof(asm_file),
+                                            out_file, sizeof(out_file),
+                                            lst_file, sizeof(lst_file),
+                                            &ctx));
+    ASSERT_NOT_NULL(ctx);
+
+    FILE *f = fopen(lst_file, "r");
+    ASSERT_NOT_NULL(f);
+    while (fgets(line, sizeof(line), f)) {
+        listing_row_t row;
+        if (parse_listing_row(line, &row)) {
+            row_count++;
+            if (strstr(line, "mov rax") != NULL) {
+                saw_mov = 1;
+            }
+        }
+    }
+    fclose(f);
+
+    ASSERT_TRUE(row_count >= 3);
+    ASSERT_TRUE(saw_mov);
+
+    asm_free(ctx);
+    unlink(asm_file);
+    unlink(out_file);
+    unlink(lst_file);
+    return 0;
+}
+
+/* Test: listing row addresses should be monotonic non-decreasing */
+static int test_integration_listing_address_monotonic(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $1\n"
+        "    mov rdi, $1\n"
+        "    syscall\n"
+        "section .data\n"
+        "v: dq 0x11223344\n";
+    char asm_file[256];
+    char out_file[256];
+    char lst_file[256];
+    assembler_context_t *ctx = NULL;
+    char line[512];
+    uint64_t prev = 0;
+    int saw_any = 0;
+
+    ASSERT_EQ(0, assemble_and_write_listing(source,
+                                            asm_file, sizeof(asm_file),
+                                            out_file, sizeof(out_file),
+                                            lst_file, sizeof(lst_file),
+                                            &ctx));
+    ASSERT_NOT_NULL(ctx);
+
+    FILE *f = fopen(lst_file, "r");
+    ASSERT_NOT_NULL(f);
+    while (fgets(line, sizeof(line), f)) {
+        listing_row_t row;
+        if (!parse_listing_row(line, &row)) {
+            continue;
+        }
+        if (!saw_any) {
+            prev = row.address;
+            saw_any = 1;
+            continue;
+        }
+        ASSERT_TRUE(row.address >= prev);
+        prev = row.address;
+    }
+    fclose(f);
+
+    ASSERT_TRUE(saw_any);
+
+    asm_free(ctx);
+    unlink(asm_file);
+    unlink(out_file);
+    unlink(lst_file);
+    return 0;
+}
+
+/* Test: listing bytes should match assembled text/data buffers by absolute address */
+static int test_integration_listing_bytes_match_buffers(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n"
+        "section .data\n"
+        "msg: db \"ABC\", 10\n";
+    char asm_file[256];
+    char out_file[256];
+    char lst_file[256];
+    assembler_context_t *ctx = NULL;
+    char line[512];
+    int matched_rows = 0;
+
+    ASSERT_EQ(0, assemble_and_write_listing(source,
+                                            asm_file, sizeof(asm_file),
+                                            out_file, sizeof(out_file),
+                                            lst_file, sizeof(lst_file),
+                                            &ctx));
+    ASSERT_NOT_NULL(ctx);
+
+    FILE *f = fopen(lst_file, "r");
+    ASSERT_NOT_NULL(f);
+    while (fgets(line, sizeof(line), f)) {
+        listing_row_t row;
+        if (!parse_listing_row(line, &row)) {
+            continue;
+        }
+
+        uint64_t offset = row.address - ctx->base_address;
+        for (int i = 0; i < row.byte_count; i++) {
+            uint8_t expected;
+            if (offset + (uint64_t)i < (uint64_t)ctx->text_size) {
+                expected = ctx->text_section[offset + (uint64_t)i];
+            } else {
+                uint64_t data_off = (offset + (uint64_t)i) - (uint64_t)ctx->text_size;
+                ASSERT_TRUE(data_off < (uint64_t)ctx->data_size);
+                expected = ctx->data_section[data_off];
+            }
+            ASSERT_EQ_HEX(expected, row.bytes[i]);
+        }
+        matched_rows++;
+    }
+    fclose(f);
+
+    ASSERT_TRUE(matched_rows > 0);
+
+    asm_free(ctx);
+    unlink(asm_file);
+    unlink(out_file);
+    unlink(lst_file);
+    return 0;
+}
+
+/* Test: listing symbol appendix should contain key symbols with section labels */
+static int test_integration_listing_symbol_table_entries(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $0\n"
+        "    syscall\n"
+        "section .data\n"
+        "msg: db \"Hello\", 0\n";
+    char asm_file[256];
+    char out_file[256];
+    char lst_file[256];
+    assembler_context_t *ctx = NULL;
+    char line[512];
+    int saw_start = 0;
+    int saw_msg = 0;
+
+    ASSERT_EQ(0, assemble_and_write_listing(source,
+                                            asm_file, sizeof(asm_file),
+                                            out_file, sizeof(out_file),
+                                            lst_file, sizeof(lst_file),
+                                            &ctx));
+    ASSERT_NOT_NULL(ctx);
+
+    FILE *f = fopen(lst_file, "r");
+    ASSERT_NOT_NULL(f);
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "; _start") != NULL && strstr(line, "text") != NULL) {
+            saw_start = 1;
+        }
+        if (strstr(line, "; msg") != NULL) {
+            saw_msg = 1;
+        }
+    }
+    fclose(f);
+
+    ASSERT_TRUE(saw_start);
+    ASSERT_TRUE(saw_msg);
+
+    asm_free(ctx);
+    unlink(asm_file);
+    unlink(out_file);
+    unlink(lst_file);
+    return 0;
+}
+
+/* Test: compare disassembler mnemonic coverage against objdump for a representative program */
+static int test_integration_disassembler_objdump_semantic_compare(void) {
+    const char *mnemonics[] = {"push", "mov", "sub", "cmp", "jle", "xor", "movsxd"};
+    const char *target_bin = "./bin/x86_64-asm";
+    char cmd[512];
+    char line[512];
+    int saw_ours[7] = {0, 0, 0, 0, 0, 0, 0};
+    int saw_objdump[7] = {0, 0, 0, 0, 0, 0, 0};
+
+    if (system("command -v objdump >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ASSERT_TRUE(access(target_bin, X_OK) == 0);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd), "./bin/x86_64-asm --disassemble %s 2>/dev/null", target_bin) < (int)sizeof(cmd));
+    {
+        FILE *ours = popen(cmd, "r");
+        ASSERT_NOT_NULL(ours);
+        while (fgets(line, sizeof(line), ours)) {
+            for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+                if (strstr(line, mnemonics[i]) != NULL) {
+                    saw_ours[i] = 1;
+                }
+            }
+        }
+        {
+            int ours_status = pclose(ours);
+            ASSERT_EQ(0, ours_status);
+        }
+    }
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd), "objdump -d -M intel %s 2>/dev/null", target_bin) < (int)sizeof(cmd));
+    {
+        FILE *objdump = popen(cmd, "r");
+        ASSERT_NOT_NULL(objdump);
+        while (fgets(line, sizeof(line), objdump)) {
+            for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+                if (strstr(line, mnemonics[i]) != NULL) {
+                    saw_objdump[i] = 1;
+                }
+            }
+        }
+        {
+            int objdump_status = pclose(objdump);
+            ASSERT_EQ(0, objdump_status);
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_objdump[i]);
+        ASSERT_TRUE(saw_ours[i]);
+    }
+
+    return 0;
+}
+
+/* Test: compare 0x66 operand-override semantic mnemonics against objdump on controlled bytes */
+static int test_integration_disassembler_objdump_operand_override_fixture(void) {
+    static const uint8_t code[] = {
+        0x66, 0x0f, 0xbe, 0xc1,
+        0x66, 0x0f, 0xbf, 0xc2,
+        0x66, 0x0f, 0xaf, 0xc1,
+        0x66, 0x0f, 0xa3, 0xc1,
+        0x66, 0x0f, 0xab, 0xc1,
+        0x66, 0x0f, 0xb3, 0xc1,
+        0x66, 0x0f, 0xbb, 0xc1
+    };
+    const char *mnemonics[] = {"movsx", "imul", "bt", "bts", "btr", "btc"};
+    char cmd[512];
+    char line[512];
+    char raw_file[] = "/tmp/test_disasm_raw_XXXXXX";
+    int fd;
+    int saw_ours[6] = {0, 0, 0, 0, 0, 0};
+    int saw_objdump[6] = {0, 0, 0, 0, 0, 0};
+    char *ours_text;
+
+    if (system("command -v objdump >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ours_text = disassemble_buffer_to_string(code, sizeof(code), 0x500000U);
+    ASSERT_NOT_NULL(ours_text);
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        if (strstr(ours_text, mnemonics[i]) != NULL) {
+            saw_ours[i] = 1;
+        }
+    }
+
+    fd = mkstemp(raw_file);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)sizeof(code), (int)write(fd, code, sizeof(code)));
+    close(fd);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd),
+                         "objdump -D -b binary -m i386:x86-64 -M intel %s 2>/dev/null",
+                         raw_file) < (int)sizeof(cmd));
+    {
+        FILE *objdump = popen(cmd, "r");
+        ASSERT_NOT_NULL(objdump);
+        while (fgets(line, sizeof(line), objdump)) {
+            for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+                if (strstr(line, mnemonics[i]) != NULL) {
+                    saw_objdump[i] = 1;
+                }
+            }
+        }
+        {
+            int objdump_status = pclose(objdump);
+            ASSERT_EQ(0, objdump_status);
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_objdump[i]);
+        ASSERT_TRUE(saw_ours[i]);
+    }
+
+    free(ours_text);
+    unlink(raw_file);
+    return 0;
+}
+
+/* Test: compare 0F BA immediate bit-test semantic mnemonics against objdump on controlled bytes */
+static int test_integration_disassembler_objdump_bit_test_immediate_fixture(void) {
+    static const uint8_t code[] = {
+        0x48, 0x0f, 0xba, 0xe0, 0x05,
+        0x48, 0x0f, 0xba, 0xe9, 0x07,
+        0x48, 0x0f, 0xba, 0xf2, 0x03,
+        0x48, 0x0f, 0xba, 0xfb, 0x01,
+        0x48, 0x0f, 0xba, 0xac, 0x8b, 0x20, 0x00, 0x00, 0x00, 0x09,
+        0x66, 0x0f, 0xba, 0xe1, 0x04
+    };
+    const char *mnemonics[] = {"bt", "bts", "btr", "btc"};
+    char cmd[512];
+    char line[512];
+    char raw_file[] = "/tmp/test_disasm_ba_raw_XXXXXX";
+    int fd;
+    int saw_ours[4] = {0, 0, 0, 0};
+    int saw_objdump[4] = {0, 0, 0, 0};
+    char *ours_text;
+
+    if (system("command -v objdump >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ours_text = disassemble_buffer_to_string(code, sizeof(code), 0x510000U);
+    ASSERT_NOT_NULL(ours_text);
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        if (strstr(ours_text, mnemonics[i]) != NULL) {
+            saw_ours[i] = 1;
+        }
+    }
+
+    fd = mkstemp(raw_file);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)sizeof(code), (int)write(fd, code, sizeof(code)));
+    close(fd);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd),
+                         "objdump -D -b binary -m i386:x86-64 -M intel %s 2>/dev/null",
+                         raw_file) < (int)sizeof(cmd));
+    {
+        FILE *objdump = popen(cmd, "r");
+        ASSERT_NOT_NULL(objdump);
+        while (fgets(line, sizeof(line), objdump)) {
+            for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+                if (strstr(line, mnemonics[i]) != NULL) {
+                    saw_objdump[i] = 1;
+                }
+            }
+        }
+        {
+            int objdump_status = pclose(objdump);
+            ASSERT_EQ(0, objdump_status);
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_objdump[i]);
+        ASSERT_TRUE(saw_ours[i]);
+    }
+
+    free(ours_text);
+    unlink(raw_file);
+    return 0;
+}
+
+/* Test: compare bsf/bsr/test semantic mnemonics against objdump on controlled bytes */
+static int test_integration_disassembler_objdump_bit_scan_and_test_fixture(void) {
+    static const uint8_t code[] = {
+        0x48, 0x0f, 0xbc, 0xc3,
+        0x48, 0x0f, 0xbd, 0x45, 0xf8,
+        0x48, 0x85, 0xc8,
+        0x48, 0x85, 0x8c, 0x8b, 0x10, 0x00, 0x00, 0x00,
+        0x66, 0x0f, 0xbc, 0xc1,
+        0x66, 0x0f, 0xbd, 0xc2,
+        0x66, 0x85, 0xc8
+    };
+    const char *mnemonics[] = {"bsf", "bsr", "test"};
+    char cmd[512];
+    char line[512];
+    char raw_file[] = "/tmp/test_disasm_bscan_raw_XXXXXX";
+    int fd;
+    int saw_ours[3] = {0, 0, 0};
+    int saw_objdump[3] = {0, 0, 0};
+    char *ours_text;
+
+    if (system("command -v objdump >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ours_text = disassemble_buffer_to_string(code, sizeof(code), 0x520000U);
+    ASSERT_NOT_NULL(ours_text);
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        if (strstr(ours_text, mnemonics[i]) != NULL) {
+            saw_ours[i] = 1;
+        }
+    }
+
+    fd = mkstemp(raw_file);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)sizeof(code), (int)write(fd, code, sizeof(code)));
+    close(fd);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd),
+                         "objdump -D -b binary -m i386:x86-64 -M intel %s 2>/dev/null",
+                         raw_file) < (int)sizeof(cmd));
+    {
+        FILE *objdump = popen(cmd, "r");
+        ASSERT_NOT_NULL(objdump);
+        while (fgets(line, sizeof(line), objdump)) {
+            for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+                if (strstr(line, mnemonics[i]) != NULL) {
+                    saw_objdump[i] = 1;
+                }
+            }
+        }
+        {
+            int objdump_status = pclose(objdump);
+            ASSERT_EQ(0, objdump_status);
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_objdump[i]);
+        ASSERT_TRUE(saw_ours[i]);
+    }
+
+    free(ours_text);
+    unlink(raw_file);
+    return 0;
+}
+
+/* Test: compare xadd/cmpxchg semantic mnemonics against objdump with RIP-relative and SIB addressing */
+static int test_integration_disassembler_objdump_xadd_cmpxchg_fixture(void) {
+    static const uint8_t code[] = {
+        0x48, 0x0f, 0xc1, 0xd8,
+        0x0f, 0xc0, 0xc1,
+        0x48, 0x0f, 0xb1, 0xd1,
+        0x66, 0x0f, 0xb1, 0xc8,
+        0x48, 0x0f, 0xc1, 0x0d, 0x20, 0x00, 0x00, 0x00,
+        0x48, 0x0f, 0xb1, 0x15, 0x10, 0x00, 0x00, 0x00,
+        0x0f, 0xc1, 0x44, 0x8b, 0x10
+    };
+    const char *mnemonics[] = {"xadd", "cmpxchg"};
+    char cmd[512];
+    char line[512];
+    char raw_file[] = "/tmp/test_disasm_xadd_raw_XXXXXX";
+    int fd;
+    int saw_ours[2] = {0, 0};
+    int saw_objdump[2] = {0, 0};
+    int saw_rip_ours = 0;
+    int saw_rip_objdump = 0;
+    char *ours_text;
+
+    if (system("command -v objdump >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ours_text = disassemble_buffer_to_string(code, sizeof(code), 0x530000U);
+    ASSERT_NOT_NULL(ours_text);
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        if (strstr(ours_text, mnemonics[i]) != NULL) {
+            saw_ours[i] = 1;
+        }
+    }
+    if (strstr(ours_text, "[rip+") != NULL || strstr(ours_text, "[rip-") != NULL) {
+        saw_rip_ours = 1;
+    }
+
+    fd = mkstemp(raw_file);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)sizeof(code), (int)write(fd, code, sizeof(code)));
+    close(fd);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd),
+                         "objdump -D -b binary -m i386:x86-64 -M intel %s 2>/dev/null",
+                         raw_file) < (int)sizeof(cmd));
+    {
+        FILE *objdump = popen(cmd, "r");
+        ASSERT_NOT_NULL(objdump);
+        while (fgets(line, sizeof(line), objdump)) {
+            for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+                if (strstr(line, mnemonics[i]) != NULL) {
+                    saw_objdump[i] = 1;
+                }
+            }
+            if (strstr(line, "[rip+") != NULL || strstr(line, "[rip-") != NULL) {
+                saw_rip_objdump = 1;
+            }
+        }
+        {
+            int objdump_status = pclose(objdump);
+            ASSERT_EQ(0, objdump_status);
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_objdump[i]);
+        ASSERT_TRUE(saw_ours[i]);
+    }
+    ASSERT_TRUE(saw_rip_ours);
+    ASSERT_TRUE(saw_rip_objdump);
+
+    free(ours_text);
+    unlink(raw_file);
+    return 0;
+}
+
+/* Test: compare setcc and movzx/movsx edge semantic mnemonics against objdump */
+static int test_integration_disassembler_objdump_setcc_movx_edge_fixture(void) {
+    static const uint8_t code[] = {
+        0x0f, 0x94, 0xc4,
+        0x40, 0x0f, 0x94, 0xc4,
+        0x44, 0x0f, 0xb6, 0xc4,
+        0x0f, 0xbe, 0xc4,
+        0x40, 0x0f, 0xbe, 0xc4,
+        0x66, 0x0f, 0xb7, 0xc1,
+        0x0f, 0x95, 0x05, 0x34, 0x12, 0x00, 0x00,
+        0x48, 0x0f, 0xb6, 0x0d, 0x10, 0x00, 0x00, 0x00
+    };
+    const char *mnemonics[] = {"set", "movzx", "movsx"};
+    char cmd[512];
+    char line[512];
+    char raw_file[] = "/tmp/test_disasm_setcc_movx_raw_XXXXXX";
+    int fd;
+    int saw_ours[3] = {0, 0, 0};
+    int saw_objdump[3] = {0, 0, 0};
+    int saw_rip_ours = 0;
+    int saw_rip_objdump = 0;
+    int saw_spl_ours = 0;
+    int saw_spl_objdump = 0;
+    char *ours_text;
+
+    if (system("command -v objdump >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ours_text = disassemble_buffer_to_string(code, sizeof(code), 0x540000U);
+    ASSERT_NOT_NULL(ours_text);
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        if (strstr(ours_text, mnemonics[i]) != NULL) {
+            saw_ours[i] = 1;
+        }
+    }
+    if (strstr(ours_text, "[rip+") != NULL || strstr(ours_text, "[rip-") != NULL) {
+        saw_rip_ours = 1;
+    }
+    if (strstr(ours_text, "spl") != NULL) {
+        saw_spl_ours = 1;
+    }
+
+    fd = mkstemp(raw_file);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)sizeof(code), (int)write(fd, code, sizeof(code)));
+    close(fd);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd),
+                         "objdump -D -b binary -m i386:x86-64 -M intel %s 2>/dev/null",
+                         raw_file) < (int)sizeof(cmd));
+    {
+        FILE *objdump = popen(cmd, "r");
+        ASSERT_NOT_NULL(objdump);
+        while (fgets(line, sizeof(line), objdump)) {
+            if (strstr(line, "set") != NULL) {
+                saw_objdump[0] = 1;
+            }
+            if (strstr(line, "movzx") != NULL) {
+                saw_objdump[1] = 1;
+            }
+            if (strstr(line, "movsx") != NULL) {
+                saw_objdump[2] = 1;
+            }
+            if (strstr(line, "[rip+") != NULL || strstr(line, "[rip-") != NULL) {
+                saw_rip_objdump = 1;
+            }
+            if (strstr(line, "spl") != NULL) {
+                saw_spl_objdump = 1;
+            }
+        }
+        {
+            int objdump_status = pclose(objdump);
+            ASSERT_EQ(0, objdump_status);
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_objdump[i]);
+        ASSERT_TRUE(saw_ours[i]);
+    }
+    ASSERT_TRUE(saw_rip_ours);
+    ASSERT_TRUE(saw_rip_objdump);
+    ASSERT_TRUE(saw_spl_ours);
+    ASSERT_TRUE(saw_spl_objdump);
+
+    free(ours_text);
+    unlink(raw_file);
+    return 0;
+}
+
+/* Test: compare multi-byte NOP and group-0x80 semantic mnemonics against objdump */
+static int test_integration_disassembler_objdump_nop_group80_fixture(void) {
+    static const uint8_t code[] = {
+        0x0f, 0x1f, 0x00,
+        0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x80, 0xc0, 0x01,
+        0x80, 0xe1, 0x7f,
+        0x80, 0x6d, 0xf8, 0x80,
+        0x80, 0x3d, 0x10, 0x00, 0x00, 0x00, 0xff
+    };
+    const char *mnemonics[] = {"nop", "add", "and", "sub", "cmp"};
+    char cmd[512];
+    char line[512];
+    char raw_file[] = "/tmp/test_disasm_nop80_raw_XXXXXX";
+    int fd;
+    int saw_ours[5] = {0, 0, 0, 0, 0};
+    int saw_objdump[5] = {0, 0, 0, 0, 0};
+    char *ours_text;
+
+    if (system("command -v objdump >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ours_text = disassemble_buffer_to_string(code, sizeof(code), 0x550000U);
+    ASSERT_NOT_NULL(ours_text);
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        if (strstr(ours_text, mnemonics[i]) != NULL) {
+            saw_ours[i] = 1;
+        }
+    }
+
+    fd = mkstemp(raw_file);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)sizeof(code), (int)write(fd, code, sizeof(code)));
+    close(fd);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd),
+                         "objdump -D -b binary -m i386:x86-64 -M intel %s 2>/dev/null",
+                         raw_file) < (int)sizeof(cmd));
+    {
+        FILE *objdump = popen(cmd, "r");
+        ASSERT_NOT_NULL(objdump);
+        while (fgets(line, sizeof(line), objdump)) {
+            for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+                if (strstr(line, mnemonics[i]) != NULL) {
+                    saw_objdump[i] = 1;
+                }
+            }
+        }
+        {
+            int objdump_status = pclose(objdump);
+            ASSERT_EQ(0, objdump_status);
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_objdump[i]);
+        ASSERT_TRUE(saw_ours[i]);
+    }
+
+    free(ours_text);
+    unlink(raw_file);
+    return 0;
+}
+
+/* Test: compare group2/group3 and byte-MOV semantic mnemonics against objdump */
+static int test_integration_disassembler_objdump_group2_group3_fixture(void) {
+    static const uint8_t code[] = {
+        0x88, 0xc8,
+        0x8a, 0xd9,
+        0x44, 0x88, 0xc4,
+        0xc0, 0xe8, 0x04,
+        0x48, 0xc1, 0xe9, 0x08,
+        0x66, 0xc1, 0xf9, 0x01,
+        0xf6, 0xc1, 0x0f,
+        0xf6, 0xd0,
+        0xf6, 0xd8,
+        0xf7, 0xc1, 0x34, 0x12, 0x00, 0x00,
+        0x66, 0xf7, 0xc1, 0xcd, 0xab,
+        0xf7, 0xd1,
+        0xf7, 0xd9
+    };
+    const char *mnemonics[] = {"mov", "shr", "sar", "test", "not", "neg"};
+    char cmd[512];
+    char line[512];
+    char raw_file[] = "/tmp/test_disasm_grp23_raw_XXXXXX";
+    int fd;
+    int saw_ours[6] = {0, 0, 0, 0, 0, 0};
+    int saw_objdump[6] = {0, 0, 0, 0, 0, 0};
+    char *ours_text;
+
+    if (system("command -v objdump >/dev/null 2>&1") != 0) {
+        return 0;
+    }
+
+    ours_text = disassemble_buffer_to_string(code, sizeof(code), 0x560000U);
+    ASSERT_NOT_NULL(ours_text);
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        if (strstr(ours_text, mnemonics[i]) != NULL) {
+            saw_ours[i] = 1;
+        }
+    }
+
+    fd = mkstemp(raw_file);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)sizeof(code), (int)write(fd, code, sizeof(code)));
+    close(fd);
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd),
+                         "objdump -D -b binary -m i386:x86-64 -M intel %s 2>/dev/null",
+                         raw_file) < (int)sizeof(cmd));
+    {
+        FILE *objdump = popen(cmd, "r");
+        ASSERT_NOT_NULL(objdump);
+        while (fgets(line, sizeof(line), objdump)) {
+            for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+                if (strstr(line, mnemonics[i]) != NULL) {
+                    saw_objdump[i] = 1;
+                }
+            }
+        }
+        {
+            int objdump_status = pclose(objdump);
+            ASSERT_EQ(0, objdump_status);
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_objdump[i]);
+        ASSERT_TRUE(saw_ours[i]);
+    }
+
+    free(ours_text);
+    unlink(raw_file);
+    return 0;
+}
+
+/* Test: assemble source -> disassemble output -> semantic compare with source intent and objdump */
+static int test_integration_disassembler_source_roundtrip_semantic(void) {
+    typedef struct {
+        uint32_t p_type;
+        uint32_t p_flags;
+        uint64_t p_offset;
+        uint64_t p_vaddr;
+        uint64_t p_paddr;
+        uint64_t p_filesz;
+        uint64_t p_memsz;
+        uint64_t p_align;
+    } test_elf64_phdr_t;
+
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    xor rdi, rdi\n"
+        "    syscall\n";
+    const char *mnemonics[] = {"mov", "xor", "syscall"};
+    char asm_file[] = "/tmp/test_roundtrip_src_XXXXXX";
+    char out_file[512];
+    char raw_file[] = "/tmp/test_roundtrip_raw_XXXXXX";
+    char cmd[1024];
+    assembler_context_t *ctx = NULL;
+    char *ours_text = NULL;
+    char *objdump_text = NULL;
+    int saw_ours[3] = {0, 0, 0};
+    int saw_objdump[3] = {0, 0, 0};
+    uint8_t *bytes = NULL;
+    const uint8_t *seg_bytes = NULL;
+    size_t seg_size = 0;
+    uint64_t seg_addr = 0;
+    int fd;
+
+    fd = mkstemp(asm_file);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)strlen(source), (int)write(fd, source, strlen(source)));
+    close(fd);
+
+    ASSERT_TRUE(snprintf(out_file, sizeof(out_file), "%s.out", asm_file) < (int)sizeof(out_file));
+
+    ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
+
+    ASSERT_EQ(0, asm_write_elf64(ctx, out_file));
+    asm_free(ctx);
+    ctx = NULL;
+
+    {
+        FILE *f = fopen(out_file, "rb");
+        ASSERT_NOT_NULL(f);
+        ASSERT_EQ(0, fseek(f, 0, SEEK_END));
+        long file_size = ftell(f);
+        ASSERT_TRUE(file_size > 0);
+        ASSERT_EQ(0, fseek(f, 0, SEEK_SET));
+
+        bytes = (uint8_t *)malloc((size_t)file_size);
+        ASSERT_NOT_NULL(bytes);
+        ASSERT_EQ(file_size, (long)fread(bytes, 1, (size_t)file_size, f));
+        fclose(f);
+
+        const test_elf64_ehdr_t *eh = (const test_elf64_ehdr_t *)bytes;
+        ASSERT_TRUE(eh->e_phoff > 0);
+        ASSERT_TRUE(eh->e_phnum > 0);
+
+        const test_elf64_phdr_t *phdrs = (const test_elf64_phdr_t *)(bytes + eh->e_phoff);
+        for (uint16_t i = 0; i < eh->e_phnum; i++) {
+            if (phdrs[i].p_type == PT_LOAD && (phdrs[i].p_flags & PF_X) != 0 && phdrs[i].p_filesz > 0) {
+                seg_bytes = bytes + phdrs[i].p_offset;
+                seg_size = (size_t)phdrs[i].p_filesz;
+                seg_addr = phdrs[i].p_vaddr;
+                break;
+            }
+        }
+    }
+    ASSERT_NOT_NULL(seg_bytes);
+    ASSERT_TRUE(seg_size > 0U);
+
+    ours_text = disassemble_buffer_to_string(seg_bytes, seg_size, seg_addr);
+    ASSERT_NOT_NULL(ours_text);
+
+    {
+        int raw_fd = mkstemp(raw_file);
+        ASSERT_TRUE(raw_fd >= 0);
+        ASSERT_EQ((int)seg_size, (int)write(raw_fd, seg_bytes, seg_size));
+        close(raw_fd);
+    }
+
+    ASSERT_TRUE(snprintf(cmd, sizeof(cmd),
+                         "objdump -D -b binary -m i386:x86-64 -M intel %s 2>/dev/null",
+                         raw_file) < (int)sizeof(cmd));
+    objdump_text = capture_command_output(cmd);
+    ASSERT_NOT_NULL(objdump_text);
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        if (strstr(ours_text, mnemonics[i]) != NULL) {
+            saw_ours[i] = 1;
+        }
+        if (strstr(objdump_text, mnemonics[i]) != NULL) {
+            saw_objdump[i] = 1;
+        }
+    }
+
+    for (size_t i = 0; i < (sizeof(mnemonics) / sizeof(mnemonics[0])); i++) {
+        ASSERT_TRUE(saw_ours[i]);
+        ASSERT_TRUE(saw_objdump[i]);
+    }
+
+    free(ours_text);
+    free(objdump_text);
+    free(bytes);
+    if (ctx) {
+        asm_free(ctx);
+    }
+    unlink(asm_file);
+    unlink(out_file);
+    unlink(raw_file);
+    return 0;
+}
+
+/* Test: stress fixtures should assemble successfully and produce non-empty artifacts */
+static int test_integration_stress_fixtures_compile_nonempty(void) {
+    const char *fixtures[] = {
+        "examples/stress_100_functions.asm",
+        "examples/stress_1000_labels.asm",
+        "examples/stress_50kb_mixed.asm",
+        "examples/stress_macro_nested.asm",
+        "examples/stress_sse_broad.asm",
+        "examples/stress_addressing_matrix.asm"
+    };
+
+    for (size_t i = 0; i < (sizeof(fixtures) / sizeof(fixtures[0])); i++) {
+        ASSERT_EQ(0, access(fixtures[i], R_OK));
+        ASSERT_EQ(0, assemble_fixture_and_verify_nonempty_output(fixtures[i]));
+    }
+
+    return 0;
+}
+
 /* Test Suite: Integration Tests */
 TEST_SUITE(integration) {
     TEST(integration_exit);
@@ -2014,8 +3612,12 @@ TEST_SUITE(integration) {
     TEST(integration_invalid);
     TEST(integration_enter_invalid_operands);
     TEST(integration_enter_invalid_nesting);
+    TEST(integration_failure_scenarios_matrix);
     TEST(integration_sectionless_entrypoint);
     TEST(integration_include_relative);
+    TEST(integration_include_circular_fails);
+    TEST(integration_include_duplicate_symbol_handled);
+    TEST(integration_include_depth_overflow_fails);
     TEST(integration_sse_smoke);
     TEST(integration_sse_mixed_controlflow);
     TEST(integration_sse_scalar_to_gpr_runtime);
@@ -2035,6 +3637,21 @@ TEST_SUITE(integration) {
     TEST(integration_dwarf_symbol_table_crosscheck);
     TEST(integration_dwarf_large_program_success);
     TEST(integration_output_formats_compile);
+    TEST(integration_listing_file_sections);
+    TEST(integration_listing_rows_present);
+    TEST(integration_listing_address_monotonic);
+    TEST(integration_listing_bytes_match_buffers);
+    TEST(integration_listing_symbol_table_entries);
+    TEST(integration_disassembler_objdump_semantic_compare);
+    TEST(integration_disassembler_objdump_operand_override_fixture);
+    TEST(integration_disassembler_objdump_bit_test_immediate_fixture);
+    TEST(integration_disassembler_objdump_bit_scan_and_test_fixture);
+    TEST(integration_disassembler_objdump_xadd_cmpxchg_fixture);
+    TEST(integration_disassembler_objdump_setcc_movx_edge_fixture);
+    TEST(integration_disassembler_objdump_nop_group80_fixture);
+    TEST(integration_disassembler_objdump_group2_group3_fixture);
+    TEST(integration_disassembler_source_roundtrip_semantic);
+    TEST(integration_stress_fixtures_compile_nonempty);
 }
 
 /* Main entry point */

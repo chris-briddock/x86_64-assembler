@@ -26,31 +26,16 @@ extern test_state_t g_test_state;
 
 /* Test macros */
 #define TEST_SUITE(name) \
-    void test_suite_##name(void); \
-    void run_test_suite_##name(void) { \
+    static void test_suite_##name(void); \
+    static void run_test_suite_##name(void) { \
         test_suite_begin(#name); \
         test_suite_##name(); \
         test_suite_end(); \
     } \
-    void test_suite_##name(void)
+    static void test_suite_##name(void)
 
 #define TEST(name) \
-    do { \
-        g_test_state.current_test = #name; \
-        g_test_state.total++; \
-        g_test_state.suite_total++; \
-        printf("  TEST: %s ... ", #name); \
-        int _test_result = test_##name(); \
-        if (_test_result == 0) { \
-            g_test_state.passed++; \
-            g_test_state.suite_passed++; \
-            printf("PASS\n"); \
-        } else { \
-            g_test_state.failed++; \
-            g_test_state.suite_failed++; \
-            printf("FAIL\n"); \
-        } \
-    } while (0)
+    test_run_case(#name, test_##name)
 
 /* Assertion macros */
 #define ASSERT_TRUE(expr) \
@@ -111,6 +96,7 @@ void test_suite_begin(const char *suite_name);
 void test_suite_end(void);
 void test_report(void);
 int test_final_status(void);
+void test_run_case(const char *test_name, int (*test_fn)(void));
 
 /* stderr capture helpers for negative-path testing. */
 int test_capture_stderr_begin(void);
