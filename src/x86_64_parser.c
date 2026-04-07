@@ -2,7 +2,7 @@
  * x86_64 Parser - Parse assembly syntax into instruction structures
  */
 
-#include "x86_64_asm/x86_64_asm.h"
+#include "x86_64_asm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,13 +47,15 @@ typedef struct {
     token_t current;
     token_t peek;
     int line;
+    assembler_context_t *ctx;
 } parser_state_t;
-
-static bool g_parser_profile_enabled = false;
-static parser_profile_stats_t g_parser_profile_stats;
 
 static token_t next_token(parser_state_t *p);
 static int parse_instruction(parser_state_t *p, parsed_instruction_t *inst);
+
+static bool parser_profile_enabled_ctx(const assembler_context_t *ctx) {
+    return ctx != NULL && ctx->parser_profile_enabled;
+}
 
 static uint64_t parser_now_ns(void) {
     struct timespec ts;
@@ -90,15 +92,15 @@ static token_t profiled_next_token(parser_state_t *p) {
     uint64_t start_ns = 0;
     token_t tok;
 
-    if (g_parser_profile_enabled) {
+    if (parser_profile_enabled_ctx(p->ctx)) {
         start_ns = parser_now_ns();
     }
 
     tok = next_token(p);
 
-    if (g_parser_profile_enabled) {
-        g_parser_profile_stats.next_token_calls++;
-        g_parser_profile_stats.next_token_ns += (parser_now_ns() - start_ns);
+    if (parser_profile_enabled_ctx(p->ctx)) {
+        p->ctx->parser_profile_next_token_calls++;
+        p->ctx->parser_profile_next_token_ns += (parser_now_ns() - start_ns);
     }
 
     return tok;
@@ -375,11 +377,12 @@ static const char *find_closest_instruction_name(const char *name, int *out_dist
 }
 
 /* Initialize parser */
-static void parser_init(parser_state_t *p, const char *input) {
+static void parser_init(parser_state_t *p, assembler_context_t *ctx, const char *input) {
     p->input = input;
     p->pos = input;
     p->line_start = input;
     p->line = 1;
+    p->ctx = ctx;
     p->current.type = TOK_NONE;
     p->peek.type = TOK_NONE;
 }
@@ -1360,21 +1363,21 @@ static void trim_trailing_ws(char *text) {
     }
 }
 
-static void parser_profile_note_capacity(size_t capacity) {
-    if (g_parser_profile_enabled && capacity > g_parser_profile_stats.peak_instruction_capacity) {
-        g_parser_profile_stats.peak_instruction_capacity = capacity;
+static void parser_profile_note_capacity_ctx(assembler_context_t *ctx, size_t capacity) {
+    if (parser_profile_enabled_ctx(ctx) && capacity > ctx->parser_profile_peak_instruction_capacity) {
+        ctx->parser_profile_peak_instruction_capacity = capacity;
     }
 }
 
 static int parse_instruction_profiled(parser_state_t *p, parsed_instruction_t *inst) {
-    if (!g_parser_profile_enabled) {
+    if (!parser_profile_enabled_ctx(p->ctx)) {
         return parse_instruction(p, inst);
     }
 
     uint64_t instruction_start_ns = parser_now_ns();
     int parse_result = parse_instruction(p, inst);
-    g_parser_profile_stats.parse_instruction_calls++;
-    g_parser_profile_stats.parse_instruction_ns += (parser_now_ns() - instruction_start_ns);
+    p->ctx->parser_profile_parse_instruction_calls++;
+    p->ctx->parser_profile_parse_instruction_ns += (parser_now_ns() - instruction_start_ns);
     return parse_result;
 }
 
@@ -1545,10 +1548,12 @@ static int parse_instruction(parser_state_t *p, parsed_instruction_t *inst) {
 }
 
 /* Main parse function (internal) */
-static parsed_instruction_t *parse_source_internal(const char *source, int *count) {
+static parsed_instruction_t *parse_source_internal(assembler_context_t *ctx,
+                                                   const char *source,
+                                                   int *count) {
     uint64_t parse_start_ns = 0;
     parser_state_t p;
-    parser_init(&p, source);
+    parser_init(&p, ctx, source);
     init_tokens(&p);
 
     /* First pass: count instructions */
@@ -1557,9 +1562,9 @@ static parsed_instruction_t *parse_source_internal(const char *source, int *coun
     parsed_instruction_t *insts = malloc(capacity * sizeof(parsed_instruction_t));
     if (!insts) return NULL;
 
-    if (g_parser_profile_enabled) {
+    if (parser_profile_enabled_ctx(ctx)) {
         parse_start_ns = parser_now_ns();
-        parser_profile_note_capacity(capacity);
+        parser_profile_note_capacity_ctx(ctx, capacity);
     }
 
     while (p.current.type != TOK_EOF) {
@@ -1571,9 +1576,9 @@ static parsed_instruction_t *parse_source_internal(const char *source, int *coun
                 return NULL;
             }
             insts = new_insts;
-            if (g_parser_profile_enabled) {
-                g_parser_profile_stats.realloc_events++;
-                parser_profile_note_capacity(capacity);
+            if (parser_profile_enabled_ctx(ctx)) {
+                ctx->parser_profile_realloc_events++;
+                parser_profile_note_capacity_ctx(ctx, capacity);
             }
         }
 
@@ -1595,9 +1600,9 @@ static parsed_instruction_t *parse_source_internal(const char *source, int *coun
         }
     }
 
-    if (g_parser_profile_enabled) {
-        g_parser_profile_stats.parse_calls++;
-        g_parser_profile_stats.parse_ns += (parser_now_ns() - parse_start_ns);
+    if (parser_profile_enabled_ctx(ctx)) {
+        ctx->parser_profile_parse_calls++;
+        ctx->parser_profile_parse_ns += (parser_now_ns() - parse_start_ns);
     }
 
     *count = n;
@@ -1699,12 +1704,12 @@ static parsed_instruction_t *parse_source_common(assembler_context_t *ctx,
     /* First, always expand times directive */
     char *times_expanded = expand_times_only(source);
     if (!times_expanded) {
-        return parse_source_internal(source, count);
+        return parse_source_internal(ctx, source, count);
     }
 
     /* Simple case: no assembler context, parse the times-expanded source */
     if (!ctx) {
-        parsed_instruction_t *insts = parse_source_internal(times_expanded, count);
+        parsed_instruction_t *insts = parse_source_internal(NULL, times_expanded, count);
         free(times_expanded);
         return insts;
     }
@@ -1724,7 +1729,7 @@ static parsed_instruction_t *parse_source_common(assembler_context_t *ctx,
     }
     
     /* Parse the preprocessed source */
-    parsed_instruction_t *insts = parse_source_internal(preprocessed, count);
+    parsed_instruction_t *insts = parse_source_internal(ctx, preprocessed, count);
     free(preprocessed);
     
     return insts;
@@ -1740,19 +1745,41 @@ parsed_instruction_t *parse_source_with_context(assembler_context_t *ctx, const 
     return parse_source_common(ctx, source, count);
 }
 
-void parser_profile_enable(bool enabled) {
-    g_parser_profile_enabled = enabled;
-}
-
-void parser_profile_reset(void) {
-    memset(&g_parser_profile_stats, 0, sizeof(g_parser_profile_stats));
-}
-
-void parser_profile_get(parser_profile_stats_t *out_stats) {
-    if (!out_stats) {
+void parser_profile_enable(assembler_context_t *ctx, bool enabled) {
+    if (!ctx) {
         return;
     }
-    *out_stats = g_parser_profile_stats;
+    ctx->parser_profile_enabled = enabled;
+}
+
+void parser_profile_reset(assembler_context_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+
+    ctx->parser_profile_parse_calls = 0;
+    ctx->parser_profile_parse_ns = 0;
+    ctx->parser_profile_parse_instruction_calls = 0;
+    ctx->parser_profile_parse_instruction_ns = 0;
+    ctx->parser_profile_next_token_calls = 0;
+    ctx->parser_profile_next_token_ns = 0;
+    ctx->parser_profile_realloc_events = 0;
+    ctx->parser_profile_peak_instruction_capacity = 0;
+}
+
+void parser_profile_get(const assembler_context_t *ctx, parser_profile_stats_t *out_stats) {
+    if (!ctx || !out_stats) {
+        return;
+    }
+
+    out_stats->parse_calls = ctx->parser_profile_parse_calls;
+    out_stats->parse_ns = ctx->parser_profile_parse_ns;
+    out_stats->parse_instruction_calls = ctx->parser_profile_parse_instruction_calls;
+    out_stats->parse_instruction_ns = ctx->parser_profile_parse_instruction_ns;
+    out_stats->next_token_calls = ctx->parser_profile_next_token_calls;
+    out_stats->next_token_ns = ctx->parser_profile_next_token_ns;
+    out_stats->realloc_events = ctx->parser_profile_realloc_events;
+    out_stats->peak_instruction_capacity = ctx->parser_profile_peak_instruction_capacity;
 }
 
 /* Free parsed instructions */

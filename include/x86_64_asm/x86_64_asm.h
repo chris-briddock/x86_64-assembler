@@ -36,6 +36,7 @@ extern "C" {
 #define MAX_INCLUDE_DEPTH   10   /* Maximum nested include depth */
 #define MAX_INCLUDE_FILES   64   /* Maximum total files in include chain */
 #define MAX_FILEPATH_LENGTH 512  /* Maximum file path length */
+#define MAX_ERROR_MESSAGE   512  /* Maximum stored error message length */
 
 /* ELF64 Constants */
 #define ELFMAG0             0x7f
@@ -424,6 +425,18 @@ typedef struct {
     /* Include file support */
     include_context_t include_ctx;              /* File include stack */
     char current_filename[MAX_FILEPATH_LENGTH]; /* Current file for error reporting */
+    char last_error[MAX_ERROR_MESSAGE];         /* Last library error message */
+
+    /* Parser profiling state (context-local, no global mutable state) */
+    bool parser_profile_enabled;
+    uint64_t parser_profile_parse_calls;
+    uint64_t parser_profile_parse_ns;
+    uint64_t parser_profile_parse_instruction_calls;
+    uint64_t parser_profile_parse_instruction_ns;
+    uint64_t parser_profile_next_token_calls;
+    uint64_t parser_profile_next_token_ns;
+    uint64_t parser_profile_realloc_events;
+    uint64_t parser_profile_peak_instruction_capacity;
 
     /* Listing file support */
     listing_entry_t *listing_entries;
@@ -458,13 +471,70 @@ assembler_context_t *asm_init(void);
  */
 void asm_free(assembler_context_t *ctx);
 
-/* Hash table helpers for O(1) symbol lookup */
+/**
+ * @brief Get the most recent library error message for this context.
+ *
+ * @param ctx Assembler context.
+ * @return Null-terminated error string, or empty string when no error is recorded.
+ */
+const char *asm_get_last_error(const assembler_context_t *ctx);
+
+/**
+ * @brief Look up a symbol in the hash table.
+ *
+ * @param ctx Assembler context. Must not be NULL.
+ * @param name Symbol name to query. Must be non-NULL and non-empty.
+ * @return Pointer to symbol hash entry when found, otherwise NULL.
+ *         Returned pointer is owned by ctx and must not be freed by callers.
+ */
 hash_entry_t *symbol_hash_lookup(assembler_context_t *ctx, const char *name);
+
+/**
+ * @brief Insert a symbol into the hash table.
+ *
+ * @param ctx Assembler context. Must not be NULL.
+ * @param name Symbol name to insert. Must be non-NULL and non-empty.
+ * @param address Symbol value/address.
+ * @param is_global Whether symbol has global visibility.
+ * @param is_external Whether symbol is externally resolved.
+ * @param section Section index associated with the symbol, or negative for absolute.
+ * @return 0 on success, negative value on failure (invalid input, allocation failure,
+ *         or duplicate insertion policy violation).
+ */
 int symbol_hash_insert(assembler_context_t *ctx, const char *name, uint64_t address,
                        bool is_global, bool is_external, int section);
+
+/**
+ * @brief Update an existing symbol entry in the hash table.
+ *
+ * @param ctx Assembler context. Must not be NULL.
+ * @param name Symbol name to update. Must be non-NULL and non-empty.
+ * @param address Updated symbol value/address.
+ * @param is_global Updated global visibility flag.
+ * @param is_external Updated external-resolution flag.
+ * @param section Updated section index, or negative for absolute.
+ * @return 0 on success, negative value when the symbol does not exist or input is invalid.
+ */
 int symbol_hash_update(assembler_context_t *ctx, const char *name, uint64_t address,
                        bool is_global, bool is_external, int section);
+
+/**
+ * @brief Check whether a symbol exists in the hash table.
+ *
+ * @param ctx Assembler context. Must not be NULL.
+ * @param name Symbol name to query. Must be non-NULL and non-empty.
+ * @return true when the symbol exists, false otherwise.
+ */
 bool symbol_exists(assembler_context_t *ctx, const char *name);
+
+/**
+ * @brief Retrieve hash-table metadata for a symbol.
+ *
+ * @param ctx Assembler context. Must not be NULL.
+ * @param name Symbol name to query. Must be non-NULL and non-empty.
+ * @return Pointer to symbol metadata when found, otherwise NULL.
+ *         Returned pointer is owned by ctx and must not be freed by callers.
+ */
 hash_entry_t *get_symbol_info(assembler_context_t *ctx, const char *name);
 
 /* Fixup management */
@@ -526,149 +596,27 @@ int disassemble_code_buffer(const uint8_t *code, size_t code_size,
  */
 int asm_disassemble_file(const char *filename, FILE *out);
 
-/* Debug output */
+/**
+ * @brief Dump current symbol table state for diagnostics.
+ *
+ * @param ctx Assembler context. Must not be NULL.
+ * @return None.
+ */
 void asm_dump_symbols(assembler_context_t *ctx);
+
+/**
+ * @brief Dump emitted output buffer state for diagnostics.
+ *
+ * @param ctx Assembler context. Must not be NULL.
+ * @return None.
+ */
 void asm_dump_output(assembler_context_t *ctx);
 
-/* Output buffer operations (used by encoders) */
-int emit_byte(assembler_context_t *ctx, uint8_t byte);
-int emit_bytes(assembler_context_t *ctx, const uint8_t *bytes, size_t count);
-int emit_word(assembler_context_t *ctx, uint16_t word);
-int emit_dword(assembler_context_t *ctx, uint32_t dword);
-int emit_qword(assembler_context_t *ctx, uint64_t qword);
-int emit_le16(assembler_context_t *ctx, int16_t val);
-int emit_le32(assembler_context_t *ctx, int32_t val);
-int emit_le64(assembler_context_t *ctx, int64_t val);
-int emit_rex(assembler_context_t *ctx, bool w, const operand_t *reg_op,
-             const operand_t *rm_op, const operand_t *sib_index_op);
-int emit_modrm_sib(assembler_context_t *ctx, uint8_t reg_opcode,
-                   const operand_t *operand, reg_size_t size);
+/* Internal encoder/parser helpers are intentionally not part of the public API.
+ * They are declared in private implementation headers under src/. */
 
-/* Listing file tracking */
-void listing_start_instruction(assembler_context_t *ctx, int line_number, const char *source);
-void listing_emit_byte(assembler_context_t *ctx, uint8_t byte);
-void listing_end_instruction(assembler_context_t *ctx);
-
-/* Instruction encoding helpers */
-int encode_instruction(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_unary_arithmetic(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_lea(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_push_pop(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_jmp(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_jcc(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_call_ret(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_int(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_syscall(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_sysret(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_nop(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_hlt(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_cwd_cdq_cqo(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_cbw_cwde_cdqe(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_enter(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_leave(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_clc_stc_cmc(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_cld_std(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_cli_sti(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_setcc(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_cmov(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_bswap(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_xchg(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_imul(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_div_idiv_mul(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_test(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_not(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_shift(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_string(assembler_context_t *ctx, const parsed_instruction_t *inst);
-
-/* Bit manipulation instructions */
-int encode_bit_manip(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_shld_shrd(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_bit_scan(assembler_context_t *ctx, const parsed_instruction_t *inst);
-
-/* SSE instruction encoding */
-int encode_sse_mov(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_sse_arith(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_sse_packed_arith(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_sse_packed_cmp(assembler_context_t *ctx, const parsed_instruction_t *inst);
-int encode_sse_packed_logic(assembler_context_t *ctx, const parsed_instruction_t *inst);
-
-/* Integer range helpers */
-int fits_in_int8(int32_t val);
-
-/* ModR/M and SIB encoding helpers */
-uint8_t make_modrm(uint8_t mod, uint8_t reg, uint8_t rm);
-uint8_t make_sib(uint8_t scale, uint8_t index, uint8_t base);
-
-/* REX prefix */
-int needs_rex(const operand_t *op);
-uint8_t make_rex(bool w, bool r, bool x, bool b);
-
-/* Register info */
-reg_t parse_register(const char *name, reg_size_t *size);
-const char *register_name(reg_t reg, reg_size_t size);
-int get_reg_size_bytes(reg_size_t size);
-
-/* ============================================================================
- * MACRO FUNCTIONS
- * ============================================================================ */
-
-/* Macro table operations */
-macro_t *macro_lookup(assembler_context_t *ctx, const char *name);
-int macro_define(assembler_context_t *ctx, const char *name);
-void macro_add_param(assembler_context_t *ctx, const char *param_name);
-void macro_add_body_line(assembler_context_t *ctx, const char *line);
-void macro_end_definition(assembler_context_t *ctx);
-
-/* Macro expansion */
-char *macro_expand_line(assembler_context_t *ctx, const char *line, const char **args, int arg_count);
-bool is_macro_name(assembler_context_t *ctx, const char *name);
-int get_macro_arg_count(assembler_context_t *ctx, const char *name);
-
-/* Preprocessing */
-char *preprocess_macros(assembler_context_t *ctx, const char *source);
-
-/* Parser profiling statistics */
-typedef struct {
-    uint64_t parse_calls;
-    uint64_t parse_ns;
-    uint64_t parse_instruction_calls;
-    uint64_t parse_instruction_ns;
-    uint64_t next_token_calls;
-    uint64_t next_token_ns;
-    uint64_t realloc_events;
-    uint64_t peak_instruction_capacity;
-} parser_profile_stats_t;
-
-/* Parser API */
-parsed_instruction_t *parse_source(const char *source, int *count);
-void free_instructions(parsed_instruction_t *insts);
-
-/* Parser with context for macro support */
-parsed_instruction_t *parse_source_with_context(assembler_context_t *ctx, const char *source, int *count);
-
-/* Parser profiling controls */
-void parser_profile_enable(bool enabled);
-void parser_profile_reset(void);
-void parser_profile_get(parser_profile_stats_t *out_stats);
-
-/* ============================================================================
- * INCLUDE FILE FUNCTIONS
- * ============================================================================ */
-
-/* Include file operations */
-int include_file(assembler_context_t *ctx, const char *filename);
-int include_push(assembler_context_t *ctx, const char *filename, char *content);
-int include_pop(assembler_context_t *ctx);
-bool is_circular_include(const assembler_context_t *ctx, const char *filename);
-char *read_file_contents(const char *filename);
-
-/* Get next character from source with include support */
-int source_getc(assembler_context_t *ctx);
-
-/* Get current line info for error reporting */
-void get_source_location(const assembler_context_t *ctx, char *filename, int *line_number);
+/* Additional parser/macro/include helpers are private implementation details
+ * and declared only in src/x86_64_asm.h. */
 
 #ifdef __cplusplus
 }

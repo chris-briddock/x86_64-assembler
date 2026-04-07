@@ -4,7 +4,7 @@
  */
 
 #include "test_framework.h"
-#include "x86_64_asm/x86_64_asm.h"
+#include "../src/x86_64_asm.h"
 #include <string.h>
 
 /* External encoder functions from x86_64_controlflow.c */

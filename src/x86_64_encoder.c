@@ -3,7 +3,7 @@
  * Generates raw machine code bytes for x86_64 instructions
  */
 
-#include "x86_64_asm/x86_64_asm.h"
+#include "x86_64_asm.h"
 #include "x86_64_asm/opcode_lookup.h"
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,4 +1,4 @@
-#include "x86_64_asm/x86_64_asm.h"
+#include "../src/x86_64_asm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,23 +63,31 @@ int main(void) {
     char *program = build_large_program(blocks);
     uint64_t parser_total_ns = 0;
     parser_profile_stats_t stats;
+    assembler_context_t *profile_ctx = asm_init();
 
     if (!program) {
         fprintf(stderr, "failed to allocate parser profile program\n");
         return 1;
     }
 
-    parser_profile_reset();
-    parser_profile_enable(true);
+    if (!profile_ctx) {
+        fprintf(stderr, "failed to allocate parser profile context\n");
+        free(program);
+        return 1;
+    }
+
+    parser_profile_reset(profile_ctx);
+    parser_profile_enable(profile_ctx, true);
 
     for (int i = 0; i < parser_runs; i++) {
         int count = 0;
         uint64_t start_ns = now_ns();
-        parsed_instruction_t *insts = parse_source(program, &count);
+        parsed_instruction_t *insts = parse_source_with_context(profile_ctx, program, &count);
         uint64_t end_ns = now_ns();
 
         if (!insts) {
             fprintf(stderr, "parse_source failed on run %d\n", i + 1);
+            asm_free(profile_ctx);
             free(program);
             return 1;
         }
@@ -88,8 +96,8 @@ int main(void) {
         free_instructions(insts);
     }
 
-    parser_profile_enable(false);
-    parser_profile_get(&stats);
+    parser_profile_enable(profile_ctx, false);
+    parser_profile_get(profile_ctx, &stats);
 
         printf("Parser profiling on synthetic source\n");
         printf("- Blocks: %zu (about %zu lines)\n", blocks, blocks * 5u + 6u);
@@ -182,6 +190,7 @@ int main(void) {
         asm_free(ctx);
     }
 
+    asm_free(profile_ctx);
     free(program);
     return 0;
 }

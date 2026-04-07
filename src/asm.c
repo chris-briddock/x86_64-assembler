@@ -2,7 +2,7 @@
  * x86_64 Assembler - Command-line driver
  */
 
-#include "x86_64_asm/x86_64_asm.h"
+#include "x86_64_asm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

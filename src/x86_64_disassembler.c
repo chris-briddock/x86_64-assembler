@@ -2,7 +2,7 @@
  * x86_64 Disassembler - baseline implementation
  */
 
-#include "x86_64_asm/x86_64_asm.h"
+#include "x86_64_asm.h"
 #include "x86_64_asm/opcode_lookup.h"
 
 #include <stdio.h>
@@ -170,12 +170,15 @@ static int read_le64(const uint8_t *buf, size_t size, size_t pos, uint64_t *out)
 }
 
 static int append_with_sign(char *dst, size_t dst_size, int64_t value) {
+    uint64_t magnitude;
     int written;
 
+    magnitude = (value < 0) ? (uint64_t)(-(value + 1)) + 1ULL : (uint64_t)value;
+
     if (value < 0) {
-        written = snprintf(dst, dst_size, "-0x%llx", (unsigned long long)(-value));
+        written = snprintf(dst, dst_size, "-0x%llx", (unsigned long long)magnitude);
     } else if (value > 0) {
-        written = snprintf(dst, dst_size, "+0x%llx", (unsigned long long)value);
+        written = snprintf(dst, dst_size, "+0x%llx", (unsigned long long)magnitude);
     } else {
         written = snprintf(dst, dst_size, "+0x0");
     }
@@ -326,8 +329,9 @@ static int format_rm_operand(const uint8_t *code, size_t size, size_t modrm_pos,
                     written = snprintf(operand + strlen(operand), sizeof(operand) - strlen(operand),
                                        "0x%llx", (unsigned long long)(uint32_t)disp);
                 } else if (disp < 0) {
+                    uint32_t magnitude = (uint32_t)(-(disp + 1)) + 1U;
                     written = snprintf(operand + strlen(operand), sizeof(operand) - strlen(operand),
-                                       "-0x%llx", (unsigned long long)(uint32_t)(-disp));
+                                       "-0x%llx", (unsigned long long)magnitude);
                 } else {
                     written = snprintf(operand + strlen(operand), sizeof(operand) - strlen(operand),
                                        "+0x%llx", (unsigned long long)(uint32_t)disp);

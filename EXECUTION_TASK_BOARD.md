@@ -86,7 +86,7 @@ Purpose: turn roadmap goals into a phase-by-phase, trackable execution board wit
 |---|---|---|---|---|---|---|---|
 | P4-01 | Large-program stress suite fixtures | [x] | Active | 2026-05-11 | 2026-05-14 | P3-11 | 6 to 10 stress programs added |
 | P4-02 | Edge-case test suite expansion | [~] | Active | 2026-05-12 | 2026-05-15 | P3-11 | 15+ edge-case scenarios validated |
-| P4-03 | NASM comparison suite and byte diff report | [~] | Active | 2026-05-15 | 2026-05-18 | P4-01, P4-02 | 35+ comparison programs with discrepancy log |
+| P4-03 | NASM comparison suite and byte diff report | [x] | Active | 2026-05-15 | 2026-05-18 | P4-01, P4-02 | 35+ comparison programs with discrepancy log |
 | P4-04 | Debugger DWARF validation (gdb or lldb) | [ ] | Unassigned | 2026-05-17 | 2026-05-19 | P4-02 | breakpoints, stepping, symbols verified |
 | P4-05 | Documentation completion pass | [ ] | Unassigned | 2026-05-19 | 2026-05-21 | P4-03, P4-04 | README/docs updated and no stale TODO claims |
 | P4-06 | Example suite finalization | [ ] | Unassigned | 2026-05-19 | 2026-05-22 | P4-05 | 12+ examples complete and runnable |
@@ -236,6 +236,8 @@ Use this section every week to keep momentum.
   - Revalidated full gates after branch/layout updates: `make test-encoder` (146/146 pass), `make test-integration` (61/61 pass).
   - NASM harness now links reference NASM objects using a temporary data-first linker script before extracting `.text`, ensuring resolved code-to-code comparison under equivalent layout assumptions.
   - Revalidated after harness alignment: `make compare-nasm` now reports 10/10 byte-identical fixtures with zero tool errors.
+  - Expanded NASM fixture corpus from 10 to 35 fixtures (`reference_nasm_*`) across arithmetic, control-flow, data, memory, logic, shifts, bit-ops, stack, and SSE categories.
+  - Revalidated parity gate after fixture expansion: `make compare-nasm-gate` now reports 35/35 byte-identical fixtures with 0 mismatches and 0 tool errors.
   - Integration stability preserved after parity completion: `make test-integration` remains 61/61 pass.
   - Revalidated integration after Phase 4 updates: `make test-integration` (61/61 pass).
 - In progress:

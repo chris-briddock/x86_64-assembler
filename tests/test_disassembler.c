@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 static char *run_disassemble_to_string(const uint8_t *code, size_t size, uint64_t base) {
     FILE *fp;
@@ -413,6 +414,36 @@ static int test_disassemble_group2_group3_and_byte_mov_forms(void) {
     return 0;
 }
 
+static int test_disassemble_rip_relative_int32_min_displacement(void) {
+    static const uint8_t code[] = {
+        0x0f, 0x95, 0x05, 0x00, 0x00, 0x00, 0x80
+    };
+    char expected[64];
+    char *out = run_disassemble_to_string(code, sizeof(code), 0x40d000U);
+
+    ASSERT_NOT_NULL(out);
+    ASSERT_TRUE(snprintf(expected, sizeof(expected), "setne [rip-0x%x]", (unsigned int)INT32_MIN) > 0);
+    ASSERT_STR_CONTAINS(out, expected);
+
+    free(out);
+    return 0;
+}
+
+static int test_disassemble_base_disp_int32_min_displacement(void) {
+    static const uint8_t code[] = {
+        0x48, 0x8b, 0x83, 0x00, 0x00, 0x00, 0x80
+    };
+    char expected[64];
+    char *out = run_disassemble_to_string(code, sizeof(code), 0x40e000U);
+
+    ASSERT_NOT_NULL(out);
+    ASSERT_TRUE(snprintf(expected, sizeof(expected), "mov rax, [rbx-0x%x]", (unsigned int)INT32_MIN) > 0);
+    ASSERT_STR_CONTAINS(out, expected);
+
+    free(out);
+    return 0;
+}
+
 TEST_SUITE(disassembler) {
     TEST(disassemble_mov_xor_syscall);
     TEST(disassemble_call_ret_jmp_relative);
@@ -430,6 +461,8 @@ TEST_SUITE(disassembler) {
     TEST(disassemble_setcc_and_movx_edge_forms);
     TEST(disassemble_multibyte_nop_and_group80);
     TEST(disassemble_group2_group3_and_byte_mov_forms);
+    TEST(disassemble_rip_relative_int32_min_displacement);
+    TEST(disassemble_base_disp_int32_min_displacement);
 }
 
 int main(void) {

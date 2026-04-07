@@ -3,13 +3,14 @@
  * Symbol table, fixup resolution, and ELF64 output
  */
 
-#include "x86_64_asm/x86_64_asm.h"
+#include "x86_64_asm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
 #include <assert.h>
+#include <stdarg.h>
 
 /* External functions */
 extern parsed_instruction_t *parse_source(const char *source, int *count);
@@ -132,6 +133,25 @@ static void copy_bounded_text(char *dst, size_t dst_size, const char *src) {
 
     memcpy(dst, src, n);
     dst[n] = '\0';
+}
+
+static void asm_clear_last_error(assembler_context_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->last_error[0] = '\0';
+}
+
+static void asm_set_last_errorf(assembler_context_t *ctx, const char *fmt, ...) {
+    va_list args;
+
+    if (!ctx || !fmt) {
+        return;
+    }
+
+    va_start(args, fmt);
+    (void)vsnprintf(ctx->last_error, sizeof(ctx->last_error), fmt, args);
+    va_end(args);
 }
 
 typedef struct {
@@ -322,7 +342,8 @@ static const char *find_closest_symbol_name(const assembler_context_t *ctx,
     return best;
 }
 
-static int normalize_label_reference(char *label,
+static int normalize_label_reference(assembler_context_t *ctx,
+                                     char *label,
                                      int scope_id,
                                      int instruction_index,
                                      local_label_alias_t *local_aliases,
@@ -349,10 +370,10 @@ static int normalize_label_reference(char *label,
     if (is_anonymous_forward_ref(label)) {
         if (lookup_anonymous_ref(anon_defs, anon_def_count, instruction_index,
                                  true, replacement, sizeof(replacement)) < 0) {
-            fprintf(stderr,
-                    "Error at line %d, column 1: [Symbol] @F has no matching forward @@ label\n"
-                    "Suggestion: Define a forward @@ label after this reference or use a named label.\n",
-                    source_line);
+            asm_set_last_errorf(ctx,
+                                "Error at line %d, column 1: [Symbol] @F has no matching forward @@ label\n"
+                                "Suggestion: Define a forward @@ label after this reference or use a named label.",
+                                source_line);
             return -1;
         }
         copy_bounded_text(label, MAX_LABEL_LENGTH, replacement);
@@ -362,10 +383,10 @@ static int normalize_label_reference(char *label,
     if (is_anonymous_backward_ref(label)) {
         if (lookup_anonymous_ref(anon_defs, anon_def_count, instruction_index,
                                  false, replacement, sizeof(replacement)) < 0) {
-            fprintf(stderr,
-                    "Error at line %d, column 1: [Symbol] @B has no matching backward @@ label\n"
-                    "Suggestion: Define an @@ label before this reference or use a named label.\n",
-                    source_line);
+            asm_set_last_errorf(ctx,
+                                "Error at line %d, column 1: [Symbol] @B has no matching backward @@ label\n"
+                                "Suggestion: Define an @@ label before this reference or use a named label.",
+                                source_line);
             return -1;
         }
         copy_bounded_text(label, MAX_LABEL_LENGTH, replacement);
@@ -375,7 +396,7 @@ static int normalize_label_reference(char *label,
     return 0;
 }
 
-static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
+static int canonicalize_symbol_labels(assembler_context_t *ctx, parsed_instruction_t *insts, int count) {
     local_label_alias_t local_aliases[MAX_SYMBOLS];
     anonymous_label_def_t anon_defs[MAX_SYMBOLS];
     int local_alias_count = 0;
@@ -399,19 +420,19 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             int written;
 
             if (anon_def_count >= MAX_SYMBOLS) {
-                fprintf(stderr,
-                        "Error at line %d, column 1: [Symbol] Too many anonymous labels\n"
-                        "Suggestion: Reduce @@ label density or split the file into multiple sections.\n",
-                        inst->line_number);
+                asm_set_last_errorf(ctx,
+                                    "Error at line %d, column 1: [Symbol] Too many anonymous labels\n"
+                                    "Suggestion: Reduce @@ label density or split the file into multiple sections.",
+                                    inst->line_number);
                 return -1;
             }
 
             written = snprintf(scoped_name, sizeof(scoped_name), "__anon_%d", anonymous_counter++);
             if (written < 0 || (size_t)written >= sizeof(scoped_name)) {
-                fprintf(stderr,
-                        "Error at line %d, column 1: [Internal] Anonymous label name overflow\n"
-                        "Suggestion: Reduce anonymous label count in this file.\n",
-                        inst->line_number);
+                asm_set_last_errorf(ctx,
+                                    "Error at line %d, column 1: [Internal] Anonymous label name overflow\n"
+                                    "Suggestion: Reduce anonymous label count in this file.",
+                                    inst->line_number);
                 return -1;
             }
 
@@ -431,10 +452,10 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             if (lookup_local_alias(local_aliases, local_alias_count,
                                    scope_id, inst->label,
                                    scoped_name, sizeof(scoped_name)) == 0) {
-                fprintf(stderr,
-                    "Error at line %d, column 1: [Symbol] Redefined local label '%s' in the same scope\n"
-                    "Suggestion: Rename one of the local labels or introduce a new global scope label.\n",
-                    inst->line_number, inst->label);
+                asm_set_last_errorf(ctx,
+                                    "Error at line %d, column 1: [Symbol] Redefined local label '%s' in the same scope\n"
+                                    "Suggestion: Rename one of the local labels or introduce a new global scope label.",
+                                    inst->line_number, inst->label);
                 return -1;
             }
 
@@ -470,7 +491,7 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             operand_t *op = &inst->operands[op_idx];
 
             if (op->type == OPERAND_LABEL) {
-                if (normalize_label_reference(op->label, scope_id, i,
+                if (normalize_label_reference(ctx, op->label, scope_id, i,
                                               local_aliases, &local_alias_count,
                                               anon_defs, anon_def_count,
                                               inst->line_number) < 0) {
@@ -480,13 +501,13 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             }
 
             if (op->type == OPERAND_LABEL_DIFF) {
-                if (normalize_label_reference(op->label, scope_id, i,
+                if (normalize_label_reference(ctx, op->label, scope_id, i,
                                               local_aliases, &local_alias_count,
                                               anon_defs, anon_def_count,
                                               inst->line_number) < 0) {
                     return -1;
                 }
-                if (normalize_label_reference(op->label_rhs, scope_id, i,
+                if (normalize_label_reference(ctx, op->label_rhs, scope_id, i,
                                               local_aliases, &local_alias_count,
                                               anon_defs, anon_def_count,
                                               inst->line_number) < 0) {
@@ -496,7 +517,7 @@ static int canonicalize_symbol_labels(parsed_instruction_t *insts, int count) {
             }
 
             if (op->type == OPERAND_MEM && op->mem.label[0] != '\0') {
-                if (normalize_label_reference(op->mem.label, scope_id, i,
+                if (normalize_label_reference(ctx, op->mem.label, scope_id, i,
                                               local_aliases, &local_alias_count,
                                               anon_defs, anon_def_count,
                                               inst->line_number) < 0) {
@@ -751,8 +772,16 @@ assembler_context_t *asm_init(void) {
     ctx->listing_active_index = -1;
     ctx->listing_active = false;
     ctx->enable_forward_short_branches = true;
+    asm_clear_last_error(ctx);
 
     return ctx;
+}
+
+const char *asm_get_last_error(const assembler_context_t *ctx) {
+    if (!ctx) {
+        return "";
+    }
+    return ctx->last_error;
 }
 
 void asm_free(assembler_context_t *ctx) {
@@ -1774,6 +1803,9 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
     char hidden_attrs[MAX_SYMBOLS][MAX_LABEL_LENGTH];
     int weak_attr_count = 0;
     int hidden_attr_count = 0;
+
+    asm_clear_last_error(ctx);
+
     /* Use context-aware parsing to enable macro support */
     parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
     if (!insts) {
@@ -1783,7 +1815,7 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         return -1;
     }
 
-    if (canonicalize_symbol_labels(insts, count) < 0) {
+    if (canonicalize_symbol_labels(ctx, insts, count) < 0) {
         free_instructions(insts);
         return -1;
     }

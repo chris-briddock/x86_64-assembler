@@ -4,14 +4,8 @@
  */
 
 #include "test_framework.h"
-#include "x86_64_asm/x86_64_asm.h"
+#include "../src/x86_64_asm.h"
 #include <string.h>
-
-/* External parser functions from x86_64_asm.c */
-extern parsed_instruction_t *parse_source(const char *source, int *count);
-extern parsed_instruction_t *parse_source_with_context(assembler_context_t *ctx, const char *source, int *count);
-extern void free_instructions(parsed_instruction_t *insts);
-extern char *preprocess_macros(assembler_context_t *ctx, const char *source);
 
 /* Test: Parse simple mov instruction */
 static int test_parse_mov(void) {
