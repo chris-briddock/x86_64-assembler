@@ -161,12 +161,28 @@ static int assemble_file_and_run(const char *asm_file) {
 static int assemble_and_run(const char *source) {
     /* Create temp files */
     char asm_file[] = "/tmp/test_XXXXXX";
+    size_t total_written;
+    size_t source_len;
+    const char *cursor;
     
     int fd = mkstemp(asm_file);
     if (fd < 0) return -1;
     
     /* Write assembly to temp file */
-    write(fd, source, strlen(source));
+    source_len = strlen(source);
+    total_written = 0;
+    cursor = source;
+
+    while (total_written < source_len) {
+        ssize_t written = write(fd, cursor + total_written, source_len - total_written);
+        if (written <= 0) {
+            close(fd);
+            unlink(asm_file);
+            return -1;
+        }
+        total_written += (size_t)written;
+    }
+
     close(fd);
     
     int result = assemble_file_and_run(asm_file);
