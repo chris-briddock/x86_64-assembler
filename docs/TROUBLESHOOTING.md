@@ -184,7 +184,7 @@ addps xmm0, xmm1
 
 ### High 8-bit Register + REX Conflict
 
-### Architectural Constraints
+#### Architectural Constraints
 
 **Problem**: You see errors mentioning `AH/BH/CH/DH` with REX-prefixed encodings.
 
