@@ -343,9 +343,11 @@ static char *capture_command_output(const char *cmd) {
 }
 
 static const symbol_t *find_symbol_by_name(assembler_context_t *ctx, const char *name) {
-    for (int i = 0; i < ctx->symbol_count; i++) {
-        if (strcmp(ctx->symbols[i].name, name) == 0) {
-            return &ctx->symbols[i];
+    int count = 0;
+    const symbol_t *symbols = asm_ctx_get_symbols(ctx, &count);
+    for (int i = 0; i < count; i++) {
+        if (strcmp(symbols[i].name, name) == 0) {
+            return &symbols[i];
         }
     }
     return NULL;
@@ -461,7 +463,7 @@ static int assemble_and_write_listing(const char *source,
         unlink(asm_file);
         return -1;
     }
-    ctx->emit_listing = true;
+    asm_ctx_set_emit_listing(ctx, true);
 
     if (asm_assemble_file(ctx, asm_file) < 0) {
         asm_free(ctx);
@@ -815,7 +817,7 @@ static int test_integration_empty(void) {
 
 /* Test: Invalid instruction should fail */
 static int test_integration_invalid(void) {
-    const char *source = 
+    const char *source =
         "section .text\n"
         "global _start\n"
         "_start:\n"
@@ -829,14 +831,17 @@ static int test_integration_invalid(void) {
     
     int result = asm_assemble(ctx, source);
     captured_err = test_capture_stderr_end();
-    asm_free(ctx);
-    
+
     /* Should fail with invalid instruction */
     ASSERT_EQ(-1, result);
     ASSERT_NOT_NULL(captured_err);
     ASSERT_STR_CONTAINS(captured_err, "Unknown instruction");
-    ASSERT_STR_CONTAINS(captured_err, "Parsing failed");
 
+    /* Library now stores error in ctx->last_error instead of stderr */
+    const char *last_err = asm_get_last_error(ctx);
+    ASSERT_STR_CONTAINS(last_err, "Parsing failed");
+
+    asm_free(ctx);
     free(captured_err);
     return 0;
 }
@@ -1712,7 +1717,7 @@ static int test_integration_dwarf_sections(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2007,7 +2012,7 @@ static int test_integration_dwarf_readelf_validation(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2101,7 +2106,7 @@ static int test_integration_dwarf_dwarfdump_validation(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2185,7 +2190,7 @@ static int test_integration_dwarf_overflow_failure(void) {
 
     ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
 
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, test_capture_stderr_begin());
@@ -2238,7 +2243,7 @@ static int test_integration_dwarf_line_table_known_lines(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2380,7 +2385,7 @@ static int test_integration_dwarf_symbol_table_crosscheck(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2506,7 +2511,7 @@ static int test_integration_dwarf_large_program_success(void) {
 
     ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
 
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
@@ -2575,7 +2580,7 @@ static int test_integration_output_formats_compile(void) {
     ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
-    ASSERT_TRUE(ctx->text_size > 0);
+    ASSERT_TRUE(asm_ctx_get_text_size(ctx) > 0);
 
     out_fd = mkstemp(out_elf);
     ASSERT_TRUE(out_fd >= 0);
@@ -2600,7 +2605,7 @@ static int test_integration_output_formats_compile(void) {
     close(out_fd);
     ASSERT_EQ(0, asm_write_binary(ctx, out_bin));
     ASSERT_EQ(0, stat(out_bin, &st));
-    ASSERT_EQ((long long)ctx->text_size, (long long)st.st_size);
+    ASSERT_EQ((long long)asm_ctx_get_text_size(ctx), (long long)st.st_size);
 
     out_fd = mkstemp(out_hex);
     ASSERT_TRUE(out_fd >= 0);
@@ -2816,15 +2821,19 @@ static int test_integration_listing_bytes_match_buffers(void) {
             continue;
         }
 
-        uint64_t offset = row.address - ctx->base_address;
+        uint64_t offset = row.address - asm_ctx_get_base_address(ctx);
+        size_t text_size = asm_ctx_get_text_size(ctx);
+        size_t data_size = asm_ctx_get_data_size(ctx);
+        const uint8_t *text_sec = asm_ctx_get_text_section(ctx);
+        const uint8_t *data_sec = asm_ctx_get_data_section(ctx);
         for (int i = 0; i < row.byte_count; i++) {
             uint8_t expected;
-            if (offset + (uint64_t)i < (uint64_t)ctx->text_size) {
-                expected = ctx->text_section[offset + (uint64_t)i];
+            if (offset + (uint64_t)i < (uint64_t)text_size) {
+                expected = text_sec[offset + (uint64_t)i];
             } else {
-                uint64_t data_off = (offset + (uint64_t)i) - (uint64_t)ctx->text_size;
-                ASSERT_TRUE(data_off < (uint64_t)ctx->data_size);
-                expected = ctx->data_section[data_off];
+                uint64_t data_off = (offset + (uint64_t)i) - (uint64_t)text_size;
+                ASSERT_TRUE(data_off < (uint64_t)data_size);
+                expected = data_sec[data_off];
             }
             ASSERT_EQ_HEX(expected, row.bytes[i]);
         }
@@ -3594,10 +3603,7 @@ static int test_integration_cli_define_substitution(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
 
-    ASSERT_TRUE(ctx->cli_define_count < MAX_CLI_DEFINES);
-    strcpy(ctx->cli_defines[ctx->cli_define_count], "MYVAL");
-    strcpy(ctx->cli_define_values[ctx->cli_define_count], "42");
-    ctx->cli_define_count++;
+    ASSERT_EQ(0, asm_ctx_add_cli_define(ctx, "MYVAL", "42"));
 
     const char *source =
         "section .text\n"
@@ -3634,10 +3640,7 @@ static int test_integration_cli_define_conditional(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
 
-    ASSERT_TRUE(ctx->cli_define_count < MAX_CLI_DEFINES);
-    strcpy(ctx->cli_defines[ctx->cli_define_count], "DEBUG");
-    ctx->cli_define_values[ctx->cli_define_count][0] = '\0';
-    ctx->cli_define_count++;
+    ASSERT_EQ(0, asm_ctx_add_cli_define(ctx, "DEBUG", NULL));
 
     const char *source =
         "section .text\n"
@@ -3706,9 +3709,7 @@ static int test_integration_include_search_path(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ASSERT_TRUE(ctx->include_path_count < MAX_INCLUDE_PATHS);
-    strcpy(ctx->include_paths[ctx->include_path_count], dir);
-    ctx->include_path_count++;
+    ASSERT_EQ(0, asm_ctx_add_include_path(ctx, dir));
 
     int result = asm_assemble_file(ctx, main_path);
     if (result == 0) {
@@ -3796,15 +3797,71 @@ static int test_integration_dependency_tracking(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->generate_deps = true;
+    asm_ctx_set_generate_deps(ctx, true);
 
     int result = asm_assemble_file(ctx, main_path);
     ASSERT_EQ(0, result);
-    ASSERT_TRUE(ctx->dependency_count > 0);
+    ASSERT_TRUE(asm_ctx_get_dependency_count(ctx) > 0);
 
     int found = 0;
-    for (int i = 0; i < ctx->dependency_count; i++) {
-        if (strstr(ctx->dependencies[i], "dep.inc") != NULL) {
+    int dep_count = asm_ctx_get_dependency_count(ctx);
+    for (int i = 0; i < dep_count; i++) {
+        if (strstr(asm_ctx_get_dependency(ctx, i), "dep.inc") != NULL) {
+            found = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+
+    unlink(main_path);
+    unlink(inc_path);
+    rmdir(dir);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: -MM should exclude system includes but still track local ones */
+static int test_integration_dependency_exclude_system(void) {
+    char dir_template[] = "/tmp/asm_deps_mm_XXXXXX";
+    char main_path[512];
+    char inc_path[512];
+    FILE *f;
+
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    ASSERT_TRUE(snprintf(inc_path, sizeof(inc_path), "%s/local.inc", dir) < (int)sizeof(inc_path));
+    f = fopen(inc_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "    nop\n");
+    fclose(f);
+
+    ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
+    f = fopen(main_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            ".include \"local.inc\"\n"
+            "    mov rax, $60\n"
+            "    xor rdi, rdi\n"
+            "    syscall\n");
+    fclose(f);
+
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    asm_ctx_set_generate_deps(ctx, true);
+    asm_ctx_set_deps_exclude_system(ctx, true);
+
+    int result = asm_assemble_file(ctx, main_path);
+    ASSERT_EQ(0, result);
+    ASSERT_TRUE(asm_ctx_get_dependency_count(ctx) > 0);
+
+    int found = 0;
+    int dep_count = asm_ctx_get_dependency_count(ctx);
+    for (int i = 0; i < dep_count; i++) {
+        if (strstr(asm_ctx_get_dependency(ctx, i), "local.inc") != NULL) {
             found = 1;
             break;
         }
@@ -3822,7 +3879,7 @@ static int test_integration_dependency_tracking(void) {
 static int test_integration_warning_utf8(void) {
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->warn_all = true;
+    asm_ctx_set_warn_all(ctx, true);
 
     /* Invalid UTF-8 continuation byte in string */
     const char *source =
@@ -3912,6 +3969,7 @@ TEST_SUITE(integration) {
     TEST(integration_include_search_path);
     TEST(integration_preprocess_only);
     TEST(integration_dependency_tracking);
+    TEST(integration_dependency_exclude_system);
     TEST(integration_warning_utf8);
 }
 

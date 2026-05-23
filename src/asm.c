@@ -3,6 +3,7 @@
  */
 
 #include "x86_64_asm.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,23 +30,6 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -h, --help           Show this help\n");
 }
 
-static void safe_copy(char *dst, size_t dst_size, const char *src)
-{
-    if (!dst || dst_size == 0) {
-        return;
-    }
-    if (!src) {
-        dst[0] = '\0';
-        return;
-    }
-    size_t n = strlen(src);
-    if (n >= dst_size) {
-        n = dst_size - 1;
-    }
-    memcpy(dst, src, n);
-    dst[n] = '\0';
-}
-
 static void emit_cli_error(int json, const char *category,
                            const char *message, const char *suggestion)
 {
@@ -67,19 +51,48 @@ static int parse_cli_define(const char *str, char *name, char *value,
                             size_t name_size, size_t value_size)
 {
     const char *eq = strchr(str, '=');
+    size_t name_len;
 
     if (eq) {
-        size_t name_len = (size_t)(eq - str);
-
+        name_len = (size_t)(eq - str);
         if (name_len >= name_size) {
             name_len = name_size - 1;
         }
         memcpy(name, str, name_len);
         name[name_len] = '\0';
-        safe_copy(value, value_size, eq + 1);
+        if (value && value_size > 0) {
+            size_t val_len = strlen(eq + 1);
+            if (val_len >= value_size) {
+                val_len = value_size - 1;
+            }
+            memcpy(value, eq + 1, val_len);
+            value[val_len] = '\0';
+        }
     } else {
-        safe_copy(name, name_size, str);
-        value[0] = '\0';
+        if (name && name_size > 0) {
+            size_t n = strlen(str);
+            if (n >= name_size) {
+                n = name_size - 1;
+            }
+            memcpy(name, str, n);
+            name[n] = '\0';
+        }
+        if (value && value_size > 0) {
+            value[0] = '\0';
+        }
+    }
+
+    /* Validate: non-empty and valid C identifier [A-Za-z_][A-Za-z0-9_]* */
+    if (!name || !name[0]) {
+        return -1;
+    }
+    if (!isalpha((unsigned char)name[0]) && name[0] != '_') {
+        return -1;
+    }
+    for (size_t i = 1; name[i] != '\0'; i++) {
+        if (!isalnum((unsigned char)name[i]) && name[i] != '_') {
+            return -1;
+        }
     }
     return 0;
 }
@@ -177,55 +190,55 @@ int main(int argc, char **argv)
                        "Retry and verify memory availability.");
         return 1;
     }
-    ctx->emit_debug_map = (debug_map != 0);
-    ctx->emit_listing = (listing != 0);
-    ctx->preprocess_only = (preprocess_only != 0);
-    ctx->warnings_as_errors = (warn_error != 0);
-    ctx->warn_all = (warn_all != 0);
-    ctx->warn_unused_labels = (warn != 0 || warn_all != 0);
-    ctx->error_format_json = (error_format_json != 0);
-    ctx->generate_deps = (gen_deps != 0 || gen_deps_local != 0);
-    ctx->deps_exclude_system = (gen_deps_local != 0);
+    asm_ctx_set_emit_debug_map(ctx, (debug_map != 0));
+    asm_ctx_set_emit_listing(ctx, (listing != 0));
+    asm_ctx_set_preprocess_only(ctx, (preprocess_only != 0));
+    asm_ctx_set_warnings_as_errors(ctx, (warn_error != 0));
+    asm_ctx_set_warn_all(ctx, (warn_all != 0));
+    asm_ctx_set_warn_unused_labels(ctx, (warn != 0 || warn_all != 0));
+    asm_ctx_set_error_format_json(ctx, (error_format_json != 0));
+    asm_ctx_set_generate_deps(ctx, (gen_deps != 0 || gen_deps_local != 0));
+    asm_ctx_set_deps_exclude_system(ctx, (gen_deps_local != 0));
 
     /* Second pass: collect -I, -D flags into context */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
-            if (ctx->include_path_count < MAX_INCLUDE_PATHS) {
-                safe_copy(ctx->include_paths[ctx->include_path_count],
-                          MAX_FILEPATH_LENGTH, argv[++i]);
-                ctx->include_path_count++;
-            } else {
+            if (asm_ctx_add_include_path(ctx, argv[++i]) < 0) {
                 fprintf(stderr, "Warning: too many -I paths (max %d)\n",
                         MAX_INCLUDE_PATHS);
             }
         } else if (strncmp(argv[i], "-I", 2) == 0 && argv[i][2] != '\0') {
-            if (ctx->include_path_count < MAX_INCLUDE_PATHS) {
-                safe_copy(ctx->include_paths[ctx->include_path_count],
-                          MAX_FILEPATH_LENGTH, argv[i] + 2);
-                ctx->include_path_count++;
-            } else {
+            if (asm_ctx_add_include_path(ctx, argv[i] + 2) < 0) {
                 fprintf(stderr, "Warning: too many -I paths (max %d)\n",
                         MAX_INCLUDE_PATHS);
             }
         } else if (strcmp(argv[i], "-D") == 0 && i + 1 < argc) {
-            if (ctx->cli_define_count < MAX_CLI_DEFINES) {
-                parse_cli_define(argv[++i],
-                                 ctx->cli_defines[ctx->cli_define_count],
-                                 ctx->cli_define_values[ctx->cli_define_count],
-                                 MAX_LABEL_LENGTH, MAX_LINE_LENGTH);
-                ctx->cli_define_count++;
-            } else {
+            char d_name[MAX_LABEL_LENGTH];
+            char d_value[MAX_LINE_LENGTH];
+            if (parse_cli_define(argv[++i], d_name, d_value,
+                                 sizeof(d_name), sizeof(d_value)) < 0) {
+                emit_cli_error(error_format_json, "CLI",
+                               "Invalid -D define: expected NAME[=VALUE]",
+                               "Use -D NAME or -D NAME=VALUE where NAME is a valid identifier.");
+                asm_free(ctx);
+                return 1;
+            }
+            if (asm_ctx_add_cli_define(ctx, d_name, d_value) < 0) {
                 fprintf(stderr, "Warning: too many -D defines (max %d)\n",
                         MAX_CLI_DEFINES);
             }
         } else if (strncmp(argv[i], "-D", 2) == 0 && argv[i][2] != '\0') {
-            if (ctx->cli_define_count < MAX_CLI_DEFINES) {
-                parse_cli_define(argv[i] + 2,
-                                 ctx->cli_defines[ctx->cli_define_count],
-                                 ctx->cli_define_values[ctx->cli_define_count],
-                                 MAX_LABEL_LENGTH, MAX_LINE_LENGTH);
-                ctx->cli_define_count++;
-            } else {
+            char d_name[MAX_LABEL_LENGTH];
+            char d_value[MAX_LINE_LENGTH];
+            if (parse_cli_define(argv[i] + 2, d_name, d_value,
+                                 sizeof(d_name), sizeof(d_value)) < 0) {
+                emit_cli_error(error_format_json, "CLI",
+                               "Invalid -D define: expected NAME[=VALUE]",
+                               "Use -D NAME or -D NAME=VALUE where NAME is a valid identifier.");
+                asm_free(ctx);
+                return 1;
+            }
+            if (asm_ctx_add_cli_define(ctx, d_name, d_value) < 0) {
                 fprintf(stderr, "Warning: too many -D defines (max %d)\n",
                         MAX_CLI_DEFINES);
             }
@@ -233,10 +246,14 @@ int main(int argc, char **argv)
     }
 
     /* Preprocess-only mode */
-    if (ctx->preprocess_only) {
+    if (asm_ctx_get_preprocess_only(ctx)) {
         char *preprocessed = asm_preprocess_file(ctx, input_file);
         if (!preprocessed) {
-            emit_cli_error(ctx->error_format_json, "Assembler",
+            const char *err = asm_get_last_error(ctx);
+            if (err && err[0] != '\0') {
+                fprintf(stderr, "%s\n", err);
+            }
+            emit_cli_error(asm_ctx_get_error_format_json(ctx), "Assembler",
                            "Preprocessing failed",
                            "Check the diagnostic emitted above for the exact failure cause.");
             asm_free(ctx);
@@ -252,7 +269,11 @@ int main(int argc, char **argv)
 
     /* Assemble */
     if (asm_assemble_file(ctx, input_file) < 0) {
-        emit_cli_error(ctx->error_format_json, "Assembler",
+        const char *err = asm_get_last_error(ctx);
+        if (err && err[0] != '\0') {
+            fprintf(stderr, "%s\n", err);
+        }
+        emit_cli_error(asm_ctx_get_error_format_json(ctx), "Assembler",
                        "Assembly failed",
                        "Check the diagnostic emitted above for the exact failure cause.");
         asm_free(ctx);
@@ -260,8 +281,8 @@ int main(int argc, char **argv)
     }
 
     /* Treat warnings as errors if -Werror was set */
-    if (ctx->fatal_warning_occurred) {
-        emit_cli_error(ctx->error_format_json, "Assembler",
+    if (asm_ctx_get_fatal_warning_occurred(ctx)) {
+        emit_cli_error(asm_ctx_get_error_format_json(ctx), "Assembler",
                        "Assembly failed due to warnings treated as errors",
                        "Fix the warnings above or remove -Werror.");
         asm_free(ctx);
@@ -272,15 +293,17 @@ int main(int argc, char **argv)
     if (gen_deps || gen_deps_local) {
         printf("%s:", output_file);
         printf(" %s", input_file);
-        for (int i = 0; i < ctx->dependency_count; i++) {
-            printf(" %s", ctx->dependencies[i]);
+        int dep_count = asm_ctx_get_dependency_count(ctx);
+        for (int i = 0; i < dep_count; i++) {
+            printf(" %s", asm_ctx_get_dependency(ctx, i));
         }
         printf("\n");
         asm_free(ctx);
         return 0;
     }
 
-    printf("Assembly successful: %zu bytes generated\n", ctx->text_size);
+    printf("Assembly successful: %zu bytes generated\n",
+           asm_ctx_get_text_size(ctx));
 
     /* Dump if requested */
     if (dump) {
@@ -297,23 +320,23 @@ int main(int argc, char **argv)
     } else if (strcmp(format, "hex") == 0) {
         result = asm_write_hex(ctx, output_file);
     } else {
-        emit_cli_error(ctx->error_format_json, "CLI",
+        emit_cli_error(asm_ctx_get_error_format_json(ctx), "CLI",
                        "Unknown output format",
                        "Use one of: elf64, bin, or hex.");
         result = -1;
     }
 
     if (result < 0) {
-        emit_cli_error(ctx->error_format_json, "I/O",
+        emit_cli_error(asm_ctx_get_error_format_json(ctx), "I/O",
                        "Failed to write output",
                        "Check output path, permissions, and available disk space.");
         asm_free(ctx);
         return 1;
     }
 
-    if (ctx->emit_debug_map) {
+    if (asm_ctx_get_emit_debug_map(ctx)) {
         if (asm_write_debug_map(ctx, output_file) < 0) {
-            emit_cli_error(ctx->error_format_json, "I/O",
+            emit_cli_error(asm_ctx_get_error_format_json(ctx), "I/O",
                            "Failed to write debug map",
                            "Check output path permissions for <output>.dbg.");
             asm_free(ctx);
@@ -321,9 +344,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (ctx->emit_listing) {
+    if (asm_ctx_get_emit_listing(ctx)) {
         if (asm_write_listing(ctx, output_file) < 0) {
-            emit_cli_error(ctx->error_format_json, "I/O",
+            emit_cli_error(asm_ctx_get_error_format_json(ctx), "I/O",
                            "Failed to write listing file",
                            "Check output path permissions for <output>.lst.");
             asm_free(ctx);

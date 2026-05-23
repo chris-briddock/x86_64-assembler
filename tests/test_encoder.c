@@ -474,12 +474,12 @@ static int test_jnz_encoding(void) {
     setup_test_context(&ctx_jnz);
     
     /* Create a label for jump target */
-    strcpy(ctx_jne.symbols[0].name, "target");
+    snprintf(ctx_jne.symbols[0].name, sizeof(ctx_jne.symbols[0].name), "target");
     ctx_jne.symbols[0].address = 0x1100;
     ctx_jne.symbols[0].is_resolved = true;
     ctx_jne.symbol_count = 1;
-    
-    strcpy(ctx_jnz.symbols[0].name, "target");
+
+    snprintf(ctx_jnz.symbols[0].name, sizeof(ctx_jnz.symbols[0].name), "target");
     ctx_jnz.symbols[0].address = 0x1100;
     ctx_jnz.symbols[0].is_resolved = true;
     ctx_jnz.symbol_count = 1;

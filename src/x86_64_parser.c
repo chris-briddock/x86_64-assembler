@@ -448,7 +448,7 @@ static void parser_diag_ctx(const assembler_context_t *ctx, const char *category
 
     if (ctx && ctx->error_format_json) {
         fprintf(stderr,
-                "{\"severity\":\"error\",\"line\":%d,\"column\":1,\"category\":\"%s\",\"message\":\"%s\"}",
+                "{\"severity\":\"error\",\"line\":%d,\"column\":1,\"category\":\"%s\",\"message\":\"%s\"",
                 line, category, message);
         if (suggestion && suggestion[0] != '\0') {
             fprintf(stderr, ",\"suggestion\":\"%s\"", suggestion);
@@ -465,17 +465,30 @@ static void parser_diag_ctx(const assembler_context_t *ctx, const char *category
 static void parser_warn_ctx(assembler_context_t *ctx, const char *category,
                             const char *message, const char *suggestion) {
     int line = 1;
+    const char *severity;
     if (ctx && ctx->line_number > 0) {
         line = ctx->line_number;
     }
     if (ctx && ctx->warnings_as_errors) {
-        fprintf(stderr, "Error at line %d, column 1: [%s] %s\n", line, category, message);
-        if (suggestion && suggestion[0] != '\0') {
-            fprintf(stderr, "\nSuggestion: %s\n", suggestion);
-        }
+        severity = "error";
         ctx->fatal_warning_occurred = true;
     } else {
-        fprintf(stderr, "Warning at line %d, column 1: [%s] %s\n", line, category, message);
+        severity = "warning";
+    }
+    if (ctx && ctx->error_format_json) {
+        fprintf(stderr,
+                "{\"severity\":\"%s\",\"line\":%d,\"column\":1,\"category\":\"%s\",\"message\":\"%s\"",
+                severity, line, category, message);
+        if (suggestion && suggestion[0] != '\0') {
+            fprintf(stderr, ",\"suggestion\":\"%s\"", suggestion);
+        }
+        fprintf(stderr, "}\n");
+    } else {
+        if (ctx && ctx->warnings_as_errors) {
+            fprintf(stderr, "Error at line %d, column 1: [%s] %s\n", line, category, message);
+        } else {
+            fprintf(stderr, "Warning at line %d, column 1: [%s] %s\n", line, category, message);
+        }
         if (suggestion && suggestion[0] != '\0') {
             fprintf(stderr, "\nSuggestion: %s\n", suggestion);
         }
@@ -2649,8 +2662,6 @@ static int pp_substitute_defines(const char *line, pp_define_t *defines, int def
     bool in_double = false;
 
     if (out_size == 0) return -1;
-    for (int di = 0; di < define_count; di++) {
-    }
 
     while (*p && pos + 1 < out_size) {
         if (!in_single && *p == '"') {
@@ -2706,14 +2717,34 @@ static int pp_substitute_defines(const char *line, pp_define_t *defines, int def
     return 0;
 }
 
+static bool is_system_include_path(const char *path)
+{
+    if (!path || path[0] != '/') {
+        return false;
+    }
+    if (strncmp(path, "/usr/include", strlen("/usr/include")) == 0) {
+        return true;
+    }
+    if (strncmp(path, "/usr/local/include", strlen("/usr/local/include")) == 0) {
+        return true;
+    }
+    if (strncmp(path, "/include", strlen("/include")) == 0) {
+        return true;
+    }
+    return false;
+}
+
 static void track_dependency(assembler_context_t *ctx, const char *path) {
+    int n;
     if (!ctx || !path || !ctx->generate_deps) return;
+    if (ctx->deps_exclude_system && is_system_include_path(path)) return;
     /* Check for duplicates */
     for (int i = 0; i < ctx->dependency_count; i++) {
         if (strcmp(ctx->dependencies[i], path) == 0) return;
     }
     if (ctx->dependency_count < MAX_DEPENDENCIES) {
-        snprintf(ctx->dependencies[ctx->dependency_count], MAX_FILEPATH_LENGTH, "%s", path);
+        n = snprintf(ctx->dependencies[ctx->dependency_count], MAX_FILEPATH_LENGTH, "%s", path);
+        if (n < 0 || n >= MAX_FILEPATH_LENGTH) return;
         ctx->dependency_count++;
     }
 }
@@ -2902,11 +2933,15 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
 
     /* Seed preprocessor with command-line -D defines */
     for (int i = 0; i < ctx->cli_define_count; i++) {
-        pp_define_set(defines, &define_count,
-                      ctx->cli_defines[i],
-                      ctx->cli_define_values[i][0] ? ctx->cli_define_values[i] : "1");
-    }
-    for (int i = 0; i < define_count; i++) {
+        if (pp_define_set(defines, &define_count,
+                          ctx->cli_defines[i],
+                          ctx->cli_define_values[i][0] ? ctx->cli_define_values[i] : "1") < 0) {
+            parser_diag_ctx(ctx, "CLI",
+                            "Failed to seed CLI define",
+                            "Check that the define name is valid and capacity is not exceeded.");
+            free(expanded_source);
+            return NULL;
+        }
     }
 
     p = source_text;
