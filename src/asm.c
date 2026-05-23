@@ -302,11 +302,6 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (!gen_deps && !gen_deps_local) {
-        printf("Assembly successful: %zu bytes generated\n",
-               asm_ctx_get_text_size(ctx));
-    }
-
     /* Dump if requested */
     if (dump) {
         asm_dump_symbols(ctx);
@@ -355,6 +350,11 @@ int main(int argc, char **argv)
             return 1;
         }
         printf("Listing written to: %s.lst\n", output_file);
+    }
+
+    if (!gen_deps && !gen_deps_local) {
+        printf("Assembly successful: %zu bytes generated\n",
+               asm_ctx_get_text_size(ctx));
     }
 
     printf("Output written to: %s\n", output_file);

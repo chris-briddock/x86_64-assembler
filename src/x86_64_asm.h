@@ -194,6 +194,7 @@ char *macro_expand_line(assembler_context_t *ctx, const char *line, const char *
 bool is_macro_name(assembler_context_t *ctx, const char *name);
 int get_macro_arg_count(assembler_context_t *ctx, const char *name);
 char *preprocess_macros(assembler_context_t *ctx, const char *source);
+char *parser_expand_times_only(const char *source);
 
 typedef struct {
 	uint64_t parse_calls;

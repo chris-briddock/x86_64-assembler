@@ -16,7 +16,6 @@
 extern parsed_instruction_t *parse_source(const char *source, int *count);
 extern parsed_instruction_t *parse_source_with_context(assembler_context_t *ctx, const char *source, int *count);
 extern void free_instructions(parsed_instruction_t *insts);
-extern char *expand_times_only(const char *source);
 
 /* Encoder functions */
 extern int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst);
@@ -2454,7 +2453,7 @@ asm_preprocess_file(assembler_context_t *ctx, const char *filename)
     ctx->current_filename[MAX_FILEPATH_LENGTH - 1] = '\0';
 
     /* Expand times directive first (same as parse_source_common) */
-    char *times_expanded = expand_times_only(source);
+    char *times_expanded = parser_expand_times_only(source);
     if (!times_expanded) {
         times_expanded = source;
     }

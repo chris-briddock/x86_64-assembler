@@ -1759,11 +1759,10 @@ static int parse_times_directive(const char *line, int *repeat_count, char *inst
     return instruction_part[0] != '\0' ? 0 : -1;  /* Success if we have an instruction */
 }
 
-/* Forward declaration used by x86_64_asm.c via extern */
-char *expand_times_only(const char *source);
-
 /* Helper to expand times directive even without macro context */
-char *expand_times_only(const char *source) {
+char *
+parser_expand_times_only(const char *source)
+{
     size_t output_size = strlen(source) * 4 + 1;
     char *output = malloc(output_size);
     if (!output) return NULL;
@@ -1815,7 +1814,7 @@ static parsed_instruction_t *parse_source_common(assembler_context_t *ctx,
                                                  const char *source,
                                                  int *count) {
     /* First, always expand times directive */
-    char *times_expanded = expand_times_only(source);
+    char *times_expanded = parser_expand_times_only(source);
     if (!times_expanded) {
         return parse_source_internal(ctx, source, count);
     }
@@ -2782,6 +2781,7 @@ static bool has_prefix_dir(const char *path, const char *prefix)
 
 static bool is_system_include_path(const char *path)
 {
+    const char *test_prefix;
     if (!path || path[0] != '/') {
         return false;
     }
@@ -2792,6 +2792,10 @@ static bool is_system_include_path(const char *path)
         return true;
     }
     if (has_prefix_dir(path, "/include")) {
+        return true;
+    }
+    test_prefix = getenv("ASM_TEST_SYSTEM_INCLUDE_PATH");
+    if (test_prefix && has_prefix_dir(path, test_prefix)) {
         return true;
     }
     return false;

@@ -100,6 +100,25 @@ static size_t decode_sleb128_at(const unsigned char *buf, size_t len, size_t pos
     return pos;
 }
 
+/* Drain a pipe fd to EOF into buffer, null-terminating the result. */
+static ssize_t
+test_read_all(int fd, char *buffer, size_t buffer_size)
+{
+    size_t total = 0;
+    while (total + 1 < buffer_size) {
+        ssize_t chunk = read(fd, buffer + total, buffer_size - total - 1);
+        if (chunk == 0) {
+            break;
+        }
+        if (chunk < 0) {
+            return -1;
+        }
+        total += (size_t)chunk;
+    }
+    buffer[total] = '\0';
+    return (ssize_t)total;
+}
+
 /* Assemble from an existing file path and run resulting executable. */
 static int assemble_file_and_run(const char *asm_file) {
     char bin_file[] = "/tmp/test_XXXXXX";
@@ -3903,9 +3922,12 @@ static int test_integration_warning_utf8(void) {
 static int test_integration_cli_end_to_end(void)
 {
     char dir_template[] = "/tmp/asm_cli_e2e_XXXXXX";
+    char sys_dir_template[] = "/tmp/asm_cli_e2e_sys_XXXXXX";
     char inc_dir[512];
     char main_path[512];
     char inc_path[512];
+    char sys_dir[512];
+    char sys_inc_path[512];
     char out_path[] = "/tmp/asm_cli_e2e_out_XXXXXX";
     FILE *f;
     int fd;
@@ -3914,12 +3936,23 @@ static int test_integration_cli_end_to_end(void)
     int stderr_pipe[2];
     char stdout_buf[4096];
     char stderr_buf[4096];
-    ssize_t n;
+    char stdout_buf_M[4096];
+    char stdout_buf_MM[4096];
     int status;
     int exit_code = -1;
 
     char *dir = mkdtemp(dir_template);
     ASSERT_NOT_NULL(dir);
+
+    /* Create system include directory and file (treated as system by -MM) */
+    char *sys_dir_ptr = mkdtemp(sys_dir_template);
+    ASSERT_NOT_NULL(sys_dir_ptr);
+    ASSERT_TRUE(snprintf(sys_dir, sizeof(sys_dir), "%s", sys_dir_ptr) < (int)sizeof(sys_dir));
+    ASSERT_TRUE(snprintf(sys_inc_path, sizeof(sys_inc_path), "%s/system.inc", sys_dir) < (int)sizeof(sys_inc_path));
+    f = fopen(sys_inc_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "    nop\n");
+    fclose(f);
 
     /* Create include subdirectory and file */
     ASSERT_TRUE(snprintf(inc_dir, sizeof(inc_dir), "%s/inc", dir) < (int)sizeof(inc_dir));
@@ -3931,7 +3964,7 @@ static int test_integration_cli_end_to_end(void)
     fprintf(f, "    mov rax, $60\n");
     fclose(f);
 
-    /* Create main source that references a define and includes via -I */
+    /* Create main source that references a define and includes via -I and absolute path */
     ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
     f = fopen(main_path, "w");
     ASSERT_NOT_NULL(f);
@@ -3940,8 +3973,10 @@ static int test_integration_cli_end_to_end(void)
             "global _start\n"
             "_start:\n"
             ".include \"helper.inc\"\n"
+            ".include \"%s\"\n"
             "    mov rdi, $MYVAL\n"
-            "    syscall\n");
+            "    syscall\n",
+            sys_inc_path);
     fclose(f);
 
     /* Create output path template */
@@ -3970,11 +4005,8 @@ static int test_integration_cli_end_to_end(void)
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
 
-    n = read(stdout_pipe[0], stdout_buf, sizeof(stdout_buf) - 1);
-    stdout_buf[(n >= 0) ? (size_t)n : 0] = '\0';
-
-    n = read(stderr_pipe[0], stderr_buf, sizeof(stderr_buf) - 1);
-    stderr_buf[(n >= 0) ? (size_t)n : 0] = '\0';
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf, sizeof(stdout_buf)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
 
     close(stdout_pipe[0]);
     close(stderr_pipe[0]);
@@ -3989,7 +4021,7 @@ static int test_integration_cli_end_to_end(void)
     ASSERT_STR_CONTAINS(stdout_buf, "mov rdi, $42");
     ASSERT_STR_CONTAINS(stdout_buf, "mov rax, $60");
 
-    /* --- Subtest 2: -M dependency generation --- */
+    /* --- Subtest 2: -M dependency generation (includes system includes) --- */
     ASSERT_EQ(0, pipe(stdout_pipe));
     ASSERT_EQ(0, pipe(stderr_pipe));
 
@@ -4002,6 +4034,7 @@ static int test_integration_cli_end_to_end(void)
         dup2(stderr_pipe[1], STDERR_FILENO);
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
+        setenv("ASM_TEST_SYSTEM_INCLUDE_PATH", sys_dir, 1);
         execl("bin/x86_64-asm", "x86_64-asm", "-M", "-o", out_path,
               "-I", inc_dir, "-DMYVAL=42", main_path, NULL);
         _exit(127);
@@ -4009,11 +4042,8 @@ static int test_integration_cli_end_to_end(void)
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
 
-    n = read(stdout_pipe[0], stdout_buf, sizeof(stdout_buf) - 1);
-    stdout_buf[(n >= 0) ? (size_t)n : 0] = '\0';
-
-    /* drain stderr */
-    while (read(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) > 0) {}
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf_M, sizeof(stdout_buf_M)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
     close(stderr_pipe[0]);
     close(stdout_pipe[0]);
 
@@ -4023,10 +4053,11 @@ static int test_integration_cli_end_to_end(void)
     }
 
     ASSERT_EQ(0, exit_code);
-    ASSERT_STR_CONTAINS(stdout_buf, main_path);
-    ASSERT_STR_CONTAINS(stdout_buf, "helper.inc");
+    ASSERT_STR_CONTAINS(stdout_buf_M, main_path);
+    ASSERT_STR_CONTAINS(stdout_buf_M, "helper.inc");
+    ASSERT_STR_CONTAINS(stdout_buf_M, "system.inc");
 
-    /* --- Subtest 3: -MM dependency generation (no system includes in test) --- */
+    /* --- Subtest 3: -MM dependency generation (excludes system includes) --- */
     ASSERT_EQ(0, pipe(stdout_pipe));
     ASSERT_EQ(0, pipe(stderr_pipe));
 
@@ -4039,6 +4070,7 @@ static int test_integration_cli_end_to_end(void)
         dup2(stderr_pipe[1], STDERR_FILENO);
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
+        setenv("ASM_TEST_SYSTEM_INCLUDE_PATH", sys_dir, 1);
         execl("bin/x86_64-asm", "x86_64-asm", "-MM", "-o", out_path,
               "-I", inc_dir, "-DMYVAL=42", main_path, NULL);
         _exit(127);
@@ -4046,10 +4078,8 @@ static int test_integration_cli_end_to_end(void)
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
 
-    n = read(stdout_pipe[0], stdout_buf, sizeof(stdout_buf) - 1);
-    stdout_buf[(n >= 0) ? (size_t)n : 0] = '\0';
-
-    while (read(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) > 0) {}
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf_MM, sizeof(stdout_buf_MM)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
     close(stderr_pipe[0]);
     close(stdout_pipe[0]);
 
@@ -4059,8 +4089,9 @@ static int test_integration_cli_end_to_end(void)
     }
 
     ASSERT_EQ(0, exit_code);
-    ASSERT_STR_CONTAINS(stdout_buf, main_path);
-    ASSERT_STR_CONTAINS(stdout_buf, "helper.inc");
+    ASSERT_STR_CONTAINS(stdout_buf_MM, main_path);
+    ASSERT_STR_CONTAINS(stdout_buf_MM, "helper.inc");
+    ASSERT_TRUE(strstr(stdout_buf_MM, "system.inc") == NULL);
 
     /* --- Subtest 4: Normal assembly with -I should produce runnable binary --- */
     ASSERT_EQ(0, pipe(stdout_pipe));
@@ -4082,10 +4113,8 @@ static int test_integration_cli_end_to_end(void)
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
 
-    n = read(stdout_pipe[0], stdout_buf, sizeof(stdout_buf) - 1);
-    stdout_buf[(n >= 0) ? (size_t)n : 0] = '\0';
-
-    while (read(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) > 0) {}
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf, sizeof(stdout_buf)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
     close(stderr_pipe[0]);
     close(stdout_pipe[0]);
 
@@ -4116,8 +4145,10 @@ static int test_integration_cli_end_to_end(void)
     unlink(out_path);
     unlink(main_path);
     unlink(inc_path);
+    unlink(sys_inc_path);
     rmdir(inc_dir);
     rmdir(dir);
+    rmdir(sys_dir);
 
     return 0;
 }
