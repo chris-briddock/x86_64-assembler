@@ -387,35 +387,86 @@ static void parser_init(parser_state_t *p, assembler_context_t *ctx, const char 
     p->peek.type = TOK_NONE;
 }
 
+/* Escape a string for safe inclusion in JSON string values.
+ * Writes into out (null-terminated) and returns the number of bytes written.
+ */
+static size_t json_escape_string(const char *in, char *out, size_t out_size)
+{
+    size_t j = 0;
+    for (size_t i = 0; in[i] != '\0' && j + 1 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\') {
+            if (j + 2 >= out_size) {
+                break;
+            }
+            out[j++] = '\\';
+            out[j++] = (char)c;
+        } else if (c < 0x20) {
+            if (j + 6 >= out_size) {
+                break;
+            }
+            out[j++] = '\\';
+            out[j++] = 'u';
+            out[j++] = '0';
+            out[j++] = '0';
+            out[j++] = "0123456789abcdef"[c >> 4];
+            out[j++] = "0123456789abcdef"[c & 0x0F];
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    if (j < out_size) {
+        out[j] = '\0';
+    } else if (out_size > 0) {
+        out[out_size - 1] = '\0';
+    }
+    return j;
+}
+
 /* Print diagnostic error with source context and remediation hint. */
 static void parser_error_context_ex(const parser_state_t *p, const char *category,
                                     const char *message, const char *suggestion) {
     /* Find end of current line */
     const char *line_end = p->pos;
     while (*line_end && *line_end != '\n') line_end++;
-    
+
     /* Calculate line length and column */
     int line_len = (int)(line_end - p->line_start);
     int col = (int)(p->pos - p->line_start) + 1;
-    
-    /* Print error message */
-        fprintf(stderr, "Error at line %d, column %d: [%s] %s\n",
-            p->line, col, category, message);
-    
-    /* Print the source line */
-    fprintf(stderr, "  ");
-    for (int i = 0; i < line_len; i++) {
-        fputc(p->line_start[i], stderr);
-    }
-    fprintf(stderr, "\n");
-    
-    /* Print column indicator */
-    fprintf(stderr, "  ");
-    for (int i = 1; i < col; i++) fputc(' ', stderr);
-    fprintf(stderr, "^\n");
 
-    if (suggestion && suggestion[0] != '\0') {
-        fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+    if (p->ctx && p->ctx->error_format_json) {
+        char esc_cat[256];
+        char esc_msg[2048];
+        char esc_sug[2048];
+        json_escape_string(category, esc_cat, sizeof(esc_cat));
+        json_escape_string(message, esc_msg, sizeof(esc_msg));
+        fprintf(stderr,
+                "{\"severity\":\"error\",\"line\":%d,\"column\":%d,\"category\":\"%s\",\"message\":\"%s\"",
+                p->line, col, esc_cat, esc_msg);
+        if (suggestion && suggestion[0] != '\0') {
+            json_escape_string(suggestion, esc_sug, sizeof(esc_sug));
+            fprintf(stderr, ",\"suggestion\":\"%s\"", esc_sug);
+        }
+        fprintf(stderr, "}\n");
+    } else {
+        fprintf(stderr, "Error at line %d, column %d: [%s] %s\n",
+                p->line, col, category, message);
+
+        /* Print the source line */
+        fprintf(stderr, "  ");
+        for (int i = 0; i < line_len; i++) {
+            fputc(p->line_start[i], stderr);
+        }
+        fprintf(stderr, "\n");
+
+        /* Print column indicator */
+        fprintf(stderr, "  ");
+        for (int i = 1; i < col; i++) fputc(' ', stderr);
+        fprintf(stderr, "^\n");
+
+        if (suggestion && suggestion[0] != '\0') {
+            fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+        }
     }
 }
 
@@ -437,9 +488,67 @@ static void parser_diag_ctx(const assembler_context_t *ctx, const char *category
         line = ctx->line_number;
     }
 
-    fprintf(stderr, "Error at line %d, column 1: [%s] %s\n", line, category, message);
-    if (suggestion && suggestion[0] != '\0') {
-        fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+    if (ctx && ctx->error_format_json) {
+        char esc_cat[256];
+        char esc_msg[2048];
+        char esc_sug[2048];
+        json_escape_string(category, esc_cat, sizeof(esc_cat));
+        json_escape_string(message, esc_msg, sizeof(esc_msg));
+        fprintf(stderr,
+                "{\"severity\":\"error\",\"line\":%d,\"column\":1,\"category\":\"%s\",\"message\":\"%s\"",
+                line, esc_cat, esc_msg);
+        if (suggestion && suggestion[0] != '\0') {
+            json_escape_string(suggestion, esc_sug, sizeof(esc_sug));
+            fprintf(stderr, ",\"suggestion\":\"%s\"", esc_sug);
+        }
+        fprintf(stderr, "}\n");
+    } else {
+        fprintf(stderr, "Error at line %d, column 1: [%s] %s\n", line, category, message);
+        if (suggestion && suggestion[0] != '\0') {
+            fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+        }
+    }
+}
+/* Emit a warning diagnostic; promoted to error if -Werror is set. */
+static void parser_warn_ctx(assembler_context_t *ctx, const char *category,
+                            const char *message, const char *suggestion) {
+    int line = 1;
+    const char *severity;
+    if (ctx && ctx->line_number > 0) {
+        line = ctx->line_number;
+    }
+    if (ctx && ctx->warnings_as_errors) {
+        severity = "error";
+        ctx->fatal_warning_occurred = true;
+    } else {
+        severity = "warning";
+    }
+    if (ctx && ctx->error_format_json) {
+        char esc_cat[256];
+        char esc_msg[2048];
+        char esc_sug[2048];
+        json_escape_string(category, esc_cat, sizeof(esc_cat));
+        json_escape_string(message, esc_msg, sizeof(esc_msg));
+        fprintf(stderr,
+                "{\"severity\":\"%s\",\"line\":%d,\"column\":1,\"category\":\"%s\",\"message\":\"%s\"",
+                severity, line, esc_cat, esc_msg);
+        if (suggestion && suggestion[0] != '\0') {
+            json_escape_string(suggestion, esc_sug, sizeof(esc_sug));
+            fprintf(stderr, ",\"suggestion\":\"%s\"", esc_sug);
+        }
+        fprintf(stderr, "}\n");
+    } else {
+        if (ctx && ctx->warnings_as_errors) {
+            fprintf(stderr, "Error at line %d, column 1: [%s] %s\n", line, category, message);
+        } else {
+            fprintf(stderr, "Warning at line %d, column 1: [%s] %s\n", line, category, message);
+        }
+        if (suggestion && suggestion[0] != '\0') {
+            fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+        }
+    }
+    if (ctx) {
+        ctx->warning_count++;
     }
 }
 
@@ -605,9 +714,10 @@ static token_t next_token(parser_state_t *p) {
         tok.type = TOK_STRING;
 
         /* Validate UTF-8 encoding */
-        if (validate_utf8(tok.text) < 0) {
-            fprintf(stderr, "Warning: Invalid UTF-8 sequence in string at line %d, column %d\n",
-                    tok.line, tok.column);
+        if (validate_utf8(tok.text) < 0 && p->ctx && p->ctx->warn_all) {
+            parser_warn_ctx(p->ctx, "Encoding",
+                            "Invalid UTF-8 sequence in string",
+                            "Ensure string literals use valid UTF-8 encoding");
         }
         
         return tok;
@@ -1650,7 +1760,9 @@ static int parse_times_directive(const char *line, int *repeat_count, char *inst
 }
 
 /* Helper to expand times directive even without macro context */
-static char *expand_times_only(const char *source) {
+char *
+parser_expand_times_only(const char *source)
+{
     size_t output_size = strlen(source) * 4 + 1;
     char *output = malloc(output_size);
     if (!output) return NULL;
@@ -1702,7 +1814,7 @@ static parsed_instruction_t *parse_source_common(assembler_context_t *ctx,
                                                  const char *source,
                                                  int *count) {
     /* First, always expand times directive */
-    char *times_expanded = expand_times_only(source);
+    char *times_expanded = parser_expand_times_only(source);
     if (!times_expanded) {
         return parse_source_internal(ctx, source, count);
     }
@@ -2661,6 +2773,49 @@ static int pp_substitute_defines(const char *line, pp_define_t *defines, int def
     return 0;
 }
 
+static bool has_prefix_dir(const char *path, const char *prefix)
+{
+    size_t n = strlen(prefix);
+    return strncmp(path, prefix, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+static bool is_system_include_path(const char *path)
+{
+    const char *test_prefix;
+    if (!path || path[0] != '/') {
+        return false;
+    }
+    if (has_prefix_dir(path, "/usr/include")) {
+        return true;
+    }
+    if (has_prefix_dir(path, "/usr/local/include")) {
+        return true;
+    }
+    if (has_prefix_dir(path, "/include")) {
+        return true;
+    }
+    test_prefix = getenv("ASM_TEST_SYSTEM_INCLUDE_PATH");
+    if (test_prefix && has_prefix_dir(path, test_prefix)) {
+        return true;
+    }
+    return false;
+}
+
+static void track_dependency(assembler_context_t *ctx, const char *path) {
+    int n;
+    if (!ctx || !path || !ctx->generate_deps) return;
+    if (ctx->deps_exclude_system && is_system_include_path(path)) return;
+    /* Check for duplicates */
+    for (int i = 0; i < ctx->dependency_count; i++) {
+        if (strcmp(ctx->dependencies[i], path) == 0) return;
+    }
+    if (ctx->dependency_count < MAX_DEPENDENCIES) {
+        n = snprintf(ctx->dependencies[ctx->dependency_count], MAX_FILEPATH_LENGTH, "%s", path);
+        if (n < 0 || n >= MAX_FILEPATH_LENGTH) return;
+        ctx->dependency_count++;
+    }
+}
+
 static char *expand_includes_recursive(assembler_context_t *ctx, const char *source,
                                        const char *base_dir, int depth) {
     const char *p;
@@ -2712,8 +2867,9 @@ static char *expand_includes_recursive(assembler_context_t *ctx, const char *sou
         if (include_parse == 1) {
             char resolved_path[MAX_FILEPATH_LENGTH];
             char child_base_dir[MAX_FILEPATH_LENGTH];
-            char *included_source;
+            char *included_source = NULL;
             char *expanded_child;
+            FILE *probe;
 
             if (include_name[0] == '/') {
                 copy_bounded(resolved_path, sizeof(resolved_path), include_name);
@@ -2760,9 +2916,44 @@ static char *expand_includes_recursive(assembler_context_t *ctx, const char *sou
                 ctx->include_ctx.tracker.count++;
             }
 
-            included_source = read_file_contents(resolved_path);
-            if (!included_source) {
-                if (ctx && ctx->include_ctx.tracker.count > 0) ctx->include_ctx.tracker.count--;
+            /* Silent existence probe before reading */
+            probe = fopen(resolved_path, "r");
+            if (probe) {
+                fclose(probe);
+                included_source = read_file_contents(resolved_path);
+            }
+
+            /* Fallback to -I search paths for relative includes */
+            if (!included_source && include_name[0] != '/' && ctx) {
+                for (int ip = 0; ip < ctx->include_path_count && !included_source; ip++) {
+                    if (snprintf(resolved_path, sizeof(resolved_path), "%s/%s",
+                                 ctx->include_paths[ip], include_name) < (int)sizeof(resolved_path)) {
+                        probe = fopen(resolved_path, "r");
+                        if (probe) {
+                            fclose(probe);
+                            included_source = read_file_contents(resolved_path);
+                            if (included_source && ctx->include_ctx.tracker.count < MAX_INCLUDE_DEPTH) {
+                                /* Update tracker with resolved path */
+                                snprintf(ctx->include_ctx.tracker.filenames[ctx->include_ctx.tracker.count - 1],
+                                         MAX_FILEPATH_LENGTH, "%s", resolved_path);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (included_source) {
+                track_dependency(ctx, resolved_path);
+            } else {
+                /* All candidates failed; emit single diagnostic */
+                char message[320];
+                snprintf(message, sizeof(message),
+                         "Cannot open include file '%.160s'", include_name);
+                parser_diag_ctx(ctx, "IO", message,
+                                "Verify the include path and file permissions");
+                if (ctx && ctx->include_ctx.tracker.count > 0) {
+                    ctx->include_ctx.tracker.count--;
+                }
                 free(output);
                 return NULL;
             }
@@ -2827,6 +3018,19 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
     ctx->macro_ctx.local_label_counter = 0;
     ctx->macro_ctx.macro_name[0] = '\0';
     memset(defines, 0, sizeof(defines));
+
+    /* Seed preprocessor with command-line -D defines */
+    for (int i = 0; i < ctx->cli_define_count; i++) {
+        if (pp_define_set(defines, &define_count,
+                          ctx->cli_defines[i],
+                          ctx->cli_define_values[i][0] ? ctx->cli_define_values[i] : "1") < 0) {
+            parser_diag_ctx(ctx, "CLI",
+                            "Failed to seed CLI define",
+                            "Check that the define name is valid and capacity is not exceeded.");
+            free(expanded_source);
+            return NULL;
+        }
+    }
 
     p = source_text;
     while (*p) {
@@ -3008,6 +3212,12 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
 
     define_count = 0;
     memset(defines, 0, sizeof(defines));
+    /* Re-seed CLI defines for the second pass where substitution happens */
+    for (int i = 0; i < ctx->cli_define_count; i++) {
+        pp_define_set(defines, &define_count,
+                      ctx->cli_defines[i],
+                      ctx->cli_define_values[i][0] ? ctx->cli_define_values[i] : "1");
+    }
     cond_depth = 0;
     current_active = true;
     p = source_text;

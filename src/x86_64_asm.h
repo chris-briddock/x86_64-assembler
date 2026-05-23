@@ -5,6 +5,118 @@
 
 #include "x86_64_asm/x86_64_asm.h"
 
+/* Full struct definition for internal use.  The public header exposes only
+ * an opaque typedef. */
+struct assembler_context_t {
+    uint64_t address;
+    int line;
+    struct {
+        uint64_t address;
+        int line;
+    } line_map_entry;
+
+    /* Output buffer */
+    uint8_t *output;
+    size_t output_size;
+    size_t output_capacity;
+
+    /* Sections */
+    uint8_t *text_section;
+    size_t text_size;
+    size_t text_capacity;
+
+    uint8_t *data_section;
+    size_t data_size;
+    size_t data_capacity;
+
+    /* Symbol table - array for iteration, hash table for lookup */
+    symbol_t symbols[MAX_SYMBOLS];
+    int symbol_count;
+    hash_entry_t *symbol_hash[HASH_TABLE_SIZE];
+
+    /* Fixup list for forward references */
+    struct {
+        char label[MAX_LABEL_LENGTH];
+        uint64_t location;
+        int instruction_type;
+        int operand_index;
+        int size;
+        bool is_rip_relative;
+        int section;
+    } fixups[MAX_SYMBOLS];
+    int fixup_count;
+
+    /* Current state */
+    uint64_t current_address;
+    int current_section;
+    int line_number;
+    struct {
+        uint64_t address;
+        int line;
+    } line_map[MAX_LINE_MAP];
+    int line_map_count;
+
+    /* Source */
+    const char *source;
+    const char *source_pos;
+
+    /* Macro support */
+    macro_t macros[MAX_MACROS];
+    int macro_count;
+    macro_expansion_context_t macro_ctx;
+    bool in_macro_definition;
+    macro_t *current_macro;
+
+    /* Include file support */
+    include_context_t include_ctx;
+    char current_filename[MAX_FILEPATH_LENGTH];
+    char last_error[MAX_ERROR_MESSAGE];
+
+    /* Parser profiling state */
+    bool parser_profile_enabled;
+    uint64_t parser_profile_parse_calls;
+    uint64_t parser_profile_parse_ns;
+    uint64_t parser_profile_parse_instruction_calls;
+    uint64_t parser_profile_parse_instruction_ns;
+    uint64_t parser_profile_next_token_calls;
+    uint64_t parser_profile_next_token_ns;
+    uint64_t parser_profile_realloc_events;
+    uint64_t parser_profile_peak_instruction_capacity;
+
+    /* Listing file support */
+    listing_entry_t *listing_entries;
+    int listing_count;
+    int listing_capacity;
+    int listing_active_index;
+    bool listing_active;
+    bool emit_listing;
+
+    /* Options */
+    bool generate_elf;
+    bool emit_debug_map;
+    uint64_t base_address;
+    bool enable_forward_short_branches;
+
+    /* Phase 1 CLI flags */
+    char include_paths[MAX_INCLUDE_PATHS][MAX_FILEPATH_LENGTH];
+    int include_path_count;
+    char cli_defines[MAX_CLI_DEFINES][MAX_LABEL_LENGTH];
+    char cli_define_values[MAX_CLI_DEFINES][MAX_LINE_LENGTH];
+    int cli_define_count;
+    bool preprocess_only;
+    bool warnings_as_errors;
+    bool warn_all;
+    bool warn_unused_labels;
+    bool error_format_json;
+    /* Dependency generation (-M / -MM) */
+    char dependencies[MAX_DEPENDENCIES][MAX_FILEPATH_LENGTH];
+    int dependency_count;
+    bool generate_deps;
+    bool deps_exclude_system;
+    int warning_count;
+    bool fatal_warning_occurred;
+};
+
 /* Internal output/encoding helpers (not part of the public API). */
 int emit_byte(assembler_context_t *ctx, uint8_t byte);
 int emit_bytes(assembler_context_t *ctx, const uint8_t *bytes, size_t count);
@@ -82,6 +194,7 @@ char *macro_expand_line(assembler_context_t *ctx, const char *line, const char *
 bool is_macro_name(assembler_context_t *ctx, const char *name);
 int get_macro_arg_count(assembler_context_t *ctx, const char *name);
 char *preprocess_macros(assembler_context_t *ctx, const char *source);
+char *parser_expand_times_only(const char *source);
 
 typedef struct {
 	uint64_t parse_calls;

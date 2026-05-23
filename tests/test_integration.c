@@ -100,6 +100,25 @@ static size_t decode_sleb128_at(const unsigned char *buf, size_t len, size_t pos
     return pos;
 }
 
+/* Drain a pipe fd to EOF into buffer, null-terminating the result. */
+static ssize_t
+test_read_all(int fd, char *buffer, size_t buffer_size)
+{
+    size_t total = 0;
+    while (total + 1 < buffer_size) {
+        ssize_t chunk = read(fd, buffer + total, buffer_size - total - 1);
+        if (chunk == 0) {
+            break;
+        }
+        if (chunk < 0) {
+            return -1;
+        }
+        total += (size_t)chunk;
+    }
+    buffer[total] = '\0';
+    return (ssize_t)total;
+}
+
 /* Assemble from an existing file path and run resulting executable. */
 static int assemble_file_and_run(const char *asm_file) {
     char bin_file[] = "/tmp/test_XXXXXX";
@@ -343,9 +362,11 @@ static char *capture_command_output(const char *cmd) {
 }
 
 static const symbol_t *find_symbol_by_name(assembler_context_t *ctx, const char *name) {
-    for (int i = 0; i < ctx->symbol_count; i++) {
-        if (strcmp(ctx->symbols[i].name, name) == 0) {
-            return &ctx->symbols[i];
+    int count = 0;
+    const symbol_t *symbols = asm_ctx_get_symbols(ctx, &count);
+    for (int i = 0; i < count; i++) {
+        if (strcmp(symbols[i].name, name) == 0) {
+            return &symbols[i];
         }
     }
     return NULL;
@@ -461,7 +482,7 @@ static int assemble_and_write_listing(const char *source,
         unlink(asm_file);
         return -1;
     }
-    ctx->emit_listing = true;
+    asm_ctx_set_emit_listing(ctx, true);
 
     if (asm_assemble_file(ctx, asm_file) < 0) {
         asm_free(ctx);
@@ -815,7 +836,7 @@ static int test_integration_empty(void) {
 
 /* Test: Invalid instruction should fail */
 static int test_integration_invalid(void) {
-    const char *source = 
+    const char *source =
         "section .text\n"
         "global _start\n"
         "_start:\n"
@@ -829,14 +850,17 @@ static int test_integration_invalid(void) {
     
     int result = asm_assemble(ctx, source);
     captured_err = test_capture_stderr_end();
-    asm_free(ctx);
-    
+
     /* Should fail with invalid instruction */
     ASSERT_EQ(-1, result);
     ASSERT_NOT_NULL(captured_err);
     ASSERT_STR_CONTAINS(captured_err, "Unknown instruction");
-    ASSERT_STR_CONTAINS(captured_err, "Parsing failed");
 
+    /* Library now stores error in ctx->last_error instead of stderr */
+    const char *last_err = asm_get_last_error(ctx);
+    ASSERT_STR_CONTAINS(last_err, "Parsing failed");
+
+    asm_free(ctx);
     free(captured_err);
     return 0;
 }
@@ -1712,7 +1736,7 @@ static int test_integration_dwarf_sections(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2007,7 +2031,7 @@ static int test_integration_dwarf_readelf_validation(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2101,7 +2125,7 @@ static int test_integration_dwarf_dwarfdump_validation(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2185,7 +2209,7 @@ static int test_integration_dwarf_overflow_failure(void) {
 
     ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
 
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, test_capture_stderr_begin());
@@ -2238,7 +2262,7 @@ static int test_integration_dwarf_line_table_known_lines(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2380,7 +2404,7 @@ static int test_integration_dwarf_symbol_table_crosscheck(void) {
 
     assembler_context_t *ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
     asm_free(ctx);
@@ -2506,7 +2530,7 @@ static int test_integration_dwarf_large_program_success(void) {
 
     ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
-    ctx->emit_debug_map = true;
+    asm_ctx_set_emit_debug_map(ctx, true);
 
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
     ASSERT_EQ(0, asm_write_elf64(ctx, bin_file));
@@ -2575,7 +2599,7 @@ static int test_integration_output_formats_compile(void) {
     ctx = asm_init();
     ASSERT_NOT_NULL(ctx);
     ASSERT_EQ(0, asm_assemble_file(ctx, asm_file));
-    ASSERT_TRUE(ctx->text_size > 0);
+    ASSERT_TRUE(asm_ctx_get_text_size(ctx) > 0);
 
     out_fd = mkstemp(out_elf);
     ASSERT_TRUE(out_fd >= 0);
@@ -2600,7 +2624,7 @@ static int test_integration_output_formats_compile(void) {
     close(out_fd);
     ASSERT_EQ(0, asm_write_binary(ctx, out_bin));
     ASSERT_EQ(0, stat(out_bin, &st));
-    ASSERT_EQ((long long)ctx->text_size, (long long)st.st_size);
+    ASSERT_EQ((long long)asm_ctx_get_text_size(ctx), (long long)st.st_size);
 
     out_fd = mkstemp(out_hex);
     ASSERT_TRUE(out_fd >= 0);
@@ -2816,15 +2840,19 @@ static int test_integration_listing_bytes_match_buffers(void) {
             continue;
         }
 
-        uint64_t offset = row.address - ctx->base_address;
+        uint64_t offset = row.address - asm_ctx_get_base_address(ctx);
+        size_t text_size = asm_ctx_get_text_size(ctx);
+        size_t data_size = asm_ctx_get_data_size(ctx);
+        const uint8_t *text_sec = asm_ctx_get_text_section(ctx);
+        const uint8_t *data_sec = asm_ctx_get_data_section(ctx);
         for (int i = 0; i < row.byte_count; i++) {
             uint8_t expected;
-            if (offset + (uint64_t)i < (uint64_t)ctx->text_size) {
-                expected = ctx->text_section[offset + (uint64_t)i];
+            if (offset + (uint64_t)i < (uint64_t)text_size) {
+                expected = text_sec[offset + (uint64_t)i];
             } else {
-                uint64_t data_off = (offset + (uint64_t)i) - (uint64_t)ctx->text_size;
-                ASSERT_TRUE(data_off < (uint64_t)ctx->data_size);
-                expected = ctx->data_section[data_off];
+                uint64_t data_off = (offset + (uint64_t)i) - (uint64_t)text_size;
+                ASSERT_TRUE(data_off < (uint64_t)data_size);
+                expected = data_sec[data_off];
             }
             ASSERT_EQ_HEX(expected, row.bytes[i]);
         }
@@ -3589,6 +3617,542 @@ static int test_integration_stress_fixtures_compile_nonempty(void) {
     return 0;
 }
 
+/* Test: CLI define should be substituted in source text */
+static int test_integration_cli_define_substitution(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    ASSERT_EQ(0, asm_ctx_add_cli_define(ctx, "MYVAL", "42"));
+
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $MYVAL\n"
+        "    syscall\n";
+
+    ASSERT_EQ(0, asm_assemble(ctx, source));
+    ASSERT_EQ(0, asm_write_elf64(ctx, "/tmp/test_cli_define_sub.bin"));
+    chmod("/tmp/test_cli_define_sub.bin", 0755);
+    pid_t pid = fork();
+    int exit_code = -1;
+    if (pid == 0) {
+        execl("/tmp/test_cli_define_sub.bin", "/tmp/test_cli_define_sub.bin", NULL);
+        _exit(127);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        }
+    }
+    unlink("/tmp/test_cli_define_sub.bin");
+    asm_free(ctx);
+
+    ASSERT_EQ(42, exit_code);
+    return 0;
+}
+
+/* Test: CLI define should be visible to %ifdef conditionals */
+static int test_integration_cli_define_conditional(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    ASSERT_EQ(0, asm_ctx_add_cli_define(ctx, "DEBUG", NULL));
+
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "%ifdef DEBUG\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $77\n"
+        "    syscall\n"
+        "%else\n"
+        "    mov rax, $60\n"
+        "    mov rdi, $1\n"
+        "    syscall\n"
+        "%endif\n";
+
+    ASSERT_EQ(0, asm_assemble(ctx, source));
+    ASSERT_EQ(0, asm_write_elf64(ctx, "/tmp/test_cli_define_if.bin"));
+    chmod("/tmp/test_cli_define_if.bin", 0755);
+    pid_t pid = fork();
+    int exit_code = -1;
+    if (pid == 0) {
+        execl("/tmp/test_cli_define_if.bin", "/tmp/test_cli_define_if.bin", NULL);
+        _exit(127);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        }
+    }
+    unlink("/tmp/test_cli_define_if.bin");
+    asm_free(ctx);
+
+    ASSERT_EQ(77, exit_code);
+    return 0;
+}
+
+/* Test: Include search path (-I) should resolve non-relative includes */
+static int test_integration_include_search_path(void) {
+    char dir_template[] = "/tmp/asm_ipath_XXXXXX";
+    char main_path[512];
+    char inc_path[512];
+    FILE *f;
+
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    ASSERT_TRUE(snprintf(inc_path, sizeof(inc_path), "%s/sub.inc", dir) < (int)sizeof(inc_path));
+    f = fopen(inc_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "    mov rax, $60\n"
+            "    mov rdi, $55\n"
+            "    syscall\n");
+    fclose(f);
+
+    ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
+    f = fopen(main_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            ".include \"sub.inc\"\n");
+    fclose(f);
+
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(0, asm_ctx_add_include_path(ctx, dir));
+
+    int result = asm_assemble_file(ctx, main_path);
+    if (result == 0) {
+        result = asm_write_elf64(ctx, "/tmp/test_ipath.bin");
+    }
+    int exit_code = -1;
+    if (result == 0) {
+        chmod("/tmp/test_ipath.bin", 0755);
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/tmp/test_ipath.bin", "/tmp/test_ipath.bin", NULL);
+            _exit(127);
+        } else if (pid > 0) {
+            int status;
+            waitpid(pid, &status, 0);
+            if (WIFEXITED(status)) {
+                exit_code = WEXITSTATUS(status);
+            }
+        }
+    }
+    unlink("/tmp/test_ipath.bin");
+    unlink(main_path);
+    unlink(inc_path);
+    rmdir(dir);
+    asm_free(ctx);
+
+    ASSERT_EQ(55, exit_code);
+    return 0;
+}
+
+/* Test: Preprocess-only mode should return expanded source */
+static int test_integration_preprocess_only(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    char path[] = "/tmp/asm_preproc_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    FILE *f = fdopen(fd, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "    mov rax, $1\n"
+            "%%define FOO 42\n"
+            "    mov rdi, $FOO\n");
+    fclose(f);
+
+    char *preprocessed = asm_preprocess_file(ctx, path);
+    unlink(path);
+    ASSERT_NOT_NULL(preprocessed);
+    ASSERT_STR_CONTAINS(preprocessed, "mov rdi, $42");
+    free(preprocessed);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: Dependency tracking should record included files */
+static int test_integration_dependency_tracking(void) {
+    char dir_template[] = "/tmp/asm_deps_XXXXXX";
+    char main_path[512];
+    char inc_path[512];
+    FILE *f;
+
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    ASSERT_TRUE(snprintf(inc_path, sizeof(inc_path), "%s/dep.inc", dir) < (int)sizeof(inc_path));
+    f = fopen(inc_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "    nop\n");
+    fclose(f);
+
+    ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
+    f = fopen(main_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            ".include \"dep.inc\"\n"
+            "    mov rax, $60\n"
+            "    xor rdi, rdi\n"
+            "    syscall\n");
+    fclose(f);
+
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    asm_ctx_set_generate_deps(ctx, true);
+
+    int result = asm_assemble_file(ctx, main_path);
+    ASSERT_EQ(0, result);
+    ASSERT_TRUE(asm_ctx_get_dependency_count(ctx) > 0);
+
+    int found = 0;
+    int dep_count = asm_ctx_get_dependency_count(ctx);
+    for (int i = 0; i < dep_count; i++) {
+        if (strstr(asm_ctx_get_dependency(ctx, i), "dep.inc") != NULL) {
+            found = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+
+    unlink(main_path);
+    unlink(inc_path);
+    rmdir(dir);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: -MM should exclude system includes but still track local ones */
+static int test_integration_dependency_exclude_system(void) {
+    char dir_template[] = "/tmp/asm_deps_mm_XXXXXX";
+    char main_path[512];
+    char inc_path[512];
+    FILE *f;
+
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    ASSERT_TRUE(snprintf(inc_path, sizeof(inc_path), "%s/local.inc", dir) < (int)sizeof(inc_path));
+    f = fopen(inc_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "    nop\n");
+    fclose(f);
+
+    ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
+    f = fopen(main_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            ".include \"local.inc\"\n"
+            "    mov rax, $60\n"
+            "    xor rdi, rdi\n"
+            "    syscall\n");
+    fclose(f);
+
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    asm_ctx_set_generate_deps(ctx, true);
+    asm_ctx_set_deps_exclude_system(ctx, true);
+
+    int result = asm_assemble_file(ctx, main_path);
+    ASSERT_EQ(0, result);
+    ASSERT_TRUE(asm_ctx_get_dependency_count(ctx) > 0);
+
+    int found = 0;
+    int dep_count = asm_ctx_get_dependency_count(ctx);
+    for (int i = 0; i < dep_count; i++) {
+        if (strstr(asm_ctx_get_dependency(ctx, i), "local.inc") != NULL) {
+            found = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+
+    unlink(main_path);
+    unlink(inc_path);
+    rmdir(dir);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: Warning for invalid UTF-8 when warn_all is enabled */
+static int test_integration_warning_utf8(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+    asm_ctx_set_warn_all(ctx, true);
+
+    /* Invalid UTF-8 continuation byte in string */
+    const char *source =
+        "section .data\n"
+        "    db \"\x80\"\n"          /* standalone continuation byte */
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    xor rdi, rdi\n"
+        "    syscall\n";
+
+    int result = asm_assemble(ctx, source);
+    ASSERT_EQ(0, result);
+    ASSERT_TRUE(asm_ctx_get_warning_count(ctx) > 0);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: CLI end-to-end via subprocess for -D, -I, -E, -M/-MM */
+static int test_integration_cli_end_to_end(void)
+{
+    char dir_template[] = "/tmp/asm_cli_e2e_XXXXXX";
+    char sys_dir_template[] = "/tmp/asm_cli_e2e_sys_XXXXXX";
+    char inc_dir[512];
+    char main_path[512];
+    char inc_path[512];
+    char sys_dir[512];
+    char sys_inc_path[512];
+    char out_path[] = "/tmp/asm_cli_e2e_out_XXXXXX";
+    FILE *f;
+    int fd;
+    pid_t pid;
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+    char stdout_buf[4096];
+    char stderr_buf[4096];
+    char stdout_buf_M[4096];
+    char stdout_buf_MM[4096];
+    int status;
+    int exit_code = -1;
+
+    char *dir = mkdtemp(dir_template);
+    ASSERT_NOT_NULL(dir);
+
+    /* Create system include directory and file (treated as system by -MM) */
+    char *sys_dir_ptr = mkdtemp(sys_dir_template);
+    ASSERT_NOT_NULL(sys_dir_ptr);
+    ASSERT_TRUE(snprintf(sys_dir, sizeof(sys_dir), "%s", sys_dir_ptr) < (int)sizeof(sys_dir));
+    ASSERT_TRUE(snprintf(sys_inc_path, sizeof(sys_inc_path), "%s/system.inc", sys_dir) < (int)sizeof(sys_inc_path));
+    f = fopen(sys_inc_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "    nop\n");
+    fclose(f);
+
+    /* Create include subdirectory and file */
+    ASSERT_TRUE(snprintf(inc_dir, sizeof(inc_dir), "%s/inc", dir) < (int)sizeof(inc_dir));
+    ASSERT_EQ(0, mkdir(inc_dir, 0755));
+
+    ASSERT_TRUE(snprintf(inc_path, sizeof(inc_path), "%s/helper.inc", inc_dir) < (int)sizeof(inc_path));
+    f = fopen(inc_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "    mov rax, $60\n");
+    fclose(f);
+
+    /* Create main source that references a define and includes via -I and absolute path */
+    ASSERT_TRUE(snprintf(main_path, sizeof(main_path), "%s/main.asm", dir) < (int)sizeof(main_path));
+    f = fopen(main_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            ".include \"helper.inc\"\n"
+            ".include \"%s\"\n"
+            "    mov rdi, $MYVAL\n"
+            "    syscall\n",
+            sys_inc_path);
+    fclose(f);
+
+    /* Create output path template */
+    fd = mkstemp(out_path);
+    ASSERT_TRUE(fd >= 0);
+    close(fd);
+    unlink(out_path); /* just need the unique name */
+
+    /* --- Subtest 1: -E preprocess-only with -D and -I --- */
+    ASSERT_EQ(0, pipe(stdout_pipe));
+    ASSERT_EQ(0, pipe(stderr_pipe));
+
+    pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execl("bin/x86_64-asm", "x86_64-asm", "-E", "-I", inc_dir,
+              "-DMYVAL=42", main_path, NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf, sizeof(stdout_buf)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
+
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    ASSERT_EQ(0, exit_code);
+    /* Preprocessed output should contain expanded define and inlined include */
+    ASSERT_STR_CONTAINS(stdout_buf, "mov rdi, $42");
+    ASSERT_STR_CONTAINS(stdout_buf, "mov rax, $60");
+
+    /* --- Subtest 2: -M dependency generation (includes system includes) --- */
+    ASSERT_EQ(0, pipe(stdout_pipe));
+    ASSERT_EQ(0, pipe(stderr_pipe));
+
+    pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        setenv("ASM_TEST_SYSTEM_INCLUDE_PATH", sys_dir, 1);
+        execl("bin/x86_64-asm", "x86_64-asm", "-M", "-o", out_path,
+              "-I", inc_dir, "-DMYVAL=42", main_path, NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf_M, sizeof(stdout_buf_M)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
+    close(stderr_pipe[0]);
+    close(stdout_pipe[0]);
+
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    ASSERT_EQ(0, exit_code);
+    ASSERT_STR_CONTAINS(stdout_buf_M, main_path);
+    ASSERT_STR_CONTAINS(stdout_buf_M, "helper.inc");
+    ASSERT_STR_CONTAINS(stdout_buf_M, "system.inc");
+
+    /* --- Subtest 3: -MM dependency generation (excludes system includes) --- */
+    ASSERT_EQ(0, pipe(stdout_pipe));
+    ASSERT_EQ(0, pipe(stderr_pipe));
+
+    pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        setenv("ASM_TEST_SYSTEM_INCLUDE_PATH", sys_dir, 1);
+        execl("bin/x86_64-asm", "x86_64-asm", "-MM", "-o", out_path,
+              "-I", inc_dir, "-DMYVAL=42", main_path, NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf_MM, sizeof(stdout_buf_MM)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
+    close(stderr_pipe[0]);
+    close(stdout_pipe[0]);
+
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    ASSERT_EQ(0, exit_code);
+    ASSERT_STR_CONTAINS(stdout_buf_MM, main_path);
+    ASSERT_STR_CONTAINS(stdout_buf_MM, "helper.inc");
+    ASSERT_TRUE(strstr(stdout_buf_MM, "system.inc") == NULL);
+
+    /* --- Subtest 4: Normal assembly with -I should produce runnable binary --- */
+    ASSERT_EQ(0, pipe(stdout_pipe));
+    ASSERT_EQ(0, pipe(stderr_pipe));
+
+    pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execl("bin/x86_64-asm", "x86_64-asm", "-I", inc_dir,
+              "-DMYVAL=42", "-o", out_path, main_path, NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf, sizeof(stdout_buf)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
+    close(stderr_pipe[0]);
+    close(stdout_pipe[0]);
+
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    ASSERT_EQ(0, exit_code);
+    ASSERT_EQ(0, access(out_path, F_OK));
+
+    /* Run the produced binary to verify it works */
+    chmod(out_path, 0755);
+    pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        execl(out_path, out_path, NULL);
+        _exit(127);
+    } else if (pid > 0) {
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        }
+    }
+    ASSERT_EQ(42, exit_code);
+
+    /* Cleanup */
+    unlink(out_path);
+    unlink(main_path);
+    unlink(inc_path);
+    unlink(sys_inc_path);
+    rmdir(inc_dir);
+    rmdir(dir);
+    rmdir(sys_dir);
+
+    return 0;
+}
+
 /* Test Suite: Integration Tests */
 TEST_SUITE(integration) {
     TEST(integration_exit);
@@ -3652,6 +4216,14 @@ TEST_SUITE(integration) {
     TEST(integration_disassembler_objdump_group2_group3_fixture);
     TEST(integration_disassembler_source_roundtrip_semantic);
     TEST(integration_stress_fixtures_compile_nonempty);
+    TEST(integration_cli_define_substitution);
+    TEST(integration_cli_define_conditional);
+    TEST(integration_include_search_path);
+    TEST(integration_preprocess_only);
+    TEST(integration_dependency_tracking);
+    TEST(integration_dependency_exclude_system);
+    TEST(integration_warning_utf8);
+    TEST(integration_cli_end_to_end);
 }
 
 /* Main entry point */

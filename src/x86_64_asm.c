@@ -1809,9 +1809,11 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
     /* Use context-aware parsing to enable macro support */
     parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
     if (!insts) {
-        fprintf(stderr,
-                "Error at line 1, column 1: [Parser] Parsing failed\n"
-                "Suggestion: Review the first parser diagnostic above for exact token context.\n");
+        if (ctx->last_error[0] == '\0') {
+            asm_set_last_errorf(ctx,
+                                "Error at line 1, column 1: [Parser] Parsing failed\n"
+                                "Suggestion: Review the first parser diagnostic above for exact token context.");
+        }
         return -1;
     }
 
@@ -2370,6 +2372,107 @@ int asm_assemble_file(assembler_context_t *ctx, const char *filename) {
     int result = asm_assemble(ctx, source);
     free(source);
     return result;
+}
+
+char *
+asm_preprocess_file(assembler_context_t *ctx, const char *filename)
+{
+    if (!ctx) {
+        return NULL;
+    }
+
+    if (!filename) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [I/O] Missing filename for preprocessing\n"
+                            "Suggestion: Provide a valid input file path.");
+        return NULL;
+    }
+
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [I/O] Cannot open file '%s'\n"
+                            "Suggestion: Verify file path and read permissions.",
+                            filename);
+        return NULL;
+    }
+
+    if (fseek(f, 0, SEEK_END) < 0) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [I/O] Cannot seek in file '%s'\n"
+                            "Suggestion: Verify file is a regular file.",
+                            filename);
+        fclose(f);
+        return NULL;
+    }
+
+    long size = ftell(f);
+    if (size < 0) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [I/O] Cannot determine size of file '%s'\n"
+                            "Suggestion: Verify file is a regular file.",
+                            filename);
+        fclose(f);
+        return NULL;
+    }
+
+    if (fseek(f, 0, SEEK_SET) < 0) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [I/O] Cannot seek in file '%s'\n"
+                            "Suggestion: Verify file is a regular file.",
+                            filename);
+        fclose(f);
+        return NULL;
+    }
+
+    size_t size_u = (size_t)size;
+
+    char *source = malloc(size_u + 1u);
+    if (!source) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [Memory] Failed to allocate memory for file '%s'\n"
+                            "Suggestion: Reduce file size or free system memory.",
+                            filename);
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(source, 1u, size_u, f) != size_u) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [I/O] Failed to read file '%s'\n"
+                            "Suggestion: Verify file is readable and not truncated.",
+                            filename);
+        free(source);
+        fclose(f);
+        return NULL;
+    }
+    source[size_u] = '\0';
+    fclose(f);
+
+    strncpy(ctx->current_filename, filename, MAX_FILEPATH_LENGTH - 1);
+    ctx->current_filename[MAX_FILEPATH_LENGTH - 1] = '\0';
+
+    /* Expand times directive first (same as parse_source_common) */
+    char *times_expanded = parser_expand_times_only(source);
+    if (!times_expanded) {
+        times_expanded = source;
+    }
+
+    /* Preprocess macros and includes */
+    char *preprocessed = preprocess_macros(ctx, times_expanded);
+    if (!preprocessed) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [Preprocessor] Macro preprocessing failed for file '%s'\n"
+                            "Suggestion: Check for syntax errors or recursive macro definitions.",
+                            filename);
+    }
+
+    if (times_expanded != source) {
+        free(times_expanded);
+    }
+    free(source);
+
+    return preprocessed;
 }
 
 /* ============================================================================
@@ -3310,4 +3413,224 @@ void asm_dump_output(assembler_context_t *ctx) {
         }
         printf("\n");
     }
+}
+
+/* ============================================================================
+ * ACCESSOR / SETTER FUNCTIONS (for opaque assembler_context_t)
+ * ============================================================================ */
+
+int
+asm_ctx_add_include_path(assembler_context_t *ctx, const char *path)
+{
+    if (!ctx || !path) {
+        return -1;
+    }
+    if (ctx->include_path_count >= MAX_INCLUDE_PATHS) {
+        return -1;
+    }
+    size_t n = strlen(path);
+    if (n >= MAX_FILEPATH_LENGTH) {
+        return -1;
+    }
+    memcpy(ctx->include_paths[ctx->include_path_count], path, n);
+    ctx->include_paths[ctx->include_path_count][n] = '\0';
+    ctx->include_path_count++;
+    return 0;
+}
+
+int
+asm_ctx_add_cli_define(assembler_context_t *ctx, const char *name,
+                       const char *value)
+{
+    if (!ctx || !name) {
+        return -1;
+    }
+    if (ctx->cli_define_count >= MAX_CLI_DEFINES) {
+        return -1;
+    }
+    size_t name_len = strlen(name);
+    if (name_len >= MAX_LABEL_LENGTH) {
+        return -1;
+    }
+    memcpy(ctx->cli_defines[ctx->cli_define_count], name, name_len);
+    ctx->cli_defines[ctx->cli_define_count][name_len] = '\0';
+
+    if (value) {
+        size_t val_len = strlen(value);
+        if (val_len >= MAX_LINE_LENGTH) {
+            return -1;
+        }
+        memcpy(ctx->cli_define_values[ctx->cli_define_count], value, val_len);
+        ctx->cli_define_values[ctx->cli_define_count][val_len] = '\0';
+    } else {
+        ctx->cli_define_values[ctx->cli_define_count][0] = '\0';
+    }
+    ctx->cli_define_count++;
+    return 0;
+}
+
+void
+asm_ctx_set_preprocess_only(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->preprocess_only = val;
+    }
+}
+
+void
+asm_ctx_set_warnings_as_errors(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->warnings_as_errors = val;
+    }
+}
+
+void
+asm_ctx_set_warn_all(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->warn_all = val;
+    }
+}
+
+void
+asm_ctx_set_warn_unused_labels(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->warn_unused_labels = val;
+    }
+}
+
+void
+asm_ctx_set_error_format_json(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->error_format_json = val;
+    }
+}
+
+void
+asm_ctx_set_generate_deps(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->generate_deps = val;
+    }
+}
+
+void
+asm_ctx_set_deps_exclude_system(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->deps_exclude_system = val;
+    }
+}
+
+void
+asm_ctx_set_emit_debug_map(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->emit_debug_map = val;
+    }
+}
+
+void
+asm_ctx_set_emit_listing(assembler_context_t *ctx, bool val)
+{
+    if (ctx) {
+        ctx->emit_listing = val;
+    }
+}
+
+int
+asm_ctx_get_dependency_count(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->dependency_count : 0;
+}
+
+const char *
+asm_ctx_get_dependency(const assembler_context_t *ctx, int index)
+{
+    if (!ctx || index < 0 || index >= ctx->dependency_count) {
+        return NULL;
+    }
+    return ctx->dependencies[index];
+}
+
+size_t
+asm_ctx_get_text_size(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->text_size : 0;
+}
+
+size_t
+asm_ctx_get_data_size(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->data_size : 0;
+}
+
+const uint8_t *
+asm_ctx_get_text_section(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->text_section : NULL;
+}
+
+const uint8_t *
+asm_ctx_get_data_section(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->data_section : NULL;
+}
+
+uint64_t
+asm_ctx_get_base_address(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->base_address : 0;
+}
+
+const symbol_t *
+asm_ctx_get_symbols(const assembler_context_t *ctx, int *out_count)
+{
+    if (!ctx || !out_count) {
+        if (out_count) {
+            *out_count = 0;
+        }
+        return NULL;
+    }
+    *out_count = ctx->symbol_count;
+    return ctx->symbols;
+}
+
+bool
+asm_ctx_get_error_format_json(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->error_format_json : false;
+}
+
+bool
+asm_ctx_get_fatal_warning_occurred(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->fatal_warning_occurred : false;
+}
+
+int
+asm_ctx_get_warning_count(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->warning_count : 0;
+}
+
+bool
+asm_ctx_get_preprocess_only(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->preprocess_only : false;
+}
+
+bool
+asm_ctx_get_emit_debug_map(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->emit_debug_map : false;
+}
+
+bool
+asm_ctx_get_emit_listing(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->emit_listing : false;
 }

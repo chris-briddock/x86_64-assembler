@@ -37,6 +37,9 @@ extern "C" {
 #define MAX_INCLUDE_FILES   64   /* Maximum total files in include chain */
 #define MAX_FILEPATH_LENGTH 512  /* Maximum file path length */
 #define MAX_ERROR_MESSAGE   512  /* Maximum stored error message length */
+#define MAX_INCLUDE_PATHS   32   /* Maximum -I search paths */
+#define MAX_CLI_DEFINES     64   /* Maximum -D command-line defines */
+#define MAX_DEPENDENCIES    256  /* Maximum tracked include dependencies */
 
 /* ELF64 Constants */
 #define ELFMAG0             0x7f
@@ -366,92 +369,41 @@ typedef struct {
     char source_line[MAX_LINE_LENGTH];        /* Original source line */
 } listing_entry_t;
 
-/* Assembler context */
-typedef struct {
-    uint64_t address;
-    int line;
-} line_map_entry_t;
+/* Assembler context - opaque type; use accessor functions. */
+typedef struct assembler_context_t assembler_context_t;
 
-typedef struct {
-    /* Output buffer */
-    uint8_t *output;
-    size_t output_size;
-    size_t output_capacity;
+/* ============================================================================
+ * ACCESSOR / SETTER FUNCTIONS (for opaque assembler_context_t)
+ * ============================================================================ */
 
-    /* Sections */
-    uint8_t *text_section;
-    size_t text_size;
-    size_t text_capacity;
+int asm_ctx_add_include_path(assembler_context_t *ctx, const char *path);
+int asm_ctx_add_cli_define(assembler_context_t *ctx, const char *name,
+                           const char *value);
+void asm_ctx_set_preprocess_only(assembler_context_t *ctx, bool val);
+void asm_ctx_set_warnings_as_errors(assembler_context_t *ctx, bool val);
+void asm_ctx_set_warn_all(assembler_context_t *ctx, bool val);
+void asm_ctx_set_warn_unused_labels(assembler_context_t *ctx, bool val);
+void asm_ctx_set_error_format_json(assembler_context_t *ctx, bool val);
+void asm_ctx_set_generate_deps(assembler_context_t *ctx, bool val);
+void asm_ctx_set_deps_exclude_system(assembler_context_t *ctx, bool val);
+void asm_ctx_set_emit_debug_map(assembler_context_t *ctx, bool val);
+void asm_ctx_set_emit_listing(assembler_context_t *ctx, bool val);
 
-    uint8_t *data_section;
-    size_t data_size;
-    size_t data_capacity;
-
-    /* Symbol table - array for iteration, hash table for lookup */
-    symbol_t symbols[MAX_SYMBOLS];
-    int symbol_count;
-    hash_entry_t *symbol_hash[HASH_TABLE_SIZE];  /* Hash table for O(1) lookup */
-
-    /* Fixup list for forward references */
-    struct {
-        char label[MAX_LABEL_LENGTH];
-        uint64_t location;
-        int instruction_type;
-        int operand_index;
-        int size;  /* 1, 2, 4, or 8 bytes */
-        bool is_rip_relative;  /* true for RIP-relative addressing */
-        int section;  /* Section where fixup applies (0=text, 1=data) */
-    } fixups[MAX_SYMBOLS];
-    int fixup_count;
-
-    /* Current state */
-    uint64_t current_address;
-    int current_section;  /* 0 = text, 1 = data */
-    int line_number;
-    line_map_entry_t line_map[MAX_LINE_MAP];
-    int line_map_count;
-
-    /* Source */
-    const char *source;
-    const char *source_pos;
-
-    /* Macro support */
-    macro_t macros[MAX_MACROS];               /* Macro definitions table */
-    int macro_count;                          /* Number of defined macros */
-    macro_expansion_context_t macro_ctx;      /* Current expansion context */
-    bool in_macro_definition;                 /* Currently parsing macro body */
-    macro_t *current_macro;                   /* Macro being defined */
-
-    /* Include file support */
-    include_context_t include_ctx;              /* File include stack */
-    char current_filename[MAX_FILEPATH_LENGTH]; /* Current file for error reporting */
-    char last_error[MAX_ERROR_MESSAGE];         /* Last library error message */
-
-    /* Parser profiling state (context-local, no global mutable state) */
-    bool parser_profile_enabled;
-    uint64_t parser_profile_parse_calls;
-    uint64_t parser_profile_parse_ns;
-    uint64_t parser_profile_parse_instruction_calls;
-    uint64_t parser_profile_parse_instruction_ns;
-    uint64_t parser_profile_next_token_calls;
-    uint64_t parser_profile_next_token_ns;
-    uint64_t parser_profile_realloc_events;
-    uint64_t parser_profile_peak_instruction_capacity;
-
-    /* Listing file support */
-    listing_entry_t *listing_entries;
-    int listing_count;
-    int listing_capacity;
-    int listing_active_index;
-    bool listing_active;
-    bool emit_listing;
-
-    /* Options */
-    bool generate_elf;
-    bool emit_debug_map;
-    uint64_t base_address;
-    bool enable_forward_short_branches;
-} assembler_context_t;
+/* Read-only accessors for test / driver inspection */
+int asm_ctx_get_dependency_count(const assembler_context_t *ctx);
+const char *asm_ctx_get_dependency(const assembler_context_t *ctx, int index);
+size_t asm_ctx_get_text_size(const assembler_context_t *ctx);
+size_t asm_ctx_get_data_size(const assembler_context_t *ctx);
+const uint8_t *asm_ctx_get_text_section(const assembler_context_t *ctx);
+const uint8_t *asm_ctx_get_data_section(const assembler_context_t *ctx);
+uint64_t asm_ctx_get_base_address(const assembler_context_t *ctx);
+const symbol_t *asm_ctx_get_symbols(const assembler_context_t *ctx, int *out_count);
+bool asm_ctx_get_error_format_json(const assembler_context_t *ctx);
+bool asm_ctx_get_fatal_warning_occurred(const assembler_context_t *ctx);
+int asm_ctx_get_warning_count(const assembler_context_t *ctx);
+bool asm_ctx_get_preprocess_only(const assembler_context_t *ctx);
+bool asm_ctx_get_emit_debug_map(const assembler_context_t *ctx);
+bool asm_ctx_get_emit_listing(const assembler_context_t *ctx);
 
 /* ============================================================================
  * FUNCTION DECLARATIONS
@@ -561,6 +513,18 @@ int asm_assemble(assembler_context_t *ctx, const char *source);
  * @return 0 on success, negative value on failure.
  */
 int asm_assemble_file(assembler_context_t *ctx, const char *filename);
+
+/**
+ * @brief Preprocess source from a file path and return expanded text.
+ *
+ * Performs include expansion and macro preprocessing only.  The caller
+ * must free the returned string with free().
+ *
+ * @param ctx Assembler context.
+ * @param filename Input assembly file path.
+ * @return Newly allocated preprocessed source string, or NULL on failure.
+ */
+char *asm_preprocess_file(assembler_context_t *ctx, const char *filename);
 
 /**
  * @brief Emit ELF64 output.
