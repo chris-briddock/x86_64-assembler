@@ -2,6 +2,18 @@
 
 This document lists possible enhancements for the x86_64 assembler, organized by category and priority.
 
+## Recently Completed
+
+The following features have been implemented and are available in the current build:
+
+- **36. `-E` Preprocessor-Only Mode** — `asm_preprocess_file()` exposes expanded source; `-E` CLI flag writes to stdout or `-o`.
+- **37. `-M` / `-MM` Dependency Generation** — `asm_ctx_set_generate_deps()` tracks includes; `-M` / `-MM` emit Makefile rules.
+- **38. Include Search Paths (`-I`)** — `asm_ctx_add_include_path()` adds search directories; `-I<dir>` accepted on the CLI.
+- **39. Define Symbols from Command Line (`-D`)** — `asm_ctx_add_cli_define()` seeds `%define` symbols; `-D<sym>[=val]` accepted on the CLI.
+- **40. Warning Levels (`-W`, `-Wall`, `-Werror`)** — Warning system with fatal-warning support (`-Werror`) is active.
+- **41. Listing File** — Basic listing file generation (`-l`) with address, bytes, and source line is implemented.
+- **42. JSON Error Output** — `emit_cli_error()` produces machine-readable JSON when `--error-format=json` is used.
+
 ## Instruction Set & Encoding
 
 ### 1. AVX / AVX-512 Support
@@ -252,7 +264,7 @@ Automatically merge adjacent `.data` and `.rodata` sections with identical flags
 
 ## Tooling & UX
 
-### 36. `-E` Preprocessor-Only Mode
+### 36. `-E` Preprocessor-Only Mode ✅
 
 Emit expanded source without assembling:
 
@@ -260,7 +272,7 @@ Emit expanded source without assembling:
 ./bin/x86_64-asm -E input.asm -o output.i
 ```
 
-### 37. `-M` / `-MM` Dependency Generation
+### 37. `-M` / `-MM` Dependency Generation ✅
 
 Generate Makefile dependencies for `.include` directives:
 
@@ -268,32 +280,32 @@ Generate Makefile dependencies for `.include` directives:
 ./bin/x86_64-asm -M input.asm > input.d
 ```
 
-### 38. Include Search Paths (`-I`)
+### 38. Include Search Paths (`-I`) ✅
 
 ```bash
 ./bin/x86_64-asm -I./inc -I/usr/share/asm input.asm -o out
 ```
 
-### 39. Define Symbols from Command Line (`-D`)
+### 39. Define Symbols from Command Line (`-D`) ✅
 
 ```bash
 ./bin/x86_64-asm -DDEBUG=1 -DVERSION=3 input.asm -o out
 ```
 
-### 40. Warning Levels (`-W`, `-Wall`, `-Werror`)
+### 40. Warning Levels (`-W`, `-Wall`, `-Werror`) ✅
 
 - Unused labels
 - Unreachable code
 - Oversized immediates that truncate silently
 - Signed/unsigned mismatch in comparisons
 
-### 41. Listing File Enhancements
+### 41. Listing File Enhancements ✅
 
 - Cross-reference table (where each symbol is defined / used)
 - Macro expansion trace
 - Cycle-timing annotations (if target CPU specified)
 
-### 42. JSON / XML Error Output
+### 42. JSON / XML Error Output ✅
 
 Machine-readable diagnostics for IDE integration:
 
@@ -383,9 +395,9 @@ Single-page PDF or Markdown table of all supported instructions with encoding no
 
 ## Suggested Roadmap
 
-| Phase | Focus |
-|-------|-------|
-| Phase 1 | `-I`, `-D`, `-M`, `-E`, warning levels, JSON errors |
+| Phase | Focus | Status |
+|-------|-------|--------|
+| Phase 1 | `-I`, `-D`, `-M`, `-E`, warning levels, JSON errors | ✅ Complete |
 | Phase 2 | Local labels, `%rep`, multi-line macros, `equ` constant folding |
 | Phase 3 | ELF64 `.o` relocatable output, `.stab` / DWARF 5 completion |
 | Phase 4 | AVX, BMI, AES-NI, LOCK, REP prefixes |

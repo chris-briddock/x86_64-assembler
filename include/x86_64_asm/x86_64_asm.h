@@ -400,6 +400,7 @@ uint64_t asm_ctx_get_base_address(const assembler_context_t *ctx);
 const symbol_t *asm_ctx_get_symbols(const assembler_context_t *ctx, int *out_count);
 bool asm_ctx_get_error_format_json(const assembler_context_t *ctx);
 bool asm_ctx_get_fatal_warning_occurred(const assembler_context_t *ctx);
+int asm_ctx_get_warning_count(const assembler_context_t *ctx);
 bool asm_ctx_get_preprocess_only(const assembler_context_t *ctx);
 bool asm_ctx_get_emit_debug_map(const assembler_context_t *ctx);
 bool asm_ctx_get_emit_listing(const assembler_context_t *ctx);

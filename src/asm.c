@@ -178,7 +178,9 @@ int main(int argc, char **argv)
         emit_cli_error(error_format_json, "CLI",
                        "No input file specified",
                        "Provide an input .asm file path.");
-        print_usage(argv[0]);
+        if (!error_format_json) {
+            print_usage(argv[0]);
+        }
         return 1;
     }
 
@@ -204,13 +206,11 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
             if (asm_ctx_add_include_path(ctx, argv[++i]) < 0) {
-                fprintf(stderr, "Warning: too many -I paths (max %d)\n",
-                        MAX_INCLUDE_PATHS);
+                fprintf(stderr, "Warning: failed to add -I path (too many or too long)\n");
             }
         } else if (strncmp(argv[i], "-I", 2) == 0 && argv[i][2] != '\0') {
             if (asm_ctx_add_include_path(ctx, argv[i] + 2) < 0) {
-                fprintf(stderr, "Warning: too many -I paths (max %d)\n",
-                        MAX_INCLUDE_PATHS);
+                fprintf(stderr, "Warning: failed to add -I path (too many or too long)\n");
             }
         } else if (strcmp(argv[i], "-D") == 0 && i + 1 < argc) {
             char d_name[MAX_LABEL_LENGTH];
@@ -224,14 +224,13 @@ int main(int argc, char **argv)
                 return 1;
             }
             if (asm_ctx_add_cli_define(ctx, d_name, d_value) < 0) {
-                fprintf(stderr, "Warning: too many -D defines (max %d)\n",
-                        MAX_CLI_DEFINES);
+                fprintf(stderr, "Warning: failed to add -D define (too many or too long)\n");
             }
         } else if (strncmp(argv[i], "-D", 2) == 0 && argv[i][2] != '\0') {
             char d_name[MAX_LABEL_LENGTH];
             char d_value[MAX_LINE_LENGTH];
             if (parse_cli_define(argv[i] + 2, d_name, d_value,
-                                 sizeof(d_name), sizeof(d_value)) < 0) {
+                                  sizeof(d_name), sizeof(d_value)) < 0) {
                 emit_cli_error(error_format_json, "CLI",
                                "Invalid -D define: expected NAME[=VALUE]",
                                "Use -D NAME or -D NAME=VALUE where NAME is a valid identifier.");
@@ -239,8 +238,7 @@ int main(int argc, char **argv)
                 return 1;
             }
             if (asm_ctx_add_cli_define(ctx, d_name, d_value) < 0) {
-                fprintf(stderr, "Warning: too many -D defines (max %d)\n",
-                        MAX_CLI_DEFINES);
+                fprintf(stderr, "Warning: failed to add -D define (too many or too long)\n");
             }
         }
     }
@@ -265,7 +263,9 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    printf("Assembling: %s\n", input_file);
+    if (!gen_deps && !gen_deps_local) {
+        printf("Assembling: %s\n", input_file);
+    }
 
     /* Assemble */
     if (asm_assemble_file(ctx, input_file) < 0) {
@@ -302,8 +302,10 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    printf("Assembly successful: %zu bytes generated\n",
-           asm_ctx_get_text_size(ctx));
+    if (!gen_deps && !gen_deps_local) {
+        printf("Assembly successful: %zu bytes generated\n",
+               asm_ctx_get_text_size(ctx));
+    }
 
     /* Dump if requested */
     if (dump) {

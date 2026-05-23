@@ -387,6 +387,42 @@ static void parser_init(parser_state_t *p, assembler_context_t *ctx, const char 
     p->peek.type = TOK_NONE;
 }
 
+/* Escape a string for safe inclusion in JSON string values.
+ * Writes into out (null-terminated) and returns the number of bytes written.
+ */
+static size_t json_escape_string(const char *in, char *out, size_t out_size)
+{
+    size_t j = 0;
+    for (size_t i = 0; in[i] != '\0' && j + 1 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\') {
+            if (j + 2 >= out_size) {
+                break;
+            }
+            out[j++] = '\\';
+            out[j++] = (char)c;
+        } else if (c < 0x20) {
+            if (j + 6 >= out_size) {
+                break;
+            }
+            out[j++] = '\\';
+            out[j++] = 'u';
+            out[j++] = '0';
+            out[j++] = '0';
+            out[j++] = "0123456789abcdef"[c >> 4];
+            out[j++] = "0123456789abcdef"[c & 0x0F];
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    if (j < out_size) {
+        out[j] = '\0';
+    } else if (out_size > 0) {
+        out[out_size - 1] = '\0';
+    }
+    return j;
+}
+
 /* Print diagnostic error with source context and remediation hint. */
 static void parser_error_context_ex(const parser_state_t *p, const char *category,
                                     const char *message, const char *suggestion) {
@@ -399,11 +435,17 @@ static void parser_error_context_ex(const parser_state_t *p, const char *categor
     int col = (int)(p->pos - p->line_start) + 1;
 
     if (p->ctx && p->ctx->error_format_json) {
+        char esc_cat[256];
+        char esc_msg[2048];
+        char esc_sug[2048];
+        json_escape_string(category, esc_cat, sizeof(esc_cat));
+        json_escape_string(message, esc_msg, sizeof(esc_msg));
         fprintf(stderr,
                 "{\"severity\":\"error\",\"line\":%d,\"column\":%d,\"category\":\"%s\",\"message\":\"%s\"",
-                p->line, col, category, message);
+                p->line, col, esc_cat, esc_msg);
         if (suggestion && suggestion[0] != '\0') {
-            fprintf(stderr, ",\"suggestion\":\"%s\"", suggestion);
+            json_escape_string(suggestion, esc_sug, sizeof(esc_sug));
+            fprintf(stderr, ",\"suggestion\":\"%s\"", esc_sug);
         }
         fprintf(stderr, "}\n");
     } else {
@@ -447,11 +489,17 @@ static void parser_diag_ctx(const assembler_context_t *ctx, const char *category
     }
 
     if (ctx && ctx->error_format_json) {
+        char esc_cat[256];
+        char esc_msg[2048];
+        char esc_sug[2048];
+        json_escape_string(category, esc_cat, sizeof(esc_cat));
+        json_escape_string(message, esc_msg, sizeof(esc_msg));
         fprintf(stderr,
                 "{\"severity\":\"error\",\"line\":%d,\"column\":1,\"category\":\"%s\",\"message\":\"%s\"",
-                line, category, message);
+                line, esc_cat, esc_msg);
         if (suggestion && suggestion[0] != '\0') {
-            fprintf(stderr, ",\"suggestion\":\"%s\"", suggestion);
+            json_escape_string(suggestion, esc_sug, sizeof(esc_sug));
+            fprintf(stderr, ",\"suggestion\":\"%s\"", esc_sug);
         }
         fprintf(stderr, "}\n");
     } else {
@@ -476,11 +524,17 @@ static void parser_warn_ctx(assembler_context_t *ctx, const char *category,
         severity = "warning";
     }
     if (ctx && ctx->error_format_json) {
+        char esc_cat[256];
+        char esc_msg[2048];
+        char esc_sug[2048];
+        json_escape_string(category, esc_cat, sizeof(esc_cat));
+        json_escape_string(message, esc_msg, sizeof(esc_msg));
         fprintf(stderr,
                 "{\"severity\":\"%s\",\"line\":%d,\"column\":1,\"category\":\"%s\",\"message\":\"%s\"",
-                severity, line, category, message);
+                severity, line, esc_cat, esc_msg);
         if (suggestion && suggestion[0] != '\0') {
-            fprintf(stderr, ",\"suggestion\":\"%s\"", suggestion);
+            json_escape_string(suggestion, esc_sug, sizeof(esc_sug));
+            fprintf(stderr, ",\"suggestion\":\"%s\"", esc_sug);
         }
         fprintf(stderr, "}\n");
     } else {
@@ -1705,6 +1759,9 @@ static int parse_times_directive(const char *line, int *repeat_count, char *inst
     return instruction_part[0] != '\0' ? 0 : -1;  /* Success if we have an instruction */
 }
 
+/* Forward declaration used by x86_64_asm.c via extern */
+char *expand_times_only(const char *source);
+
 /* Helper to expand times directive even without macro context */
 char *expand_times_only(const char *source) {
     size_t output_size = strlen(source) * 4 + 1;
@@ -2717,18 +2774,24 @@ static int pp_substitute_defines(const char *line, pp_define_t *defines, int def
     return 0;
 }
 
+static bool has_prefix_dir(const char *path, const char *prefix)
+{
+    size_t n = strlen(prefix);
+    return strncmp(path, prefix, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
 static bool is_system_include_path(const char *path)
 {
     if (!path || path[0] != '/') {
         return false;
     }
-    if (strncmp(path, "/usr/include", strlen("/usr/include")) == 0) {
+    if (has_prefix_dir(path, "/usr/include")) {
         return true;
     }
-    if (strncmp(path, "/usr/local/include", strlen("/usr/local/include")) == 0) {
+    if (has_prefix_dir(path, "/usr/local/include")) {
         return true;
     }
-    if (strncmp(path, "/include", strlen("/include")) == 0) {
+    if (has_prefix_dir(path, "/include")) {
         return true;
     }
     return false;
@@ -2800,8 +2863,9 @@ static char *expand_includes_recursive(assembler_context_t *ctx, const char *sou
         if (include_parse == 1) {
             char resolved_path[MAX_FILEPATH_LENGTH];
             char child_base_dir[MAX_FILEPATH_LENGTH];
-            char *included_source;
+            char *included_source = NULL;
             char *expanded_child;
+            FILE *probe;
 
             if (include_name[0] == '/') {
                 copy_bounded(resolved_path, sizeof(resolved_path), include_name);
@@ -2848,24 +2912,44 @@ static char *expand_includes_recursive(assembler_context_t *ctx, const char *sou
                 ctx->include_ctx.tracker.count++;
             }
 
-            included_source = read_file_contents(resolved_path);
+            /* Silent existence probe before reading */
+            probe = fopen(resolved_path, "r");
+            if (probe) {
+                fclose(probe);
+                included_source = read_file_contents(resolved_path);
+            }
+
             /* Fallback to -I search paths for relative includes */
             if (!included_source && include_name[0] != '/' && ctx) {
                 for (int ip = 0; ip < ctx->include_path_count && !included_source; ip++) {
                     if (snprintf(resolved_path, sizeof(resolved_path), "%s/%s",
                                  ctx->include_paths[ip], include_name) < (int)sizeof(resolved_path)) {
-                        included_source = read_file_contents(resolved_path);
-                        if (included_source && ctx->include_ctx.tracker.count < MAX_INCLUDE_DEPTH) {
-                            /* Update tracker with resolved path */
-                            snprintf(ctx->include_ctx.tracker.filenames[ctx->include_ctx.tracker.count - 1],
-                                     MAX_FILEPATH_LENGTH, "%s", resolved_path);
+                        probe = fopen(resolved_path, "r");
+                        if (probe) {
+                            fclose(probe);
+                            included_source = read_file_contents(resolved_path);
+                            if (included_source && ctx->include_ctx.tracker.count < MAX_INCLUDE_DEPTH) {
+                                /* Update tracker with resolved path */
+                                snprintf(ctx->include_ctx.tracker.filenames[ctx->include_ctx.tracker.count - 1],
+                                         MAX_FILEPATH_LENGTH, "%s", resolved_path);
+                            }
                         }
                     }
                 }
             }
-            track_dependency(ctx, resolved_path);
-            if (!included_source) {
-                if (ctx && ctx->include_ctx.tracker.count > 0) ctx->include_ctx.tracker.count--;
+
+            if (included_source) {
+                track_dependency(ctx, resolved_path);
+            } else {
+                /* All candidates failed; emit single diagnostic */
+                char message[320];
+                snprintf(message, sizeof(message),
+                         "Cannot open include file '%.160s'", include_name);
+                parser_diag_ctx(ctx, "IO", message,
+                                "Verify the include path and file permissions");
+                if (ctx && ctx->include_ctx.tracker.count > 0) {
+                    ctx->include_ctx.tracker.count--;
+                }
                 free(output);
                 return NULL;
             }

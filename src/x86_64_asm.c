@@ -1810,9 +1810,11 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
     /* Use context-aware parsing to enable macro support */
     parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
     if (!insts) {
-        asm_set_last_errorf(ctx,
-                            "Error at line 1, column 1: [Parser] Parsing failed\n"
-                            "Suggestion: Review the first parser diagnostic above for exact token context.");
+        if (ctx->last_error[0] == '\0') {
+            asm_set_last_errorf(ctx,
+                                "Error at line 1, column 1: [Parser] Parsing failed\n"
+                                "Suggestion: Review the first parser diagnostic above for exact token context.");
+        }
         return -1;
     }
 
@@ -2373,7 +2375,20 @@ int asm_assemble_file(assembler_context_t *ctx, const char *filename) {
     return result;
 }
 
-char *asm_preprocess_file(assembler_context_t *ctx, const char *filename) {
+char *
+asm_preprocess_file(assembler_context_t *ctx, const char *filename)
+{
+    if (!ctx) {
+        return NULL;
+    }
+
+    if (!filename) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [I/O] Missing filename for preprocessing\n"
+                            "Suggestion: Provide a valid input file path.");
+        return NULL;
+    }
+
     FILE *f = fopen(filename, "r");
     if (!f) {
         asm_set_last_errorf(ctx,
@@ -2415,11 +2430,19 @@ char *asm_preprocess_file(assembler_context_t *ctx, const char *filename) {
 
     char *source = malloc(size_u + 1u);
     if (!source) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [Memory] Failed to allocate memory for file '%s'\n"
+                            "Suggestion: Reduce file size or free system memory.",
+                            filename);
         fclose(f);
         return NULL;
     }
 
     if (fread(source, 1u, size_u, f) != size_u) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [I/O] Failed to read file '%s'\n"
+                            "Suggestion: Verify file is readable and not truncated.",
+                            filename);
         free(source);
         fclose(f);
         return NULL;
@@ -2438,6 +2461,12 @@ char *asm_preprocess_file(assembler_context_t *ctx, const char *filename) {
 
     /* Preprocess macros and includes */
     char *preprocessed = preprocess_macros(ctx, times_expanded);
+    if (!preprocessed) {
+        asm_set_last_errorf(ctx,
+                            "Error at line 1, column 1: [Preprocessor] Macro preprocessing failed for file '%s'\n"
+                            "Suggestion: Check for syntax errors or recursive macro definitions.",
+                            filename);
+    }
 
     if (times_expanded != source) {
         free(times_expanded);
@@ -3402,7 +3431,7 @@ asm_ctx_add_include_path(assembler_context_t *ctx, const char *path)
     }
     size_t n = strlen(path);
     if (n >= MAX_FILEPATH_LENGTH) {
-        n = MAX_FILEPATH_LENGTH - 1;
+        return -1;
     }
     memcpy(ctx->include_paths[ctx->include_path_count], path, n);
     ctx->include_paths[ctx->include_path_count][n] = '\0';
@@ -3422,7 +3451,7 @@ asm_ctx_add_cli_define(assembler_context_t *ctx, const char *name,
     }
     size_t name_len = strlen(name);
     if (name_len >= MAX_LABEL_LENGTH) {
-        name_len = MAX_LABEL_LENGTH - 1;
+        return -1;
     }
     memcpy(ctx->cli_defines[ctx->cli_define_count], name, name_len);
     ctx->cli_defines[ctx->cli_define_count][name_len] = '\0';
@@ -3430,7 +3459,7 @@ asm_ctx_add_cli_define(assembler_context_t *ctx, const char *name,
     if (value) {
         size_t val_len = strlen(value);
         if (val_len >= MAX_LINE_LENGTH) {
-            val_len = MAX_LINE_LENGTH - 1;
+            return -1;
         }
         memcpy(ctx->cli_define_values[ctx->cli_define_count], value, val_len);
         ctx->cli_define_values[ctx->cli_define_count][val_len] = '\0';
@@ -3581,6 +3610,12 @@ bool
 asm_ctx_get_fatal_warning_occurred(const assembler_context_t *ctx)
 {
     return ctx ? ctx->fatal_warning_occurred : false;
+}
+
+int
+asm_ctx_get_warning_count(const assembler_context_t *ctx)
+{
+    return ctx ? ctx->warning_count : 0;
 }
 
 bool
