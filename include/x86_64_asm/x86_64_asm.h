@@ -37,6 +37,9 @@ extern "C" {
 #define MAX_INCLUDE_FILES   64   /* Maximum total files in include chain */
 #define MAX_FILEPATH_LENGTH 512  /* Maximum file path length */
 #define MAX_ERROR_MESSAGE   512  /* Maximum stored error message length */
+#define MAX_INCLUDE_PATHS   32   /* Maximum -I search paths */
+#define MAX_CLI_DEFINES     64   /* Maximum -D command-line defines */
+#define MAX_DEPENDENCIES    256  /* Maximum tracked include dependencies */
 
 /* ELF64 Constants */
 #define ELFMAG0             0x7f
@@ -451,6 +454,25 @@ typedef struct {
     bool emit_debug_map;
     uint64_t base_address;
     bool enable_forward_short_branches;
+
+    /* Phase 1 CLI flags */
+    char include_paths[MAX_INCLUDE_PATHS][MAX_FILEPATH_LENGTH];
+    int include_path_count;
+    char cli_defines[MAX_CLI_DEFINES][MAX_LABEL_LENGTH];
+    char cli_define_values[MAX_CLI_DEFINES][MAX_LINE_LENGTH];
+    int cli_define_count;
+    bool preprocess_only;
+    bool warnings_as_errors;
+    bool warn_all;
+    bool warn_unused_labels;
+    bool error_format_json;
+    /* Dependency generation (-M / -MM) */
+    char dependencies[MAX_DEPENDENCIES][MAX_FILEPATH_LENGTH];
+    int dependency_count;
+    bool generate_deps;
+    bool deps_exclude_system;
+    int warning_count;
+    bool fatal_warning_occurred;
 } assembler_context_t;
 
 /* ============================================================================
@@ -561,6 +583,18 @@ int asm_assemble(assembler_context_t *ctx, const char *source);
  * @return 0 on success, negative value on failure.
  */
 int asm_assemble_file(assembler_context_t *ctx, const char *filename);
+
+/**
+ * @brief Preprocess source from a file path and return expanded text.
+ *
+ * Performs include expansion and macro preprocessing only.  The caller
+ * must free the returned string with free().
+ *
+ * @param ctx Assembler context.
+ * @param filename Input assembly file path.
+ * @return Newly allocated preprocessed source string, or NULL on failure.
+ */
+char *asm_preprocess_file(assembler_context_t *ctx, const char *filename);
 
 /**
  * @brief Emit ELF64 output.

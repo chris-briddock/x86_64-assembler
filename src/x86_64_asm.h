@@ -101,6 +101,8 @@ void parser_profile_enable(assembler_context_t *ctx, bool enabled);
 void parser_profile_reset(assembler_context_t *ctx);
 void parser_profile_get(const assembler_context_t *ctx, parser_profile_stats_t *out_stats);
 
+char *expand_times_only(const char *source);
+
 int include_file(assembler_context_t *ctx, const char *filename);
 int include_push(assembler_context_t *ctx, const char *filename, char *content);
 int include_pop(assembler_context_t *ctx);

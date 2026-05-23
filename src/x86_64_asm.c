@@ -16,6 +16,7 @@
 extern parsed_instruction_t *parse_source(const char *source, int *count);
 extern parsed_instruction_t *parse_source_with_context(assembler_context_t *ctx, const char *source, int *count);
 extern void free_instructions(parsed_instruction_t *insts);
+extern char *expand_times_only(const char *source);
 
 /* Encoder functions */
 extern int encode_mov(assembler_context_t *ctx, const parsed_instruction_t *inst);
@@ -1809,9 +1810,16 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
     /* Use context-aware parsing to enable macro support */
     parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
     if (!insts) {
-        fprintf(stderr,
-                "Error at line 1, column 1: [Parser] Parsing failed\n"
-                "Suggestion: Review the first parser diagnostic above for exact token context.\n");
+        if (ctx->error_format_json) {
+            fprintf(stderr,
+                    "{\"severity\":\"error\",\"line\":1,\"column\":1,"
+                    "\"category\":\"Parser\",\"message\":\"Parsing failed\","
+                    "\"suggestion\":\"Review the first parser diagnostic above for exact token context.\"}\n");
+        } else {
+            fprintf(stderr,
+                    "Error at line 1, column 1: [Parser] Parsing failed\n"
+                    "Suggestion: Review the first parser diagnostic above for exact token context.\n");
+        }
         return -1;
     }
 
@@ -2370,6 +2378,56 @@ int asm_assemble_file(assembler_context_t *ctx, const char *filename) {
     int result = asm_assemble(ctx, source);
     free(source);
     return result;
+}
+
+char *asm_preprocess_file(assembler_context_t *ctx, const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr,
+                "Error at line 1, column 1: [I/O] Cannot open file '%s'\n"
+                "Suggestion: Verify file path and read permissions.\n",
+                filename);
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    size_t size_u = (size_t)size;
+
+    char *source = malloc(size_u + 1u);
+    if (!source) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(source, 1u, size_u, f) != size_u) {
+        free(source);
+        fclose(f);
+        return NULL;
+    }
+    source[size_u] = '\0';
+    fclose(f);
+
+    strncpy(ctx->current_filename, filename, MAX_FILEPATH_LENGTH - 1);
+    ctx->current_filename[MAX_FILEPATH_LENGTH - 1] = '\0';
+
+    /* Expand times directive first (same as parse_source_common) */
+    char *times_expanded = expand_times_only(source);
+    if (!times_expanded) {
+        times_expanded = source;
+    }
+
+    /* Preprocess macros and includes */
+    char *preprocessed = preprocess_macros(ctx, times_expanded);
+
+    if (times_expanded != source) {
+        free(times_expanded);
+    }
+    free(source);
+
+    return preprocessed;
 }
 
 /* ============================================================================
