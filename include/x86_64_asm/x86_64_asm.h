@@ -106,7 +106,8 @@ typedef enum {
     OPERAND_MEM,           /* Memory: [rax], [rbx+4] */
     OPERAND_LABEL,         /* Label reference */
     OPERAND_LABEL_DIFF,    /* Label arithmetic: label1 - label2 */
-    OPERAND_STRING         /* String literal */
+    OPERAND_STRING,        /* String literal */
+    OPERAND_EXPR           /* Complex expression for equ constant folding */
 } operand_type_t;
 
 typedef enum {
@@ -289,6 +290,7 @@ typedef struct {
     bool is_weak;
     bool is_hidden;
     bool is_function;
+    bool is_used;
     int section;  /* 0 = text, 1 = data */
 } symbol_t;
 

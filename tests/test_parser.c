@@ -1215,6 +1215,310 @@ static int test_parse_equ_label_subtraction(void) {
     return 0;
 }
 
+/* Test: %macro alias should define macro same as .macro */
+static int test_percent_macro_alias(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%macro exit_code code\n"
+        "    mov rax, 60\n"
+        "    mov rdi, \\code\n"
+        "%endmacro\n";
+
+    char *preprocessed = preprocess_macros(ctx, source);
+    ASSERT_NOT_NULL(preprocessed);
+
+    ASSERT_EQ(1, ctx->macro_count);
+    ASSERT_EQ_STR("exit_code", ctx->macros[0].name);
+    ASSERT_EQ(1, ctx->macros[0].param_count);
+    ASSERT_EQ_STR("code", ctx->macros[0].params[0].name);
+    ASSERT_EQ(2, ctx->macros[0].body_line_count);
+
+    free(preprocessed);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %macro expansion with parameter substitution */
+static int test_percent_macro_expansion(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%macro set_reg reg, val\n"
+        "    mov \\reg, \\val\n"
+        "%endmacro\n"
+        "set_reg rax, 42\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(2, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_REG, insts[0].operands[0].type);
+    ASSERT_EQ(RAX, insts[0].operands[0].reg);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[1].type);
+    ASSERT_EQ(42, insts[0].operands[1].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: NASM-style %macro name N with positional %1, %2 parameters */
+static int test_nasm_positional_macro_definition(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%macro write 2\n"
+        "    mov rax, %1\n"
+        "    mov rdx, %2\n"
+        "%endmacro\n";
+
+    char *preprocessed = preprocess_macros(ctx, source);
+    ASSERT_NOT_NULL(preprocessed);
+
+    ASSERT_EQ(1, ctx->macro_count);
+    ASSERT_EQ_STR("write", ctx->macros[0].name);
+    ASSERT_EQ(2, ctx->macros[0].param_count);
+    ASSERT_EQ_STR("1", ctx->macros[0].params[0].name);
+    ASSERT_EQ_STR("2", ctx->macros[0].params[1].name);
+
+    free(preprocessed);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: NASM-style positional macro expansion with %1, %2 */
+static int test_nasm_positional_macro_expansion(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%macro set_reg 2\n"
+        "    mov %1, %2\n"
+        "%endmacro\n"
+        "set_reg rax, 42\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(2, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_REG, insts[0].operands[0].type);
+    ASSERT_EQ(RAX, insts[0].operands[0].reg);
+    ASSERT_EQ(OPERAND_IMM, insts[0].operands[1].type);
+    ASSERT_EQ(42, insts[0].operands[1].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: NASM-style positional macro with memory reference */
+static int test_nasm_positional_macro_memory(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%macro load 2\n"
+        "    mov %1, [%2]\n"
+        "%endmacro\n"
+        "load rax, mydata\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(2, insts[0].operand_count);
+    ASSERT_EQ(OPERAND_REG, insts[0].operands[0].type);
+    ASSERT_EQ(RAX, insts[0].operands[0].reg);
+    ASSERT_EQ(OPERAND_MEM, insts[0].operands[1].type);
+    ASSERT_EQ_STR("mydata", insts[0].operands[1].mem.label);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %rep / %endrep should repeat body N times */
+static int test_rep_directive(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%rep 3\n"
+        "    nop\n"
+        "%endrep\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(3, count);
+    ASSERT_EQ(INST_NOP, insts[0].type);
+    ASSERT_EQ(INST_NOP, insts[1].type);
+    ASSERT_EQ(INST_NOP, insts[2].type);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %rep with multiple instructions per iteration */
+static int test_rep_multiple_instructions(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%rep 2\n"
+        "    push rax\n"
+        "    pop rax\n"
+        "%endrep\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(4, count);
+    ASSERT_EQ(INST_PUSH, insts[0].type);
+    ASSERT_EQ(INST_POP, insts[1].type);
+    ASSERT_EQ(INST_PUSH, insts[2].type);
+    ASSERT_EQ(INST_POP, insts[3].type);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: %rep with count of 1 */
+static int test_rep_count_one(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source =
+        "%rep 1\n"
+        "    mov rax, 1\n"
+        "%endrep\n";
+
+    int count = 0;
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_MOV, insts[0].type);
+    ASSERT_EQ(1, insts[0].operands[1].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: equ with complex arithmetic expression */
+static int test_equ_complex_expression(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source = "RESULT equ 10 + 20 * 2\n";
+    int count = 0;
+
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_EQU, insts[0].type);
+    ASSERT_TRUE(insts[0].has_label);
+    ASSERT_EQ_STR("RESULT", insts[0].label);
+    ASSERT_EQ(1, insts[0].operand_count);
+    /* Should fold to 50 (10 + 40) */
+    ASSERT_EQ(50, insts[0].operands[0].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: equ with expression using parentheses */
+static int test_equ_expression_parens(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source = "RESULT equ (10 + 20) * 2\n";
+    int count = 0;
+
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_EQU, insts[0].type);
+    /* Should fold to 60 ((10 + 20) * 2) */
+    ASSERT_EQ(60, insts[0].operands[0].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: equ with bitwise expression */
+static int test_equ_expression_bitwise(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source = "RESULT equ 0x0F | 0xF0\n";
+    int count = 0;
+
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_EQU, insts[0].type);
+    /* Should fold to 0xFF */
+    ASSERT_EQ(0xFF, insts[0].operands[0].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: equ with shift expression */
+static int test_equ_expression_shift(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source = "RESULT equ 1 << 8\n";
+    int count = 0;
+
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_EQU, insts[0].type);
+    /* Should fold to 256 */
+    ASSERT_EQ(256, insts[0].operands[0].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
+/* Test: equ with mixed expression */
+static int test_equ_expression_mixed(void) {
+    assembler_context_t *ctx = asm_init();
+    ASSERT_NOT_NULL(ctx);
+
+    const char *source = "RESULT equ (0x10 + 4) * 2 - 8\n";
+    int count = 0;
+
+    parsed_instruction_t *insts = parse_source_with_context(ctx, source, &count);
+    ASSERT_NOT_NULL(insts);
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(INST_EQU, insts[0].type);
+    /* Should fold to 32 ((0x14) * 2 - 8 = 40 - 8 = 32) */
+    ASSERT_EQ(32, insts[0].operands[0].immediate);
+
+    free_instructions(insts);
+    asm_free(ctx);
+    return 0;
+}
+
 /* Test: Parse weak/hidden symbol attribute directives */
 static int test_parse_weak_hidden_directives(void) {
     int count = 0;
@@ -1808,6 +2112,19 @@ TEST_SUITE(parser) {
     TEST(macro_no_params);
     TEST(macro_multiple_invocations);
     TEST(macro_recursive_invocation_fails);
+    TEST(percent_macro_alias);
+    TEST(percent_macro_expansion);
+    TEST(nasm_positional_macro_definition);
+    TEST(nasm_positional_macro_expansion);
+    TEST(nasm_positional_macro_memory);
+    TEST(rep_directive);
+    TEST(rep_multiple_instructions);
+    TEST(rep_count_one);
+    TEST(equ_complex_expression);
+    TEST(equ_expression_parens);
+    TEST(equ_expression_bitwise);
+    TEST(equ_expression_shift);
+    TEST(equ_expression_mixed);
     TEST(preprocessor_define_substitution);
     TEST(preprocessor_if_else);
     TEST(preprocessor_ifdef_ifndef);

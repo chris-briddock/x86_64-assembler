@@ -810,6 +810,93 @@ static int test_integration_preprocessor_conditionals(void) {
     return 0;
 }
 
+/* Test: Nested %rep blocks should expand deterministically */
+static int test_integration_rep_nested(void) {
+    const char *source =
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rdi, $0\n"
+        "%rep 2\n"
+        "    %rep 3\n"
+        "        add rdi, $1\n"
+        "    %endrep\n"
+        "%endrep\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(6, exit_code);
+    return 0;
+}
+
+/* Test: %rep inside macro expansion should repeat the body */
+static int test_integration_rep_inside_macro(void) {
+    const char *source =
+        "%macro bump 1\n"
+        "    %rep %1\n"
+        "        add rdi, $1\n"
+        "    %endrep\n"
+        "%endmacro\n"
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rdi, $0\n"
+        "    bump 4\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(4, exit_code);
+    return 0;
+}
+
+/* Test: Macros with local labels should coexist with anonymous labels */
+static int test_integration_macro_local_and_anonymous_labels(void) {
+    const char *source =
+        "%macro bump_loop 1\n"
+        "    mov rcx, %1\n"
+        ".loop\\@:\n"
+        "    add rdi, $1\n"
+        "    dec rcx\n"
+        "    jnz .loop\\@\n"
+        "%endmacro\n"
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rdi, $0\n"
+        "    bump_loop 3\n"
+        "    bump_loop 2\n"
+        "    jmp @F\n"
+        "@@:\n"
+        "    mov rdi, $99\n"
+        "@F:\n"
+        "    mov rax, $60\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(5, exit_code);
+    return 0;
+}
+
+/* Test: equ expressions should work in directives and immediates */
+static int test_integration_equ_expression_in_directives(void) {
+    const char *source =
+        "size equ (4 + 8) * 2\n"
+        "section .bss\n"
+        "buf: resb size\n"
+        "section .text\n"
+        "global _start\n"
+        "_start:\n"
+        "    mov rax, $60\n"
+        "    mov rdi, size\n"
+        "    syscall\n";
+
+    int exit_code = assemble_and_run(source);
+    ASSERT_EQ(24, exit_code);
+    return 0;
+}
+
 /* Test: Empty program should fail gracefully */
 static int test_integration_empty(void) {
     const char *source = "";
@@ -3918,6 +4005,223 @@ static int test_integration_warning_utf8(void) {
     return 0;
 }
 
+/* Test: -W should warn on unused labels */
+static int test_integration_cli_warning_unused_label(void) {
+    char asm_path[] = "/tmp/asm_warn_unused_XXXXXX";
+    int fd = mkstemp(asm_path);
+    ASSERT_TRUE(fd >= 0);
+    FILE *f = fdopen(fd, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    jmp done\n"
+            "unused:\n"
+            "    nop\n"
+            "done:\n"
+            "    mov rax, $60\n"
+            "    xor rdi, rdi\n"
+            "    syscall\n");
+    fclose(f);
+
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+    char stdout_buf[4096];
+    char stderr_buf[4096];
+    int status;
+    int exit_code = -1;
+
+    ASSERT_EQ(0, pipe(stdout_pipe));
+    ASSERT_EQ(0, pipe(stderr_pipe));
+
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execl("bin/x86_64-asm", "x86_64-asm", "-W", asm_path, NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf, sizeof(stdout_buf)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    ASSERT_EQ(0, exit_code);
+    ASSERT_STR_CONTAINS(stderr_buf, "Unused label 'unused'");
+
+    unlink(asm_path);
+    return 0;
+}
+
+/* Test: CLI warning levels (-Wall/-Werror) with a warning-producing input */
+static int test_integration_cli_warning_levels(void) {
+    char asm_path[] = "/tmp/asm_warn_levels_XXXXXX";
+    int fd = mkstemp(asm_path);
+    ASSERT_TRUE(fd >= 0);
+    FILE *f = fdopen(fd, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .data\n"
+            "    db \"\x80\"\n"
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    mov rax, $60\n"
+            "    xor rdi, rdi\n"
+            "    syscall\n");
+    fclose(f);
+
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+    char stdout_buf[4096];
+    char stderr_buf[4096];
+    int status;
+    int exit_code = -1;
+
+    /* Subtest 1: -Wall should emit a warning but succeed */
+    ASSERT_EQ(0, pipe(stdout_pipe));
+    ASSERT_EQ(0, pipe(stderr_pipe));
+
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execl("bin/x86_64-asm", "x86_64-asm", "-Wall", asm_path, NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf, sizeof(stdout_buf)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    ASSERT_EQ(0, exit_code);
+    ASSERT_STR_CONTAINS(stderr_buf, "Warning at line");
+    ASSERT_STR_CONTAINS(stderr_buf, "Invalid UTF-8 sequence in string");
+
+    /* Subtest 2: -Wall -Werror should fail due to warnings-as-errors */
+    ASSERT_EQ(0, pipe(stdout_pipe));
+    ASSERT_EQ(0, pipe(stderr_pipe));
+
+    pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execl("bin/x86_64-asm", "x86_64-asm", "-Wall", "-Werror", asm_path, NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf, sizeof(stdout_buf)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    ASSERT_EQ(1, exit_code);
+    ASSERT_STR_CONTAINS(stderr_buf, "warnings treated as errors");
+
+    unlink(asm_path);
+    return 0;
+}
+
+/* Test: JSON error output via --error-format=json */
+static int test_integration_cli_error_format_json(void) {
+    char asm_path[] = "/tmp/asm_json_error_XXXXXX";
+    int fd = mkstemp(asm_path);
+    ASSERT_TRUE(fd >= 0);
+    FILE *f = fdopen(fd, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f,
+            "section .text\n"
+            "global _start\n"
+            "_start:\n"
+            "    mov rax, $60\n"
+            "    xor rdi, rdi\n"
+            "    syscall\n");
+    fclose(f);
+
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+    char stdout_buf[2048];
+    char stderr_buf[4096];
+    int status;
+    int exit_code = -1;
+
+    ASSERT_EQ(0, pipe(stdout_pipe));
+    ASSERT_EQ(0, pipe(stderr_pipe));
+
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execl("bin/x86_64-asm", "x86_64-asm", "--error-format=json",
+              "-D1INVALID", asm_path, NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    ASSERT_TRUE(test_read_all(stdout_pipe[0], stdout_buf, sizeof(stdout_buf)) >= 0);
+    ASSERT_TRUE(test_read_all(stderr_pipe[0], stderr_buf, sizeof(stderr_buf)) >= 0);
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    ASSERT_EQ(1, exit_code);
+    ASSERT_STR_CONTAINS(stderr_buf, "\"severity\":\"error\"");
+    ASSERT_STR_CONTAINS(stderr_buf, "\"category\":\"CLI\"");
+    ASSERT_STR_CONTAINS(stderr_buf, "Invalid -D define");
+
+    unlink(asm_path);
+    return 0;
+}
+
 /* Test: CLI end-to-end via subprocess for -D, -I, -E, -M/-MM */
 static int test_integration_cli_end_to_end(void)
 {
@@ -4172,6 +4476,10 @@ TEST_SUITE(integration) {
     TEST(integration_named_sections);
     TEST(integration_segment_alias);
     TEST(integration_preprocessor_conditionals);
+    TEST(integration_rep_nested);
+    TEST(integration_rep_inside_macro);
+    TEST(integration_macro_local_and_anonymous_labels);
+    TEST(integration_equ_expression_in_directives);
     TEST(integration_empty);
     TEST(integration_invalid);
     TEST(integration_enter_invalid_operands);
@@ -4223,6 +4531,9 @@ TEST_SUITE(integration) {
     TEST(integration_dependency_tracking);
     TEST(integration_dependency_exclude_system);
     TEST(integration_warning_utf8);
+    TEST(integration_cli_warning_unused_label);
+    TEST(integration_cli_warning_levels);
+    TEST(integration_cli_error_format_json);
     TEST(integration_cli_end_to_end);
 }
 

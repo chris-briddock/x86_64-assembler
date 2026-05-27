@@ -1385,6 +1385,229 @@ static instruction_type_t lookup_instruction_type(const char *mnemonic) {
     return INST_UNKNOWN;
 }
 
+/* ============================================================================
+ * EQU EXPRESSION EVALUATOR (constant folding)
+ * ============================================================================ */
+
+typedef struct {
+    const char *s;
+    int line;
+    int column;
+    const char *line_text;
+} expr_parser_t;
+
+static int64_t expr_parse_factor(expr_parser_t *ep);
+static int64_t expr_parse_term(expr_parser_t *ep);
+static int64_t expr_parse_shift(expr_parser_t *ep);
+static int64_t expr_parse_addsub(expr_parser_t *ep);
+static int64_t expr_parse_bitand(expr_parser_t *ep);
+static int64_t expr_parse_bitxor(expr_parser_t *ep);
+static int64_t expr_parse_bitor(expr_parser_t *ep);
+
+static void expr_skip_ws(expr_parser_t *ep) {
+    while (*ep->s && isspace((unsigned char)*ep->s)) ep->s++;
+}
+
+static int64_t expr_parse_number(expr_parser_t *ep) {
+    expr_skip_ws(ep);
+    const char *start = ep->s;
+    int base = 10;
+    int64_t val = 0;
+    bool negate = false;
+
+    if (*ep->s == '-') {
+        negate = true;
+        ep->s++;
+        expr_skip_ws(ep);
+    } else if (*ep->s == '+') {
+        ep->s++;
+        expr_skip_ws(ep);
+    }
+
+    if (*ep->s == '0' && (ep->s[1] == 'x' || ep->s[1] == 'X')) {
+        base = 16;
+        ep->s += 2;
+    } else if (*ep->s == '0' && (ep->s[1] == 'b' || ep->s[1] == 'B')) {
+        base = 2;
+        ep->s += 2;
+    }
+
+    while (*ep->s) {
+        int digit = -1;
+        char c = *ep->s;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (base == 16 && c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (base == 16 && c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else if (base == 2 && (c == '0' || c == '1')) digit = c - '0';
+
+        if (digit < 0 || digit >= base) break;
+        val = val * base + digit;
+        ep->s++;
+    }
+
+    if (ep->s == start || (negate && ep->s == start + 1)) {
+        parser_diag_ctx(NULL, "Syntax",
+                        "Invalid number in equ expression",
+                        "Use decimal, hex (0x), or binary (0b) literals");
+        return 0;
+    }
+    return negate ? -val : val;
+}
+
+static int64_t expr_parse_factor(expr_parser_t *ep) {
+    expr_skip_ws(ep);
+
+    if (*ep->s == '(') {
+        ep->s++;
+        int64_t val = expr_parse_bitor(ep);
+        expr_skip_ws(ep);
+        if (*ep->s != ')') {
+            parser_diag_ctx(NULL, "Syntax",
+                            "Missing closing parenthesis in equ expression",
+                            "Add a matching ')' to close the sub-expression");
+            return 0;
+        }
+        ep->s++;
+        return val;
+    }
+
+    return expr_parse_number(ep);
+}
+
+static int64_t expr_parse_term(expr_parser_t *ep) {
+    int64_t lhs = expr_parse_factor(ep);
+    for (;;) {
+        expr_skip_ws(ep);
+        char op = *ep->s;
+        if (op != '*' && op != '/' && op != '%') break;
+        ep->s++;
+        int64_t rhs = expr_parse_factor(ep);
+        if (op == '*') lhs = lhs * rhs;
+        else if (op == '/') {
+            if (rhs == 0) {
+                parser_diag_ctx(NULL, "Constraint",
+                                "Division by zero in equ expression",
+                                "Avoid dividing by zero in constant expressions");
+                return 0;
+            }
+            lhs = lhs / rhs;
+        } else {
+            if (rhs == 0) {
+                parser_diag_ctx(NULL, "Constraint",
+                                "Modulo by zero in equ expression",
+                                "Avoid modulo by zero in constant expressions");
+                return 0;
+            }
+            lhs = lhs % rhs;
+        }
+    }
+    return lhs;
+}
+
+static int64_t expr_parse_shift(expr_parser_t *ep) {
+    int64_t lhs = expr_parse_term(ep);
+    for (;;) {
+        expr_skip_ws(ep);
+        if (ep->s[0] == '<' && ep->s[1] == '<') {
+            ep->s += 2;
+            int64_t rhs = expr_parse_term(ep);
+            lhs = lhs << rhs;
+        } else if (ep->s[0] == '>' && ep->s[1] == '>') {
+            ep->s += 2;
+            int64_t rhs = expr_parse_term(ep);
+            lhs = lhs >> rhs;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int64_t expr_parse_addsub(expr_parser_t *ep) {
+    int64_t lhs = expr_parse_shift(ep);
+    for (;;) {
+        expr_skip_ws(ep);
+        char op = *ep->s;
+        if (op != '+' && op != '-') break;
+        ep->s++;
+        int64_t rhs = expr_parse_shift(ep);
+        if (op == '+') lhs = lhs + rhs;
+        else lhs = lhs - rhs;
+    }
+    return lhs;
+}
+
+static int64_t expr_parse_bitand(expr_parser_t *ep) {
+    int64_t lhs = expr_parse_addsub(ep);
+    for (;;) {
+        expr_skip_ws(ep);
+        if (*ep->s != '&') break;
+        ep->s++;
+        int64_t rhs = expr_parse_addsub(ep);
+        lhs = lhs & rhs;
+    }
+    return lhs;
+}
+
+static int64_t expr_parse_bitxor(expr_parser_t *ep) {
+    int64_t lhs = expr_parse_bitand(ep);
+    for (;;) {
+        expr_skip_ws(ep);
+        if (*ep->s != '^') break;
+        ep->s++;
+        int64_t rhs = expr_parse_bitand(ep);
+        lhs = lhs ^ rhs;
+    }
+    return lhs;
+}
+
+static int64_t expr_parse_bitor(expr_parser_t *ep) {
+    int64_t lhs = expr_parse_bitxor(ep);
+    for (;;) {
+        expr_skip_ws(ep);
+        if (*ep->s != '|') break;
+        ep->s++;
+        int64_t rhs = expr_parse_bitxor(ep);
+        lhs = lhs | rhs;
+    }
+    return lhs;
+}
+
+static int64_t evaluate_equ_expression(const char *expr_text) {
+    if (!expr_text || !*expr_text) return 0;
+    expr_parser_t ep = { expr_text, 0, 0, NULL };
+    int64_t result = expr_parse_bitor(&ep);
+    expr_skip_ws(&ep);
+    if (*ep.s != '\0') {
+        parser_diag_ctx(NULL, "Syntax",
+                        "Unexpected characters in equ expression",
+                        "Use only numbers, parentheses, and operators + - * / % & | ^ << >>");
+        return 0;
+    }
+    return result;
+}
+
+static const char *equ_expr_start_from_line(const char *line_start) {
+    const char *p = line_start;
+
+    if (!p) return NULL;
+
+    while (*p && *p != '\n' && *p != '\r') {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p || *p == '\n' || *p == '\r') break;
+
+        const char *tok_start = p;
+        while (*p && !isspace((unsigned char)*p) && *p != '\n' && *p != '\r') p++;
+        size_t tok_len = (size_t)(p - tok_start);
+        if (tok_len == 3 && strncasecmp(tok_start, "equ", 3) == 0) {
+            while (*p && isspace((unsigned char)*p)) p++;
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
 static int maybe_parse_equ_directive(parser_state_t *p, parsed_instruction_t *inst) {
     if (!(p->current.type == TOK_IDENTIFIER && p->peek.type == TOK_IDENTIFIER &&
           strcasecmp(p->peek.text, "equ") == 0)) {
@@ -1402,17 +1625,73 @@ static int maybe_parse_equ_directive(parser_state_t *p, parsed_instruction_t *in
         parser_error_context(p, "Too many operands");
         return -1;
     }
-    if (parse_operand(p, &inst->operands[inst->operand_count]) < 0) {
-        return -1;
+
+    /* Try simple operand first (immediate, label, label diff) */
+    if (p->current.type == TOK_NUMBER || p->current.type == TOK_IDENTIFIER ||
+        p->current.type == TOK_DOLLAR || p->current.type == TOK_CHAR) {
+        parser_state_t saved = *p;
+        if (parse_operand(p, &inst->operands[inst->operand_count]) == 0) {
+            if ((inst->operands[inst->operand_count].type == OPERAND_IMM ||
+                 inst->operands[inst->operand_count].type == OPERAND_LABEL ||
+                 inst->operands[inst->operand_count].type == OPERAND_LABEL_DIFF) &&
+                (p->current.type == TOK_NEWLINE || p->current.type == TOK_EOF)) {
+                inst->operand_count++;
+                return 1;
+            }
+        }
+        *p = saved;
     }
-    if (inst->operands[inst->operand_count].type != OPERAND_IMM &&
-        inst->operands[inst->operand_count].type != OPERAND_LABEL &&
-        inst->operands[inst->operand_count].type != OPERAND_LABEL_DIFF) {
-        parser_error_context(p, "equ directive requires a numeric value, label, or label subtraction");
-        return -1;
+
+    /* Fall back to complex expression evaluation */
+    {
+        /* Reconstruct the rest of the line as expression text */
+        const char *expr_start = equ_expr_start_from_line(p->line_start);
+        if (!expr_start) {
+            expr_start = p->pos;
+        }
+        const char *expr_end = expr_start;
+        while (*expr_end && *expr_end != '\n' && *expr_end != ';' &&
+               !(expr_end[0] == '/' && expr_end[1] == '/')) {
+            expr_end++;
+        }
+        size_t expr_len = (size_t)(expr_end - expr_start);
+        if (expr_len > 0) {
+            char *expr_text = malloc(expr_len + 1);
+            if (!expr_text) {
+                parser_error_context(p, "Out of memory parsing equ expression");
+                return -1;
+            }
+            memcpy(expr_text, expr_start, expr_len);
+            expr_text[expr_len] = '\0';
+
+            int64_t value = evaluate_equ_expression(expr_text);
+            free(expr_text);
+
+            /* If evaluation produced a diagnostic, the value may be 0 from error.
+               We still store it; the assembler will catch unresolved labels later. */
+            inst->operands[inst->operand_count].type = OPERAND_EXPR;
+            inst->operands[inst->operand_count].immediate = value;
+            inst->operand_count++;
+
+            /* Advance parser to end of line */
+            p->pos = expr_end;
+            if (*p->pos == '\n') {
+                p->pos++;
+                p->line_start = p->pos;
+            } else {
+                p->line_start = expr_end;
+            }
+            /* Synchronise peek so caller's advance() works correctly */
+            p->current.type = TOK_NEWLINE;
+            p->current.text[0] = '\0';
+            p->peek.type = TOK_NEWLINE;
+            p->peek.text[0] = '\0';
+            return 1;
+        }
     }
-    inst->operand_count++;
-    return 1;
+
+    parser_error_context(p, "equ directive requires a numeric value, label, or expression");
+    return -1;
 }
 
 static int maybe_apply_section_shorthand(const parser_state_t *p, parsed_instruction_t *inst,
@@ -2037,16 +2316,16 @@ static void substitute_params(const char *line, const char **args, int arg_count
     size_t remaining = output_size - 1;
     
     while (*src && remaining > 0) {
-        /* Check for parameter reference: \param or $param */
-        if ((*src == '\\' || *src == '$') && *(src + 1)) {
+        /* Check for parameter reference: \param, $param, or %param (NASM-style) */
+        if ((*src == '\\' || *src == '$' || *src == '%') && *(src + 1)) {
             const char *param_start = src + 1;
             const char *param_end = param_start;
-            
+
             /* Find end of parameter name (alphanumeric + underscore) */
             while (*param_end && (isalnum((unsigned char)*param_end) || *param_end == '_')) {
                 param_end++;
             }
-            
+
             size_t param_len = (size_t)(param_end - param_start);
             if (param_len > 0) {
                 /* Check for local label suffix \@ */
@@ -2063,7 +2342,7 @@ static void substitute_params(const char *line, const char **args, int arg_count
                     src = param_end;
                     continue;
                 }
-                
+
                 /* Look up parameter by name */
                 for (int i = 0; i < macro->param_count; i++) {
                     if (strlen(macro->params[i].name) == param_len &&
@@ -2176,13 +2455,16 @@ static int parse_macro_directive(const char *line, char *macro_name,
     const char *p = line;
     while (*p && isspace((unsigned char)*p)) p++;
     
-    /* Check for .macro or macro */
-    if (strncasecmp(p, ".macro", 6) != 0 && strncasecmp(p, "macro", 5) != 0) {
+    /* Check for .macro, macro, or %macro */
+    if (strncasecmp(p, ".macro", 6) != 0 &&
+        strncasecmp(p, "macro", 5) != 0 &&
+        strncasecmp(p, "%macro", 6) != 0) {
         return -1;
     }
-    
+
     /* Skip directive */
-    if (*p == '.') p += 6;
+    if (*p == '%') p += 6;
+    else if (*p == '.') p += 6;
     else p += 5;
     
     /* Skip whitespace */
@@ -2193,8 +2475,8 @@ static int parse_macro_directive(const char *line, char *macro_name,
         parser_diag_ctx(
             NULL,
             "Syntax",
-            ".macro requires a name",
-            "Use: .macro <name> [param1, param2, ...]"
+            "Macro definition requires a name",
+            "Use: .macro <name> [param1, param2, ...] or %macro <name> [param1, param2, ...]"
         );
         return -1;
     }
@@ -2216,29 +2498,54 @@ static int parse_macro_directive(const char *line, char *macro_name,
     }
     
     *param_count = 0;
-    
+
     /* Skip whitespace */
     while (*p && isspace((unsigned char)*p)) p++;
-    
-    /* Parse parameters if present */
+
+    /* Check for NASM-style parameter count: a bare integer after the name */
+    if (*p && isdigit((unsigned char)*p)) {
+        int nasm_count = 0;
+        while (*p && isdigit((unsigned char)*p)) {
+            nasm_count = nasm_count * 10 + (*p - '0');
+            p++;
+        }
+        if (nasm_count > 0 && nasm_count <= MAX_MACRO_PARAMS) {
+            for (int n = 0; n < nasm_count; n++) {
+                snprintf(params[n], MAX_LABEL_LENGTH, "%d", n + 1);
+            }
+            *param_count = nasm_count;
+            return 0;
+        }
+        if (nasm_count > MAX_MACRO_PARAMS) {
+            char message[128];
+            snprintf(message, sizeof(message),
+                     "Macro parameter count %d exceeds maximum %d",
+                     nasm_count, MAX_MACRO_PARAMS);
+            parser_diag_ctx(NULL, "Constraint", message,
+                            "Reduce the number of macro parameters");
+            return -1;
+        }
+    }
+
+    /* Parse named parameters if present */
     while (*p && *p != ';' && *p != '/' && *param_count < MAX_MACRO_PARAMS) {
         /* Skip optional comma */
         if (*p == ',') {
             p++;
             while (*p && isspace((unsigned char)*p)) p++;
         }
-        
+
         /* Parse parameter name */
         i = 0;
         while (*p && (isalnum((unsigned char)*p) || *p == '_') && i < MAX_LABEL_LENGTH - 1) {
             params[*param_count][i++] = *p++;
         }
-        
+
         if (i > 0) {
             params[*param_count][i] = '\0';
             (*param_count)++;
         }
-        
+
         /* Skip whitespace and optional comma */
         while (*p && isspace((unsigned char)*p)) p++;
         if (*p == ',') {
@@ -2250,14 +2557,17 @@ static int parse_macro_directive(const char *line, char *macro_name,
     return 0;
 }
 
-/* Check if a line is .endm directive */
+/* Check if a line is .endm / %endmacro directive */
 static bool is_endm_directive(const char *line) {
     if (!line) return false;
-    
+
     const char *p = line;
     while (*p && isspace((unsigned char)*p)) p++;
-    
-    return (strncasecmp(p, ".endm", 5) == 0 || strncasecmp(p, "endm", 4) == 0);
+
+    return (strncasecmp(p, ".endm", 5) == 0 ||
+            strncasecmp(p, "endm", 4) == 0 ||
+            strncasecmp(p, "%endmacro", 9) == 0 ||
+            strncasecmp(p, "%endm", 5) == 0);
 }
 
 /* Check if a line is a macro invocation and extract arguments */
@@ -2710,6 +3020,179 @@ static int pp_parse_expr_directive(const char *line, const char *directive,
     return 1;
 }
 
+/* Parse %rep count from a line. Returns 1 on success, 0 if not %rep, -1 on error. */
+static int pp_parse_rep_directive(const char *line, int *out_count) {
+    const char *p = pp_skip_ws(line);
+    const int max_rep_count = 10000;
+
+    if (!p || !out_count) return -1;
+
+    if (strncasecmp(p, "%rep", 4) != 0) {
+        return 0;
+    }
+    if (strlen(p) > 4 && !isspace((unsigned char)p[4])) {
+        return 0;
+    }
+
+    p = pp_skip_ws(p + 4);
+    if (!*p) {
+        parser_diag_ctx(NULL, "Syntax",
+                        "%rep requires a repeat count",
+                        "Use: %rep <count>");
+        return -1;
+    }
+
+    /* Parse count (decimal or hex) */
+    int count = 0;
+    if (*p == '$') p++;
+    if (*p == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+        while (*p && isxdigit((unsigned char)*p)) {
+            count = count * 16 + (isdigit((unsigned char)*p)
+                ? (*p - '0')
+                : (tolower((unsigned char)*p) - 'a' + 10));
+            p++;
+        }
+    } else {
+        while (*p && isdigit((unsigned char)*p)) {
+            count = count * 10 + (*p - '0');
+            p++;
+        }
+    }
+
+    p = pp_skip_ws(p);
+    if (*p != '\0' && *p != ';' && !(p[0] == '/' && p[1] == '/')) {
+        parser_diag_ctx(NULL, "Syntax",
+                        "%rep count must be a single integer",
+                        "Use: %rep <count>");
+        return -1;
+    }
+
+    if (count <= 0 || count > max_rep_count) {
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "%%rep count %d out of range (1..%d)", count, max_rep_count);
+        parser_diag_ctx(NULL, "Constraint", message,
+                        "Use a repeat count between 1 and 10000");
+        return -1;
+    }
+
+    *out_count = count;
+    return 1;
+}
+
+/* Check if a line is %endrep directive */
+static bool is_endrep_directive(const char *line) {
+    const char *p = pp_skip_ws(line);
+    return strncasecmp(p, "%endrep", 7) == 0;
+}
+
+static char *expand_rep_blocks(assembler_context_t *ctx, const char *input) {
+    const char *p;
+    char *output;
+    size_t output_capacity;
+    size_t output_len;
+
+    if (!input) return NULL;
+
+    output_capacity = strlen(input) * 2 + 1;
+    if (output_capacity < 64) output_capacity = 64;
+    output = malloc(output_capacity);
+    if (!output) return NULL;
+    output[0] = '\0';
+    output_len = 0;
+
+    p = input;
+    while (*p) {
+        int i = 0;
+        bool had_newline = false;
+        char line[MAX_LINE_LENGTH];
+
+        while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) {
+            line[i++] = *p++;
+        }
+        line[i] = '\0';
+        if (*p == '\n') {
+            had_newline = true;
+            p++;
+        }
+
+        int rep_count = 0;
+        int rep_parsed = pp_parse_rep_directive(line, &rep_count);
+        if (rep_parsed < 0) {
+            free(output);
+            return NULL;
+        }
+
+        if (rep_parsed == 1) {
+            char rep_body[MAX_LINE_LENGTH * 256];
+            rep_body[0] = '\0';
+            size_t rep_body_len = 0;
+            int rep_depth = 1;
+
+            while (*p && rep_depth > 0) {
+                int nested_count = 0;
+                i = 0;
+                while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) {
+                    line[i++] = *p++;
+                }
+                line[i] = '\0';
+                if (*p == '\n') {
+                    p++;
+                }
+
+                if (pp_parse_rep_directive(line, &nested_count) == 1) {
+                    rep_depth++;
+                } else if (is_endrep_directive(line)) {
+                    rep_depth--;
+                    if (rep_depth == 0) {
+                        continue;
+                    }
+                }
+
+                if (rep_depth > 0) {
+                    size_t line_len = strlen(line);
+                    if (rep_body_len + line_len + 2 < sizeof(rep_body)) {
+                        memcpy(rep_body + rep_body_len, line, line_len);
+                        rep_body_len += line_len;
+                        rep_body[rep_body_len++] = '\n';
+                        rep_body[rep_body_len] = '\0';
+                    }
+                }
+            }
+
+            char *expanded_body = expand_rep_blocks(ctx, rep_body);
+            if (!expanded_body) {
+                free(output);
+                return NULL;
+            }
+            size_t expanded_len = strlen(expanded_body);
+            for (int r = 0; r < rep_count; r++) {
+                if (append_text(&output, &output_capacity, &output_len,
+                                expanded_body, expanded_len) < 0) {
+                    free(expanded_body);
+                    free(output);
+                    return NULL;
+                }
+            }
+            free(expanded_body);
+            continue;
+        }
+
+        if (append_text(&output, &output_capacity, &output_len,
+                        line, strlen(line)) < 0) {
+            free(output);
+            return NULL;
+        }
+        if (had_newline && append_text(&output, &output_capacity, &output_len, "\n", 1) < 0) {
+            free(output);
+            return NULL;
+        }
+    }
+
+    return output;
+}
+
 static int pp_substitute_defines(const char *line, pp_define_t *defines, int define_count,
                                  char *out, size_t out_size) {
     const char *p = line;
@@ -3156,6 +3639,28 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
                     continue;
                 }
             }
+
+            /* Skip %rep blocks in first pass (they are expanded in second pass) */
+            {
+                int rep_count = 0;
+                int rep_parsed = pp_parse_rep_directive(line, &rep_count);
+                if (rep_parsed < 0) { free(expanded_source); return NULL; }
+                if (rep_parsed == 1) {
+                    int rep_depth = 1;
+                    while (*p && rep_depth > 0) {
+                        i = 0;
+                        while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) line[i++] = *p++;
+                        line[i] = '\0';
+                        if (*p == '\n') p++;
+                        if (pp_parse_rep_directive(line, &rep_count) == 1) {
+                            rep_depth++;
+                        } else if (is_endrep_directive(line)) {
+                            rep_depth--;
+                        }
+                    }
+                    continue;
+                }
+            }
         }
 
         {
@@ -3429,6 +3934,71 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
                 continue;
             }
 
+            /* Expand %rep blocks */
+            {
+                int rep_count = 0;
+                int rep_parsed = pp_parse_rep_directive(substituted_line, &rep_count);
+                if (rep_parsed < 0) { free(output); free(expanded_source); return NULL; }
+                if (rep_parsed == 1) {
+                    /* Collect body lines until matching %endrep */
+                    char rep_body[MAX_LINE_LENGTH * 256];
+                    rep_body[0] = '\0';
+                    size_t rep_body_len = 0;
+                    int rep_depth = 1;
+
+                    while (*p && rep_depth > 0) {
+                        i = 0;
+                        while (*p && *p != '\n' && i < MAX_LINE_LENGTH - 1) line[i++] = *p++;
+                        line[i] = '\0';
+                        if (*p == '\n') p++;
+
+                        int nested_count = 0;
+                        if (pp_parse_rep_directive(line, &nested_count) == 1) {
+                            rep_depth++;
+                        } else if (is_endrep_directive(line)) {
+                            rep_depth--;
+                            if (rep_depth == 0) continue;
+                        }
+
+                        if (rep_depth > 0) {
+                            size_t line_len = strlen(line);
+                            if (rep_body_len + line_len + 2 < sizeof(rep_body)) {
+                                memcpy(rep_body + rep_body_len, line, line_len);
+                                rep_body_len += line_len;
+                                rep_body[rep_body_len++] = '\n';
+                                rep_body[rep_body_len] = '\0';
+                            }
+                        }
+                    }
+
+                    /* Repeat the body */
+                    char *expanded_body = expand_rep_blocks(ctx, rep_body);
+                    if (!expanded_body) {
+                        free(output);
+                        free(expanded_source);
+                        return NULL;
+                    }
+                    size_t expanded_len = strlen(expanded_body);
+                    for (int r = 0; r < rep_count; r++) {
+                        if (append_text(&output, &output_capacity, &output_len,
+                                        expanded_body, expanded_len) < 0) {
+                            parser_diag_ctx(
+                                ctx,
+                                "Constraint",
+                                "Preprocessor output exceeded internal buffer capacity",
+                                "Reduce %rep expansion size or split into smaller blocks"
+                            );
+                            free(expanded_body);
+                            free(output);
+                            free(expanded_source);
+                            return NULL;
+                        }
+                    }
+                    free(expanded_body);
+                    continue;
+                }
+            }
+
             char macro_name[MAX_LABEL_LENGTH];
             char args[MAX_MACRO_PARAMS][MAX_LINE_LENGTH];
             int arg_count = 0;
@@ -3461,19 +4031,29 @@ char *preprocess_macros(assembler_context_t *ctx, const char *source) {
                     return NULL;
                 }
 
+                char *expanded_rep = expand_rep_blocks(ctx, expanded_substituted);
+                if (!expanded_rep) {
+                    free(expanded);
+                    free(output);
+                    free(expanded_source);
+                    return NULL;
+                }
+
                 if (append_text(&output, &output_capacity, &output_len,
-                                expanded_substituted, strlen(expanded_substituted)) < 0) {
+                                expanded_rep, strlen(expanded_rep)) < 0) {
                     parser_diag_ctx(
                         ctx,
                         "Constraint",
                         "Preprocessor output exceeded internal buffer capacity",
                         "Reduce macro expansion output or split generated lines"
                     );
+                    free(expanded_rep);
                     free(expanded);
                     free(output);
                     free(expanded_source);
                     return NULL;
                 }
+                free(expanded_rep);
                 free(expanded);
                 continue;
             }

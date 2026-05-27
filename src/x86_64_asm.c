@@ -154,6 +154,143 @@ static void asm_set_last_errorf(assembler_context_t *ctx, const char *fmt, ...) 
     va_end(args);
 }
 
+static size_t json_escape_string(const char *in, char *out, size_t out_size) {
+    size_t out_pos = 0;
+
+    if (!in || !out || out_size == 0) {
+        return 0;
+    }
+
+    for (size_t i = 0; in[i] != '\0' && out_pos + 1 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        const char *esc = NULL;
+
+        switch (c) {
+            case '\\': esc = "\\\\"; break;
+            case '"': esc = "\\\""; break;
+            case '\n': esc = "\\n"; break;
+            case '\r': esc = "\\r"; break;
+            case '\t': esc = "\\t"; break;
+            default:
+                break;
+        }
+
+        if (esc) {
+            size_t esc_len = strlen(esc);
+            if (out_pos + esc_len >= out_size) {
+                break;
+            }
+            memcpy(out + out_pos, esc, esc_len);
+            out_pos += esc_len;
+            continue;
+        }
+
+        if (c < 0x20) {
+            if (out_pos + 6 >= out_size) {
+                break;
+            }
+            int n = snprintf(out + out_pos, out_size - out_pos, "\\u%04x", c);
+            if (n < 0) {
+                break;
+            }
+            out_pos += (size_t)n;
+            continue;
+        }
+
+        out[out_pos++] = (char)c;
+    }
+
+    out[out_pos] = '\0';
+    return out_pos;
+}
+
+static void asm_warn_ctx(assembler_context_t *ctx, int line, int column,
+                         const char *category, const char *message,
+                         const char *suggestion) {
+    const char *severity = "warning";
+
+    if (!ctx || !category || !message) {
+        return;
+    }
+
+    if (ctx->warnings_as_errors) {
+        severity = "error";
+        ctx->fatal_warning_occurred = true;
+    }
+
+    if (ctx->error_format_json) {
+        char esc_cat[256];
+        char esc_msg[2048];
+        char esc_sug[2048];
+        json_escape_string(category, esc_cat, sizeof(esc_cat));
+        json_escape_string(message, esc_msg, sizeof(esc_msg));
+        fprintf(stderr,
+                "{\"severity\":\"%s\",\"line\":%d,\"column\":%d,"
+                "\"category\":\"%s\",\"message\":\"%s\"",
+                severity, line, column, esc_cat, esc_msg);
+        if (suggestion && suggestion[0] != '\0') {
+            json_escape_string(suggestion, esc_sug, sizeof(esc_sug));
+            fprintf(stderr, ",\"suggestion\":\"%s\"", esc_sug);
+        }
+        fprintf(stderr, "}\n");
+    } else {
+        if (ctx->warnings_as_errors) {
+            fprintf(stderr, "Error at line %d, column %d: [%s] %s\n",
+                    line, column, category, message);
+        } else {
+            fprintf(stderr, "Warning at line %d, column %d: [%s] %s\n",
+                    line, column, category, message);
+        }
+        if (suggestion && suggestion[0] != '\0') {
+            fprintf(stderr, "\nSuggestion: %s\n", suggestion);
+        }
+    }
+
+    ctx->warning_count++;
+}
+
+static void mark_symbol_used(assembler_context_t *ctx, const char *name) {
+    if (!ctx || !name || !name[0]) {
+        return;
+    }
+
+    for (int i = 0; i < ctx->symbol_count; i++) {
+        if (strcmp(ctx->symbols[i].name, name) == 0) {
+            ctx->symbols[i].is_used = true;
+            return;
+        }
+    }
+}
+
+static bool is_internal_label_name(const char *name) {
+    return name && (strncmp(name, "__loc_", 6) == 0 || strncmp(name, "__anon_", 7) == 0);
+}
+
+static void warn_unused_labels(assembler_context_t *ctx) {
+    if (!ctx || !ctx->warn_unused_labels) {
+        return;
+    }
+
+    for (int i = 0; i < ctx->symbol_count; i++) {
+        symbol_t *sym = &ctx->symbols[i];
+        if (sym->is_used || sym->is_external || sym->is_global || sym->is_weak || sym->is_hidden) {
+            continue;
+        }
+        if (sym->section < 0 || is_internal_label_name(sym->name)) {
+            continue;
+        }
+
+        char message[320];
+        snprintf(message, sizeof(message), "Unused label '%.200s'", sym->name);
+        asm_warn_ctx(ctx,
+                     sym->decl_line > 0 ? sym->decl_line : 1,
+                     sym->decl_column > 0 ? sym->decl_column : 1,
+                     "Symbol",
+                     message,
+                     "Remove the label or reference it from code.");
+    }
+}
+
 typedef struct {
     int scope_id;
     char local_name[MAX_LABEL_LENGTH];
@@ -570,7 +707,8 @@ static int resolve_equ_symbol_values(assembler_context_t *ctx,
             continue;
         }
 
-        if (inst->operands[0].type == OPERAND_IMM) {
+        if (inst->operands[0].type == OPERAND_IMM ||
+            inst->operands[0].type == OPERAND_EXPR) {
             value = inst->operands[0].immediate;
         } else if (inst->operands[0].type == OPERAND_LABEL) {
             if (find_symbol_address(ctx, inst->operands[0].label, &lhs_addr) < 0) {
@@ -858,6 +996,7 @@ static int add_symbol(assembler_context_t *ctx, const char *name, uint64_t addre
     sym->is_weak = false;
     sym->is_hidden = false;
     sym->is_function = false;
+    sym->is_used = false;
     sym->section = section;
 
     /* Add to hash table (for O(1) lookup) */
@@ -874,6 +1013,7 @@ static int find_symbol_address(assembler_context_t *ctx, const char *name, uint6
     hash_entry_t *entry = symbol_hash_lookup(ctx, name);
     if (entry && entry->is_resolved) {
         *addr = entry->address;
+        mark_symbol_used(ctx, name);
         return 0;
     }
     return -1;
@@ -2331,6 +2471,8 @@ int asm_assemble(assembler_context_t *ctx, const char *source) {
         free_instructions(insts);
         return -1;
     }
+
+    warn_unused_labels(ctx);
 
     free_instructions(insts);
     return 0;
